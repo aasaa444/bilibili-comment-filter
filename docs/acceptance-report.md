@@ -4,35 +4,35 @@
 
 ## 结论
 
-当前版本已完成本机服务、批量分析、任务断点、UID 本地隐藏缓存和管理页的 fixture 级验收。它可以作为继续接入真实 B 站账号和模型服务前的可运行基线，但不能据此宣称已经完成真实 B 站评论采集、真实模型判定或官方拉黑。
+当前版本已完成本机服务、Docker Compose 运行时、批量分析、任务断点、UID 本地隐藏缓存和管理页的 fixture 级验收。它可以作为继续接入真实 B 站账号和模型服务前的可运行基线，但不能据此宣称已经完成真实 B 站评论采集、真实模型判定或官方拉黑。
 
 ## 已验证
 
-- Python 服务单元与 API 测试：`python -m pytest -q` 全量通过。
+- Python 服务单元与 API 测试：`python -m pytest -q` 全量通过（113 passed）。
 - AI 批处理：按 UID 聚合后分批调用；上下文超限会拆批；单 UID 仍被拒绝时保留为 `uncertain`；支持字符串和分段文本响应；超时按配置重试。
 - 采集断点：root cursor、评论/回复声明数量、`declared_total` 和 SQLite 重启恢复测试通过。
 - 风控边界：API `-352/-412` 与 HTTP `403/412/429` 保留结构化分类并立即暂停采集，不进入普通
   任务自动重试；分页容器、数量、cursor 和结束标记的 malformed 元数据会写入 `failed_items`
   并保留当前 root/reply checkpoint。
 - 旧 SQLite 兼容：启动时为缺少的新列执行增量迁移，旧任务仍可读取。
-- 前端：TypeScript 类型检查、构建、Node fixture 测试通过；公开 Shadow DOM fixture 覆盖根评论、楼中楼、
+- 前端：TypeScript 类型检查、构建、Node fixture 测试通过（31 passed）；公开 Shadow DOM fixture 覆盖根评论、楼中楼、
   异步新挂载的嵌套 shadow root 和弹幕不处理。
 - 任务详情：API 与管理页展示保存数量、声明评论/回复、声明总量、覆盖率和失败项。
 - 复核闭环：复核动作可通过 `GET /api/review-actions` 按 UID/证据查询，并在管理页展示历史、操作者和状态变化。
 - 真实协议探针：在 `BV1rBuM6QEfe` 上，一级评论接口返回 20 条、声明总量 536、仍有下一页；楼中楼接口在未同步会话的探针中返回 `-352`，已被 transport 分类为 `api_rate_limit` 并保留脱敏失败原因。
 - 启停脚本：PowerShell 语法解析通过；后台启动使用隐藏窗口；停止前校验 PID 对应的 Python 可执行文件、模块和端口参数。
-- Compose 配置：`docker compose config --quiet` 通过。
+- 启动契约：新增测试覆盖 CLI 默认值/环境变量、Windows 启停参数、健康检查、持久化路径和不写入开机启动。
+- Compose 配置：`docker compose config --quiet` 通过；Rancher Desktop Moby daemon 上真实执行 `docker compose build`、`docker compose up -d`，容器健康检查为 `healthy`，`/api/health` 返回 `ready`，认证状态为脱敏的 `missing`。
 
 ## 仅 fixture 或静态验证
 
 - B 站评论 transport 的固定响应、分页、失败记录和重试已验证；真实探针只确认了一级接口响应形状和楼中楼限流分类，没有完成同步真实账号后的完整评论区收敛。
 - AI transport 使用固定的 HTTP mock；没有调用实际 OpenAI-compatible endpoint，也没有验证供应商对 token 计数、`max_tokens` 或响应分段的具体差异。
 - 官方拉黑使用替身 executor；没有执行真实 B 站拉黑、批量操作或账号状态变更。
-- 浏览器插件使用本地 DOM fixture 验证过滤逻辑。此前对已登录 Chrome 页面仅做了只读 DOM 结构检查，没有读取或输出 Cookie，也没有执行评论、拉黑或账号操作。
+- 浏览器插件使用本地 DOM fixture 验证过滤逻辑；新增 service worker fixture 覆盖当前页面 Cookie 查询、会话同步顺序、权限错误和 Cookie 值脱敏。尚未安装扩展到真实 Chrome，也没有读取或输出真实 Cookie，或执行评论、拉黑和账号操作。
 
 ## 当前外部阻断
 
-- 本机 Docker daemon 未运行，因此本次没有启动容器做运行时健康检查。
 - 真实 B 站账号、真实评论采集和真实官方拉黑仍需要用户明确安排独立验收窗口；它们不应被 fixture 结果替代。
 - 模型服务的真实端点仍需要在本机或配置的远程服务上做一次小规模、可回滚的连接验收。
 

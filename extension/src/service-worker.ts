@@ -90,6 +90,7 @@ export async function submitCurrentVideo(expectedBvid?: string): Promise<VideoTa
   }
 
   const client = new ApiClient();
+  let cookieValues: string[] = [];
   try {
     const health = await client.getHealth();
     const connection = connectionStateFromHealth(health);
@@ -99,7 +100,8 @@ export async function submitCurrentVideo(expectedBvid?: string): Promise<VideoTa
       const detail = "detail" in connection ? connection.detail : undefined;
       throw new ApiRequestError(503, detail ?? "本机服务尚未就绪");
     }
-    const cookies = await readBilibiliCookies();
+    const cookies = await readBilibiliCookies(tab?.url ?? video.url);
+    cookieValues = cookies.map((cookie) => cookie.value).filter((value) => value.length > 0);
     await client.saveAuthSession({ source: "extension", origin: video.url, cookies });
     const task = await client.createTask({
       bvid: video.bvid,
@@ -110,9 +112,10 @@ export async function submitCurrentVideo(expectedBvid?: string): Promise<VideoTa
     await storageSet(LAST_TASK_STORAGE_KEY, task);
     return task;
   } catch (error) {
-    memoryConnection = connectionStateFromRequestError(asRequestError(error));
+    const normalized = redactCookieValues(asRequestError(error), cookieValues);
+    memoryConnection = connectionStateFromRequestError(normalized);
     await persistConnection(memoryConnection);
-    throw error;
+    throw normalized;
   }
 }
 
@@ -164,10 +167,10 @@ async function persistConnection(connection: ConnectionState): Promise<void> {
   await storageSet(CONNECTION_STORAGE_KEY, connection);
 }
 
-async function readBilibiliCookies(): Promise<AuthCookie[]> {
+async function readBilibiliCookies(url: string): Promise<AuthCookie[]> {
   if (typeof chrome === "undefined") return [];
   const cookies = await new Promise<chrome.cookies.Cookie[]>((resolve, reject) => {
-    chrome.cookies.getAll({ url: "https://www.bilibili.com" }, (result) => {
+    chrome.cookies.getAll({ url }, (result) => {
       const error = chrome.runtime.lastError;
       if (error) {
         reject(new ApiRequestError(403, error.message ?? "无法读取 B 站会话权限"));
@@ -186,6 +189,15 @@ async function readBilibiliCookies(): Promise<AuthCookie[]> {
     httpOnly: cookie.httpOnly,
     sameSite: cookie.sameSite,
   }));
+}
+
+function redactCookieValues(error: ApiRequestError, cookieValues: string[]): ApiRequestError {
+  const uniqueValues = [...new Set(cookieValues)];
+  const message = uniqueValues.reduce(
+    (current, value) => current.split(value).join("[Cookie 已隐藏]"),
+    error.message,
+  );
+  return message === error.message ? error : new ApiRequestError(error.status, message, error.code);
 }
 
 async function getActiveTab(): Promise<chrome.tabs.Tab | null> {
