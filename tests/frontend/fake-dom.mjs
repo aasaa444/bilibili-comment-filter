@@ -151,9 +151,11 @@ export class FakeMutationObserver {
   constructor(callback) {
     this.callback = callback;
     this.observed = false;
+    this.target = null;
   }
 
-  observe() {
+  observe(target) {
+    this.target = target;
     this.observed = true;
   }
 

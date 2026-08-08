@@ -7,6 +7,7 @@ import {
   FakeMutationObserver,
   createComment,
   createBilibiliCommentsFixture,
+  createShadowComment,
 } from "./fake-dom.mjs";
 
 function createCommentPage() {
@@ -140,4 +141,59 @@ test("comment filtering traverses the observed nested Bilibili Shadow DOM and ke
   assert.equal(fixture.reply.hidden, true);
   assert.equal(fixture.ordinary.hidden, false);
   assert.equal(danmaku.hidden, false);
+});
+
+test("async comments in a newly mounted nested Shadow DOM are filtered and observed", () => {
+  const document = new FakeElement({ tagName: "document" });
+  const blockedUid = String(900_000_011);
+  const ordinaryUid = String(900_000_012);
+  const fixture = createBilibiliCommentsFixture({ blockedUid, ordinaryUid });
+  document.append(fixture.comments);
+
+  const cache = applyUidSync(createEmptyUidCache(), {
+    version: 1,
+    mode: "snapshot",
+    records: [{
+      uid: blockedUid,
+      nicknameSnapshot: "目标账号",
+      status: "hidden",
+      hidden: true,
+      updatedAt: "2026-08-09T00:00:00Z",
+    }],
+  });
+  const observers = [];
+  const controller = createCommentFilterController({
+    root: document,
+    cache,
+    observerFactory: (callback) => {
+      const observer = new FakeMutationObserver(callback);
+      observers.push(observer);
+      return observer;
+    },
+  });
+
+  controller.start();
+  const commentsShadowObserver = observers.find(
+    (observer) => observer.target === fixture.comments.shadowRoot,
+  );
+  assert.ok(commentsShadowObserver);
+
+  const lateThread = new FakeElement({ tagName: "bili-comment-thread-renderer" });
+  const lateThreadShadow = new FakeElement({ tagName: "shadow-root" });
+  const lateComment = createShadowComment(blockedUid);
+  lateThreadShadow.append(lateComment);
+  lateThread.shadowRoot = lateThreadShadow;
+  fixture.comments.shadowRoot.append(lateThread);
+
+  commentsShadowObserver.emit([{ type: "childList", addedNodes: [lateThread] }]);
+
+  assert.equal(lateComment.hidden, true);
+  const lateThreadObserver = observers.find((observer) => observer.target === lateThreadShadow);
+  assert.ok(lateThreadObserver);
+
+  const secondLateComment = createShadowComment(blockedUid, { reply: true });
+  lateThreadShadow.append(secondLateComment);
+  lateThreadObserver.emit([{ type: "childList", addedNodes: [secondLateComment] }]);
+
+  assert.equal(secondLateComment.hidden, true);
 });

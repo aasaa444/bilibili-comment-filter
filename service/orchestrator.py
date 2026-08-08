@@ -199,6 +199,14 @@ class TaskOrchestrator:
                 "root_cursor": collection.checkpoint.root_cursor,
             },
         )
+        if collection.pause_reason:
+            paused = self.task_store.transition(
+                task_id,
+                TaskStatus.PAUSED,
+                error_code="collection_paused",
+                error_message=collection.pause_reason,
+            )
+            return self._summary(paused)
         collection_complete = collection.complete and (
             not total_declared or saved_comments + saved_replies >= total_declared
         )

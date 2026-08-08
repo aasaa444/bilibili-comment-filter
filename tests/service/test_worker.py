@@ -116,6 +116,36 @@ def test_background_worker_retries_transient_partial_task_before_processing_queu
     assert task_store.get(task.task_id).attempt == 1
 
 
+def test_background_worker_does_not_retry_paused_collection_task() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    task_store = TaskStore(database)
+    task, _ = task_store.create(video_url="https://www.bilibili.com/video/BVworkerpaused")
+    task_store.transition(task.task_id, TaskStatus.COLLECTING)
+    task_store.transition(
+        task.task_id,
+        TaskStatus.PAUSED,
+        error_code="collection_paused",
+        error_message="Bilibili collection paused after http_rate_limit (429)",
+    )
+
+    class UnexpectedOrchestrator:
+        def run(self, _task_id: str):
+            raise AssertionError("paused collection must wait for explicit retry")
+
+    worker = BackgroundWorker(
+        task_store=task_store,
+        orchestrator=UnexpectedOrchestrator(),
+        queue=EmptyQueue(),
+        executor=object(),
+        config=WorkerConfig(poll_interval=0, queue_interval=0, task_retry_delay=0),
+    )
+
+    assert worker.run_once() is False
+    assert task_store.get(task.task_id).status is TaskStatus.PAUSED
+    assert task_store.get(task.task_id).attempt == 0
+
+
 def test_background_worker_retries_temporary_blacklist_failure_without_manual_action() -> None:
     database = Database(":memory:")
     database.initialize()

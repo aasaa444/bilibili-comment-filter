@@ -29,8 +29,10 @@ FastAPI service
 
 ## Core public seams
 
-- `CommentCollector.collect(task, checkpoint)` returns pages, replies, pinned comments, coverage
-  and a resumable checkpoint.
+- `CommentCollector.collect(task, checkpoint)` returns pages, replies, pinned comments, coverage,
+  a resumable checkpoint and an optional pause reason. Risk-control/API interception is a paused
+  task outcome, not an ordinary retryable partial failure; malformed pagination metadata is
+  recorded as a failed item while the current checkpoint remains resumable.
 - `BatchAnalyzer.analyze(accounts, samples)` returns validated `hit`, `non_target` or `uncertain`
   results with evidence references and sample/rule versions.
 - `TaskOrchestrator.run(task_id)` coordinates collection, grouping, analysis, registry updates,

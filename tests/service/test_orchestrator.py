@@ -122,6 +122,18 @@ class ExplodingCollector:
         raise TimeoutError("fixture collector timeout")
 
 
+class CollectionPausedCollector:
+    def collect(self, task, _checkpoint: CollectionCheckpoint) -> CollectionResult:
+        return CollectionResult(
+            comments=(),
+            checkpoint=CollectionCheckpoint(root_page=1, requested_pages=1),
+            stats=CollectionStats(requested_pages=1),
+            complete=False,
+            failed_items=("root_page:1:http_rate_limit:429:Bilibili HTTP 429",),
+            pause_reason="Bilibili collection paused after http_rate_limit (429)",
+        )
+
+
 class IncompleteButMarkedCompleteCollector:
     def __init__(self) -> None:
         self.calls = 0
@@ -357,6 +369,37 @@ def test_orchestrator_pauses_when_collection_session_expires() -> None:
     auth = http.get("/api/auth/session").json()
     assert auth["status"] == "invalid"
     assert auth["detail"] == "fixture session expired"
+
+
+def test_orchestrator_pauses_risk_limited_collection_and_keeps_checkpoint() -> None:
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=CollectionPausedCollector(),
+        analyzer=FixedAnalyzer(),
+    )
+    from fastapi.testclient import TestClient
+
+    http = TestClient(app)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BVcollectionpaused"}
+    ).json()
+
+    summary = app.state.orchestrator.run(task["task_id"])
+
+    assert summary.status.value == "paused"
+    detail = http.get(f"/api/tasks/{task['task_id']}").json()
+    assert detail["status"] == "paused"
+    assert detail["error_code"] == "collection_paused"
+    assert "http_rate_limit (429)" in detail["error_message"]
+    assert detail["progress"]["failed_items"] == [
+        "root_page:1:http_rate_limit:429:Bilibili HTTP 429"
+    ]
+    checkpoint = app.state.task_store.checkpoint(task["task_id"])
+    assert checkpoint["root_page"] == 1
+    assert checkpoint["requested_pages"] == 1
+    assert checkpoint["complete"] is False
 
 
 def test_orchestrator_resumes_checkpoint_after_rebuilding_app(tmp_path) -> None:

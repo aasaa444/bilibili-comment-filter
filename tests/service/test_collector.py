@@ -471,10 +471,46 @@ def test_bilibili_transport_preserves_final_rate_limit_reason() -> None:
     finally:
         client.close()
 
-    assert calls == 2
+    assert calls == 1
     assert raised.value.code == -352
     assert raised.value.category == "api_rate_limit"
     assert str(raised.value) == "风控系统检测到请求异常"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "category"),
+    [(403, "http_blocked"), (412, "http_rate_limit"), (429, "http_rate_limit")],
+)
+def test_bilibili_transport_classifies_http_interception_without_retry(
+    status_code: int, category: str
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status_code)
+
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: {"SESSDATA": "fixture"},
+            client=client,
+            min_interval=0,
+            max_retries=3,
+            retry_backoff=0,
+        )
+        with pytest.raises(BilibiliRateLimitError) as raised:
+            transport.fetch_root_page("12345", 1)
+    finally:
+        client.close()
+
+    assert calls == 1
+    assert raised.value.code == status_code
+    assert raised.value.category == category
 
 
 def test_collector_records_rate_limit_reason_in_failed_item() -> None:
@@ -492,6 +528,95 @@ def test_collector_records_rate_limit_reason_in_failed_item() -> None:
     assert result.complete is False
     assert result.failed_items == (
         "root_page:1:api_rate_limit:-352:风控系统检测到请求异常",
+    )
+    assert result.pause_reason == "Bilibili collection paused after api_rate_limit (-352)"
+
+
+def test_collector_records_malformed_root_page_metadata_and_preserves_checkpoint() -> None:
+    class MalformedRootMetadataTransport:
+        root_cursor_mode = False
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page == 1
+            return {"replies": [], "page": {"count": "not-a-number"}}
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("reply collection must not start")
+
+    result = BilibiliCommentCollector(MalformedRootMetadataTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert result.checkpoint.root_page == 1
+    assert result.checkpoint.requested_pages == 1
+    assert result.checkpoint.complete is False
+    assert result.failed_items == (
+        "inconsistent_root_metadata:1:page.count:not_integer",
+    )
+
+
+def test_collector_records_malformed_root_cursor_metadata_and_preserves_checkpoint() -> None:
+    class MalformedCursorTransport:
+        root_cursor_mode = True
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page == 0
+            return {
+                "replies": [],
+                "cursor": {"all_count": "unknown", "next": "later", "is_end": "false"},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("reply collection must not start")
+
+    result = BilibiliCommentCollector(MalformedCursorTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert result.checkpoint.root_cursor is None
+    assert result.checkpoint.root_page == 1
+    assert result.checkpoint.requested_pages == 1
+    assert result.failed_items == (
+        "inconsistent_root_metadata:1:cursor.all_count:not_integer",
+        "inconsistent_root_metadata:1:cursor.next:not_integer",
+        "inconsistent_root_metadata:1:cursor.is_end:not_boolean",
+    )
+
+
+def test_collector_records_malformed_reply_metadata_and_preserves_reply_checkpoint() -> None:
+    class MalformedReplyMetadataTransport:
+        root_cursor_mode = False
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page == 1
+            return {
+                "replies": [
+                    {
+                        "rpid": 700,
+                        "member": {"mid": 7000, "uname": "root"},
+                        "content": {"message": "root"},
+                        "rcount": 1,
+                    }
+                ],
+                "page": {"count": 1, "page_count": 1},
+            }
+
+        def fetch_replies(self, _video_id: str, root_id: str, page: int) -> dict:
+            assert (root_id, page) == ("700", 1)
+            return {"replies": [], "cursor": {"next": "not-a-number"}}
+
+    result = BilibiliCommentCollector(MalformedReplyMetadataTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert result.stats.saved_comments == 1
+    assert result.checkpoint.reply_pages == {"700": 1}
+    assert result.checkpoint.requested_pages == 2
+    assert result.failed_items == (
+        "inconsistent_reply_metadata:700:1:cursor.next:not_integer",
     )
 
 

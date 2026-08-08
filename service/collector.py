@@ -61,6 +61,7 @@ class CollectionResult:
     stats: CollectionStats
     complete: bool
     failed_items: tuple[str, ...] = ()
+    pause_reason: str | None = None
 
 
 class CommentCollector(Protocol):
@@ -198,18 +199,32 @@ class BilibiliCommentTransport:
                     f"Bilibili request failed: {exc}",
                     category="network",
                 ) from exc
-            if response.status_code == 412 or response.status_code >= 500:
-                if attempt < self._max_retries:
-                    self._sleep_before_retry(attempt)
-                    continue
+            if response.status_code in {403, 412, 429}:
+                category = {
+                    403: "http_blocked",
+                    412: "http_rate_limit",
+                    429: "http_rate_limit",
+                }[response.status_code]
                 raise BilibiliRateLimitError(
                     response.status_code,
                     f"Bilibili HTTP {response.status_code}",
-                    category="http_rate_limit"
-                    if response.status_code == 412
-                    else "http_server_error",
+                    category=category,
                 )
-            response.raise_for_status()
+            if response.status_code >= 500:
+                if attempt < self._max_retries:
+                    self._sleep_before_retry(attempt)
+                    continue
+                raise BilibiliTransportError(
+                    response.status_code,
+                    f"Bilibili HTTP {response.status_code}",
+                    category="http_server_error",
+                )
+            if response.status_code >= 400:
+                raise BilibiliTransportError(
+                    response.status_code,
+                    f"Bilibili HTTP {response.status_code}",
+                    category="http_error",
+                )
             try:
                 payload = response.json()
             except ValueError as exc:
@@ -232,6 +247,8 @@ class BilibiliCommentTransport:
                     payload.get("message") or "Bilibili session is no longer valid"
                 )
             message = str(payload.get("message") or f"Bilibili code {code}")
+            if code in {-352, -412}:
+                raise BilibiliRateLimitError(code, message, category="api_rate_limit")
             if code in retryable_codes:
                 if attempt < self._max_retries:
                     self._sleep_before_retry(attempt)
@@ -303,6 +320,7 @@ class BilibiliCommentCollector:
                     sum(declared_reply_by_root.values()),
                     failed_items,
                     declared_total=declared_total,
+                    pause_reason=_pause_reason(exc),
                 )
 
             if not isinstance(payload, dict):
@@ -328,6 +346,30 @@ class BilibiliCommentCollector:
                 )
             if "replies" not in payload:
                 failed_items.append(f"inconsistent_root_payload:{root_page}:missing_replies")
+                return self._result(
+                    comments,
+                    self._checkpoint(
+                        root_page,
+                        reply_pages,
+                        False,
+                        requested_pages,
+                        declared_comments,
+                        declared_reply_by_root,
+                        root_cursor,
+                        declared_total=declared_total,
+                    ),
+                    requested_pages,
+                    pinned_comments,
+                    declared_comments,
+                    sum(declared_reply_by_root.values()),
+                    failed_items,
+                    declared_total=declared_total,
+                )
+            metadata_errors = _metadata_errors(
+                payload, f"inconsistent_root_metadata:{root_page}"
+            )
+            if metadata_errors:
+                failed_items.extend(metadata_errors)
                 return self._result(
                     comments,
                     self._checkpoint(
@@ -447,6 +489,7 @@ class BilibiliCommentCollector:
                             sum(declared_reply_by_root.values()),
                             failed_items,
                             declared_total=declared_total,
+                            pause_reason=_pause_reason(exc),
                         )
                     if not isinstance(reply_payload, dict):
                         failed_items.append(
@@ -475,6 +518,31 @@ class BilibiliCommentCollector:
                         failed_items.append(
                             f"inconsistent_reply_payload:{root_id}:{reply_page}:missing_replies"
                         )
+                        return self._result(
+                            comments,
+                            self._checkpoint(
+                                root_page,
+                                {**reply_pages, root_id: reply_page},
+                                False,
+                                requested_pages,
+                                declared_comments,
+                                declared_reply_by_root,
+                                root_cursor,
+                                declared_total=declared_total,
+                            ),
+                            requested_pages,
+                            pinned_comments,
+                            declared_comments,
+                            sum(declared_reply_by_root.values()),
+                            failed_items,
+                            declared_total=declared_total,
+                        )
+                    metadata_errors = _metadata_errors(
+                        reply_payload,
+                        f"inconsistent_reply_metadata:{root_id}:{reply_page}",
+                    )
+                    if metadata_errors:
+                        failed_items.extend(metadata_errors)
                         return self._result(
                             comments,
                             self._checkpoint(
@@ -679,6 +747,7 @@ class BilibiliCommentCollector:
         failed_items: list[str],
         *,
         declared_total: int | None = None,
+        pause_reason: str | None = None,
     ) -> CollectionResult:
         saved_comments = sum(comment.level == "root" for comment in comments)
         saved_replies = sum(comment.level == "reply" for comment in comments)
@@ -701,6 +770,7 @@ class BilibiliCommentCollector:
             ),
             complete=checkpoint.complete,
             failed_items=tuple(failed_items),
+            pause_reason=pause_reason,
         )
 
     @staticmethod
@@ -729,13 +799,15 @@ class BilibiliCommentCollector:
 
 def _declared_count(payload: dict[str, Any]) -> int:
     if payload.get("declared_count") is not None:
-        return int(payload["declared_count"])
-    page = payload.get("page") or {}
-    page_count = int(page.get("count") or 0)
+        return _coerce_integer(payload["declared_count"], 0) or 0
+    page = payload.get("page")
+    page = page if isinstance(page, dict) else {}
+    page_count = _coerce_integer(page.get("count"), 0) or 0
     if page_count:
         return page_count
-    cursor = payload.get("cursor") or {}
-    return int(cursor.get("all_count") or 0)
+    cursor = payload.get("cursor")
+    cursor = cursor if isinstance(cursor, dict) else {}
+    return _coerce_integer(cursor.get("all_count"), 0) or 0
 
 
 def _created_at(value: Any) -> int | None:
@@ -754,12 +826,67 @@ def _format_failed_item(prefix: str, error: Exception) -> str:
     return f"{prefix}:{error.category}:{error.code}:{detail}"
 
 
+def _pause_reason(error: Exception) -> str | None:
+    if not isinstance(error, BilibiliRateLimitError):
+        return None
+    return f"Bilibili collection paused after {error.category} ({error.code})"
+
+
+def _metadata_errors(payload: dict[str, Any], prefix: str) -> list[str]:
+    errors: list[str] = []
+    for container_name in ("page", "cursor"):
+        container = payload.get(container_name)
+        if container is not None and not isinstance(container, dict):
+            errors.append(f"{prefix}:{container_name}:not_object")
+    for metadata_field in ("declared_count", "declared_total"):
+        if metadata_field in payload and not _is_integer_value(payload[metadata_field]):
+            errors.append(f"{prefix}:{metadata_field}:not_integer")
+    page = payload.get("page")
+    if isinstance(page, dict):
+        for metadata_field in ("count", "acount", "page_count", "size"):
+            if metadata_field in page and not _is_integer_value(page[metadata_field]):
+                errors.append(f"{prefix}:page.{metadata_field}:not_integer")
+    cursor = payload.get("cursor")
+    if isinstance(cursor, dict):
+        for metadata_field in ("all_count", "next"):
+            if metadata_field in cursor and not _is_integer_value(cursor[metadata_field]):
+                errors.append(f"{prefix}:cursor.{metadata_field}:not_integer")
+        if "is_end" in cursor and not isinstance(cursor["is_end"], bool):
+            errors.append(f"{prefix}:cursor.is_end:not_boolean")
+    if "has_more" in payload and not isinstance(payload["has_more"], bool):
+        errors.append(f"{prefix}:has_more:not_boolean")
+    return errors
+
+
+def _is_integer_value(value: Any) -> bool:
+    if value in (None, ""):
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        try:
+            int(value)
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _coerce_integer(value: Any, default: int | None) -> int | None:
+    if not _is_integer_value(value) or value in (None, ""):
+        return default
+    return int(value)
+
+
 def _declared_total(payload: dict[str, Any]) -> int | None:
     if payload.get("declared_total") is not None:
-        return int(payload["declared_total"])
-    cursor = payload.get("cursor") or {}
+        return _coerce_integer(payload["declared_total"], None)
+    cursor = payload.get("cursor")
+    cursor = cursor if isinstance(cursor, dict) else {}
     if "all_count" in cursor and cursor.get("all_count") is not None:
-        return int(cursor["all_count"])
+        return _coerce_integer(cursor["all_count"], None)
     return None
 
 
@@ -772,24 +899,27 @@ def _total_declared(
 def _has_more(payload: dict[str, Any], page: int, *, item_count: int | None = None) -> bool:
     if "has_more" in payload:
         return bool(payload["has_more"])
-    cursor = payload.get("cursor") or {}
+    cursor = payload.get("cursor")
+    cursor = cursor if isinstance(cursor, dict) else {}
     if "is_end" in cursor:
         return not bool(cursor.get("is_end")) and cursor.get("next") is not None
-    page_info = payload.get("page") or {}
-    page_count = int(page_info.get("page_count") or 0)
+    page_info = payload.get("page")
+    page_info = page_info if isinstance(page_info, dict) else {}
+    page_count = _coerce_integer(page_info.get("page_count"), 0) or 0
     if page_count:
         return page_count > page
-    page_size = int(page_info.get("size") or 0)
-    total = int(page_info.get("count") or page_info.get("acount") or 0)
+    page_size = _coerce_integer(page_info.get("size"), 0) or 0
+    total = _coerce_integer(page_info.get("count") or page_info.get("acount"), 0) or 0
     if page_size and total:
         return total > page * page_size
     return item_count is not None and item_count >= 20
 
 
 def _next_cursor(payload: dict[str, Any]) -> int | None:
-    cursor = payload.get("cursor") or {}
+    cursor = payload.get("cursor")
+    cursor = cursor if isinstance(cursor, dict) else {}
     value = cursor.get("next")
-    return int(value) if value is not None else None
+    return _coerce_integer(value, None)
 
 
 def _pinned_items(payload: dict[str, Any]) -> list[dict[str, Any]]:

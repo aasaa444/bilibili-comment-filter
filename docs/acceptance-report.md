@@ -11,8 +11,12 @@
 - Python 服务单元与 API 测试：`python -m pytest -q` 全量通过。
 - AI 批处理：按 UID 聚合后分批调用；上下文超限会拆批；单 UID 仍被拒绝时保留为 `uncertain`；支持字符串和分段文本响应；超时按配置重试。
 - 采集断点：root cursor、评论/回复声明数量、`declared_total` 和 SQLite 重启恢复测试通过。
+- 风控边界：API `-352/-412` 与 HTTP `403/412/429` 保留结构化分类并立即暂停采集，不进入普通
+  任务自动重试；分页容器、数量、cursor 和结束标记的 malformed 元数据会写入 `failed_items`
+  并保留当前 root/reply checkpoint。
 - 旧 SQLite 兼容：启动时为缺少的新列执行增量迁移，旧任务仍可读取。
-- 前端：TypeScript 类型检查、构建、Node fixture 测试通过；公开 Shadow DOM fixture 覆盖根评论、楼中楼和弹幕不处理。
+- 前端：TypeScript 类型检查、构建、Node fixture 测试通过；公开 Shadow DOM fixture 覆盖根评论、楼中楼、
+  异步新挂载的嵌套 shadow root 和弹幕不处理。
 - 任务详情：API 与管理页展示保存数量、声明评论/回复、声明总量、覆盖率和失败项。
 - 复核闭环：复核动作可通过 `GET /api/review-actions` 按 UID/证据查询，并在管理页展示历史、操作者和状态变化。
 - 真实协议探针：在 `BV1rBuM6QEfe` 上，一级评论接口返回 20 条、声明总量 536、仍有下一页；楼中楼接口在未同步会话的探针中返回 `-352`，已被 transport 分类为 `api_rate_limit` 并保留脱敏失败原因。
