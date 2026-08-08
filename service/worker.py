@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .blacklist import BlacklistExecutor, BlacklistQueueService
+from .blacklist import BlacklistExecutor, BlacklistQueueService, BlacklistQueueStatus
 from .orchestrator import TaskOrchestrator
 from .tasks import TaskStatus, TaskStore
 
@@ -16,10 +16,23 @@ logger = logging.getLogger(__name__)
 class WorkerConfig:
     poll_interval: float = 2.0
     queue_interval: float = 5.0
+    task_retry_delay: float = 5.0
+    max_task_retries: int = 3
+    queue_retry_delay: float = 30.0
+    max_queue_retries: int = 3
 
 
 class BackgroundWorker:
     """Single-process worker for queued collection, analysis and native actions."""
+
+    RETRYABLE_TASK_ERRORS = frozenset(
+        {
+            "collection_incomplete",
+            "collection_failed",
+            "model_unavailable",
+            "analysis_failed",
+        }
+    )
 
     def __init__(
         self,
@@ -37,6 +50,8 @@ class BackgroundWorker:
         self.config = config or WorkerConfig()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._task_retry_after: dict[str, float] = {}
+        self._queue_retry_after: dict[str, float] = {}
 
     @property
     def available(self) -> bool:
@@ -61,22 +76,83 @@ class BackgroundWorker:
         return self._run_once(process_queue=True)
 
     def _run_once(self, *, process_queue: bool) -> bool:
-        did_work = False
+        did_work = self._retry_ready_task()
         queued = next(
             (task for task in self.task_store.list() if task.status is TaskStatus.QUEUED), None
         )
         if queued is not None:
             did_work = True
             try:
-                self.orchestrator.run(queued.task_id)
+                summary = self.orchestrator.run(queued.task_id)
+                if (
+                    summary.status in {TaskStatus.PARTIAL, TaskStatus.FAILED}
+                    and summary.error_code in self.RETRYABLE_TASK_ERRORS
+                ):
+                    self._task_retry_after[queued.task_id] = time.monotonic() + max(
+                        0.0, self.config.task_retry_delay
+                    )
+                elif summary.status not in {TaskStatus.PARTIAL, TaskStatus.FAILED}:
+                    self._task_retry_after.pop(queued.task_id, None)
             except Exception:
                 logger.exception("Queued task %s failed unexpectedly", queued.task_id)
 
         if process_queue:
+            if self._retry_ready_queue():
+                did_work = True
             item = self.queue.process_next(self.executor)
             if item is not None:
                 did_work = True
+                if (
+                    item.status is BlacklistQueueStatus.FAILED
+                    and item.attempts <= max(0, self.config.max_queue_retries)
+                ):
+                    self._queue_retry_after[item.item_id] = time.monotonic() + max(
+                        0.0, self.config.queue_retry_delay
+                    )
+                else:
+                    self._queue_retry_after.pop(item.item_id, None)
         return did_work
+
+    def _retry_ready_task(self) -> bool:
+        now = time.monotonic()
+        max_retries = max(0, self.config.max_task_retries)
+        for task in self.task_store.list():
+            if task.status not in {TaskStatus.PARTIAL, TaskStatus.FAILED}:
+                continue
+            if task.error_code not in self.RETRYABLE_TASK_ERRORS:
+                continue
+            if task.attempt >= max_retries:
+                continue
+            if now < self._task_retry_after.get(task.task_id, now):
+                continue
+            try:
+                self.task_store.retry(task.task_id)
+            except Exception:
+                logger.exception("Unable to retry task %s", task.task_id)
+                continue
+            self._task_retry_after.pop(task.task_id, None)
+            return True
+        return False
+
+    def _retry_ready_queue(self) -> bool:
+        now = time.monotonic()
+        max_retries = max(0, self.config.max_queue_retries)
+        for item in self.queue.list():
+            if item.status is not BlacklistQueueStatus.FAILED:
+                continue
+            if item.attempts > max_retries:
+                self._queue_retry_after.pop(item.item_id, None)
+                continue
+            if now < self._queue_retry_after.get(item.item_id, now):
+                continue
+            try:
+                self.queue.retry(item.item_id)
+            except Exception:
+                logger.exception("Unable to retry blacklist item %s", item.item_id)
+                continue
+            self._queue_retry_after.pop(item.item_id, None)
+            return True
+        return False
 
     def run_forever(self) -> None:
         last_queue_run = time.monotonic() - max(0.0, self.config.queue_interval)

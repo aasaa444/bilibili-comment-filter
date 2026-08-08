@@ -22,6 +22,15 @@ export interface HealthResponse {
   detail?: string;
 }
 
+export type AuthStatus = "valid" | "invalid" | "missing" | "verification_failed";
+
+export interface AuthSession {
+  status: AuthStatus;
+  detail: string;
+  checkedAt?: string;
+  cookiePresent: boolean;
+}
+
 export interface UidSyncResponse {
   version: number;
   mode: "snapshot" | "delta";

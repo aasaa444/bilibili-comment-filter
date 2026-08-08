@@ -49,6 +49,11 @@ if (-not $dependenciesReady) {
   }
 }
 
+& $pythonPath -m playwright install chromium chromium-headless-shell
+if ($LASTEXITCODE -ne 0) {
+  throw "Playwright Chromium installation failed."
+}
+
 if (Test-Path -LiteralPath $pidPath) {
   $existingPid = Get-Content -LiteralPath $pidPath -ErrorAction SilentlyContinue
   if ($existingPid -and (Get-Process -Id ([int]$existingPid) -ErrorAction SilentlyContinue)) {
@@ -67,6 +72,25 @@ Start-Sleep -Seconds 1
 if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
   Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
   throw "Service exited during startup. Check $stderrPath for details."
+}
+
+$healthy = $false
+for ($attempt = 0; $attempt -lt 30; $attempt++) {
+  try {
+    $health = Invoke-RestMethod -UseBasicParsing -Uri 'http://127.0.0.1:8765/api/health' -TimeoutSec 2
+    if ($health.status -eq 'ready') {
+      $healthy = $true
+      break
+    }
+  } catch {
+    # The server may still be binding its port.
+  }
+  Start-Sleep -Milliseconds 500
+}
+if (-not $healthy) {
+  Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+  throw "Service did not become healthy at /api/health. Check $stderrPath for details."
 }
 
 Write-Output "Service started in the background: http://127.0.0.1:8765/"

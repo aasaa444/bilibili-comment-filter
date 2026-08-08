@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .analyzer import (
     AccountBundle,
     AnalysisDecision,
+    AnalysisResult,
     AnalyzerInvalidResponseError,
     AnalyzerUnavailableError,
     BatchAnalyzer,
@@ -80,17 +81,57 @@ class TaskOrchestrator:
                 for key, value in dict(checkpoint_data.get("replies", {})).items()
             },
             complete=bool(checkpoint_data.get("complete", False)),
+            requested_pages=int(checkpoint_data.get("requested_pages", 0)),
+            declared_comments=int(checkpoint_data.get("declared_comments", 0)),
+            declared_reply_counts={
+                str(key): int(value)
+                for key, value in dict(checkpoint_data.get("declared_reply_counts", {})).items()
+            },
+            root_cursor=(
+                int(checkpoint_data["root_cursor"])
+                if checkpoint_data.get("root_cursor") is not None
+                else None
+            ),
         )
-        collection = self.collector.collect(collecting, checkpoint)
+        try:
+            collection = self.collector.collect(collecting, checkpoint)
+        except Exception as exc:
+            partial = self.task_store.transition(
+                task_id,
+                TaskStatus.PARTIAL,
+                error_code="collection_failed",
+                error_message=str(exc),
+            )
+            return self._summary(partial)
         self.comment_store.save_many(task_id, collection.comments)
+        saved_comments, saved_replies, pinned_comments = self.comment_store.stats_for_task(task_id)
+        declared_comments = max(
+            checkpoint.declared_comments,
+            collection.checkpoint.declared_comments,
+            collection.stats.declared_comments,
+        )
+        declared_replies = sum(collection.checkpoint.declared_reply_counts.values())
+        if not declared_replies:
+            declared_replies = max(
+                sum(checkpoint.declared_reply_counts.values()),
+                collection.stats.declared_replies,
+            )
+        total_declared = declared_comments + declared_replies
+        coverage = (
+            min(1.0, (saved_comments + saved_replies) / total_declared)
+            if total_declared
+            else collection.stats.coverage
+        )
         progress = TaskProgress(
-            requested_pages=collection.stats.requested_pages,
-            saved_comments=collection.stats.saved_comments,
-            saved_replies=collection.stats.saved_replies,
-            pinned_comments=collection.stats.pinned_comments,
-            declared_comments=collection.stats.declared_comments,
-            declared_replies=collection.stats.declared_replies,
-            coverage=collection.stats.coverage,
+            requested_pages=max(
+                collection.stats.requested_pages, collection.checkpoint.requested_pages
+            ),
+            saved_comments=saved_comments,
+            saved_replies=saved_replies,
+            pinned_comments=pinned_comments,
+            declared_comments=declared_comments,
+            declared_replies=declared_replies,
+            coverage=coverage,
             failed_items=collection.failed_items,
         )
         self.task_store.update_progress(
@@ -100,6 +141,10 @@ class TaskOrchestrator:
                 "root_page": collection.checkpoint.root_page,
                 "replies": collection.checkpoint.reply_pages,
                 "complete": collection.complete,
+                "requested_pages": collection.checkpoint.requested_pages,
+                "declared_comments": collection.checkpoint.declared_comments,
+                "declared_reply_counts": collection.checkpoint.declared_reply_counts,
+                "root_cursor": collection.checkpoint.root_cursor,
             },
         )
         if not collection.complete:
@@ -116,6 +161,7 @@ class TaskOrchestrator:
         try:
             analysis = self.analyzer.analyze(accounts, self.sample_provider())
         except AnalyzerUnavailableError as exc:
+            self._apply_analysis_results(task, accounts, exc.partial_results)
             partial = self.task_store.transition(
                 task_id,
                 TaskStatus.PARTIAL,
@@ -124,6 +170,7 @@ class TaskOrchestrator:
             )
             return self._summary(partial)
         except AnalyzerInvalidResponseError as exc:
+            self._apply_analysis_results(task, accounts, exc.partial_results)
             failed = self.task_store.transition(
                 task_id,
                 TaskStatus.FAILED,
@@ -131,16 +178,34 @@ class TaskOrchestrator:
                 error_message=str(exc),
             )
             return self._summary(failed)
+        except Exception as exc:
+            failed = self.task_store.transition(
+                task_id,
+                TaskStatus.FAILED,
+                error_code="analysis_failed",
+                error_message=str(exc),
+            )
+            return self._summary(failed)
 
+        self._apply_analysis_results(task, accounts, analysis.results)
+        completed = self.task_store.transition(task_id, TaskStatus.COMPLETED)
+        return self._summary(completed, analyzed_count=len(analysis.results))
+
+    def _apply_analysis_results(
+        self,
+        task: VideoTask,
+        accounts: tuple[AccountBundle, ...],
+        results: tuple[AnalysisResult, ...],
+    ) -> None:
         account_map = {account.uid: account for account in accounts}
-        for result in analysis.results:
+        for result in results:
             if result.decision is AnalysisDecision.NON_TARGET:
                 continue
             account = account_map.get(result.uid)
             if account is None:
                 continue
             evidence, _ = self.evidence_store.save_if_absent(
-                task_id=task_id,
+                task_id=task.task_id,
                 video_id=task.video_id,
                 account_comments=tuple(
                     comment_snapshot_to_record(account, comment_id)
@@ -156,9 +221,6 @@ class TaskOrchestrator:
                 target_state=target_state,
                 evidence_id=evidence.evidence_id,
             )
-
-        completed = self.task_store.transition(task_id, TaskStatus.COMPLETED)
-        return self._summary(completed, analyzed_count=len(analysis.results))
 
     def _apply_uid_result(
         self, *, uid: str, nickname: str | None, target_state: str, evidence_id: str
@@ -218,6 +280,10 @@ class TaskOrchestrator:
                         parent_id=comment.parent_id,
                         context=comment.context,
                         comment_url=comment.comment_url,
+                        video_id=comment.video_id,
+                        level=comment.level,
+                        created_at=comment.created_at,
+                        is_pinned=comment.is_pinned,
                     )
                     for comment in account_comments
                 ),
@@ -235,12 +301,12 @@ def comment_snapshot_to_record(account: AccountBundle, comment_id: str):
         uid=account.uid,
         nickname=account.nickname,
         content=comment.content,
-        video_id="",
+        video_id=comment.video_id,
         comment_url=comment.comment_url,
         root_id=comment.root_id,
         parent_id=comment.parent_id,
-        level="reply" if comment.parent_id else "root",
-        created_at=None,
-        is_pinned=False,
+        level=comment.level,
+        created_at=comment.created_at,
+        is_pinned=comment.is_pinned,
         context=comment.context,
     )

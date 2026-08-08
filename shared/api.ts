@@ -1,5 +1,6 @@
 import type {
   ApiErrorEnvelope,
+  AuthSession,
   AuthSessionRequest,
   BlacklistItem,
   CreateTaskRequest,
@@ -47,6 +48,10 @@ export class ApiClient {
 
   getHealth(): Promise<HealthResponse> {
     return this.request<unknown>("/api/health").then(normalizeHealth);
+  }
+
+  getAuthSession(): Promise<AuthSession> {
+    return this.request<unknown>("/api/auth/session").then(normalizeAuthSession);
   }
 
   listUids(): Promise<ApiList<UidRecord>> {
@@ -208,6 +213,18 @@ function normalizeHealth(value: unknown): HealthResponse {
     service: stringValue(candidate.service),
     version: stringValue(candidate.version),
     detail: stringValue(candidate.detail) ?? stringValue(candidate.message),
+  };
+}
+
+function normalizeAuthSession(value: unknown): AuthSession {
+  const candidate = asRecord(value);
+  const status = stringValue(candidate.status);
+  if (!isAuthStatus(status)) throw new ApiRequestError(502, "认证状态响应格式无效");
+  return {
+    status,
+    detail: stringValue(candidate.detail) ?? "未提供认证诊断信息",
+    checkedAt: stringValue(candidate.checked_at) ?? stringValue(candidate.checkedAt),
+    cookiePresent: booleanValue(candidate.cookie_present) ?? booleanValue(candidate.cookiePresent) ?? false,
   };
 }
 
@@ -434,6 +451,10 @@ function arrayValue(value: unknown): unknown[] | null {
 
 function isUidStatus(value: unknown): value is UidRecord["status"] {
   return ["hidden", "review", "queued", "blocked", "exception", "failed", "paused"].includes(value as string);
+}
+
+function isAuthStatus(value: unknown): value is AuthSession["status"] {
+  return ["valid", "invalid", "missing", "verification_failed"].includes(value as string);
 }
 
 function isTaskStatus(value: unknown): value is TaskStatus {

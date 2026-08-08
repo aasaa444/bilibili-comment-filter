@@ -1,5 +1,6 @@
 import json
 
+import httpx
 import pytest
 
 from service.analyzer import (
@@ -8,6 +9,7 @@ from service.analyzer import (
     AnalyzerInvalidResponseError,
     CommentForAnalysis,
     OpenAICompatibleBatchAnalyzer,
+    OpenAICompatibleTransport,
     RuleCatalog,
     RuleEngine,
     SampleItem,
@@ -128,3 +130,137 @@ def test_analyzer_rejects_invalid_structured_model_response() -> None:
 
     with pytest.raises(AnalyzerInvalidResponseError):
         analyzer.analyze([account("1001", "needs analysis")], SampleSet("v1", ()))
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"results": []},
+        {
+            "results": [
+                {
+                    "uid": "1001",
+                    "decision": "uncertain",
+                    "evidence_comment_ids": ["not-part-of-account"],
+                    "reason": "review",
+                    "confidence": 0.5,
+                    "model_version": "fixture-model",
+                }
+            ]
+        },
+    ],
+)
+def test_analyzer_rejects_incomplete_or_foreign_evidence(response: dict) -> None:
+    class IncompleteTransport:
+        def complete(self, payload: dict) -> dict:
+            return response
+
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=IncompleteTransport(), model="fixture-model", context_budget=100
+    )
+
+    with pytest.raises(AnalyzerInvalidResponseError):
+        analyzer.analyze([account("1001", "needs analysis")], SampleSet("v1", ()))
+
+
+def test_openai_transport_sends_batch_request_with_authentication() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == "/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer fixture-key"
+        body = json.loads(request.content)
+        assert body["model"] == "fixture-model"
+        assert body["response_format"] == {"type": "json_object"}
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key="fixture-key",
+            model="fixture-model",
+            client=client,
+        )
+        assert transport.complete({"accounts": []}) == {
+            "choices": [{"message": {"content": "{}"}}]
+        }
+    finally:
+        client.close()
+
+    assert len(requests) == 1
+
+
+def test_openai_transport_retries_transient_http_status() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, json={"error": "temporarily unavailable"})
+        return httpx.Response(200, json={"results": []})
+
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key=None,
+            model="fixture-model",
+            client=client,
+            max_retries=1,
+            retry_backoff=0,
+        )
+        assert transport.complete({"accounts": []}) == {"results": []}
+    finally:
+        client.close()
+
+    assert calls == 2
+
+
+def test_openai_transport_rejects_invalid_http_json() -> None:
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b"not-json")
+        ),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key=None,
+            model="fixture-model",
+            client=client,
+        )
+        with pytest.raises(AnalyzerInvalidResponseError):
+            transport.complete({"accounts": []})
+    finally:
+        client.close()
+
+
+def test_oversized_uid_context_becomes_explicit_uncertain_result() -> None:
+    class FailingTransport:
+        def complete(self, _payload: dict) -> str:
+            raise AssertionError("oversized account must not reach the model")
+
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=FailingTransport(), model="fixture-model", context_budget=40
+    )
+    result = analyzer.analyze(
+        [account("1001", "针对詹姆斯的长评论 " * 80)],
+        SampleSet("v1", ()),
+    )
+
+    assert result.batch_count == 0
+    assert len(result.results) == 1
+    assert result.results[0].uid == "1001"
+    assert result.results[0].decision is AnalysisDecision.UNCERTAIN
+    assert "context_overflow" in result.results[0].signals

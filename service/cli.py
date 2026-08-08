@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--web-root",
-        default=os.getenv("BILIBILI_FILTER_WEB_ROOT", "web/dist"),
+        default=os.getenv("BILIBILI_FILTER_WEB_ROOT", "dist/web"),
     )
     return parser
 

@@ -123,7 +123,8 @@ class SampleStore:
         return SampleSet(record.version, record.items)
 
     def add_review_sample(self, *, content: str, kind: str = "comment") -> SampleRecord:
-        return self.create(kind=kind, label="positive", items=[(content, "positive")])
+        draft = self.create(kind=kind, label="positive", items=[(content, "positive")])
+        return self.publish(draft.sample_id)
 
     def _next_version(self) -> int:
         rows = self.database.execute("SELECT version FROM sample_sets").fetchall()

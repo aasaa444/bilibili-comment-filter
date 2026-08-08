@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
     root_page INTEGER NOT NULL DEFAULT 1,
     replies_json TEXT NOT NULL DEFAULT '{}',
     complete INTEGER NOT NULL DEFAULT 0,
+    root_cursor INTEGER,
+    requested_pages INTEGER NOT NULL DEFAULT 0,
+    declared_comments INTEGER NOT NULL DEFAULT 0,
+    declared_reply_counts_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES video_tasks(task_id)
 );
@@ -174,7 +178,25 @@ class Database:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.executescript(SCHEMA)
+        self._migrate_task_checkpoints()
         self._connection.commit()
+
+    def _migrate_task_checkpoints(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(task_checkpoints)")
+        }
+        additions = {
+            "root_cursor": "INTEGER",
+            "requested_pages": "INTEGER NOT NULL DEFAULT 0",
+            "declared_comments": "INTEGER NOT NULL DEFAULT 0",
+            "declared_reply_counts_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE task_checkpoints ADD COLUMN {name} {definition}"
+                )
 
     @property
     def connection(self) -> sqlite3.Connection:

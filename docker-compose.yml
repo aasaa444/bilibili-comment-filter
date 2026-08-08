@@ -15,6 +15,17 @@ services:
       BILIBILI_FILTER_DATABASE: /data/bilibili-filter.sqlite3
       BILIBILI_FILTER_WEB_ROOT: /app/web/dist
       BILIBILI_FILTER_BROWSER_HEADLESS: "true"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=3)); raise SystemExit(0 if data.get('status') == 'ready' else 1)
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     volumes:
       - bilibili_filter_data:/data
     restart: unless-stopped

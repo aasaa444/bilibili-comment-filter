@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from .db import Database
@@ -97,7 +98,8 @@ class TaskStore:
         ),
     }
 
-    VIDEO_ID_PATTERN = re.compile(r"/video/(BV[0-9A-Za-z]+|av[0-9]+)(?:[/?#]|$)", re.IGNORECASE)
+    VIDEO_ID_PATTERN = re.compile(r"^/video/(BV[0-9A-Za-z]+)(?:/)?$", re.IGNORECASE)
+    SUPPORTED_VIDEO_HOSTS = frozenset({"bilibili.com", "www.bilibili.com"})
 
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -228,16 +230,26 @@ class TaskStore:
                 ),
             )
             if checkpoint is not None:
+                reply_pages = checkpoint.get("reply_pages", checkpoint.get("replies", {}))
+                root_cursor = checkpoint.get("root_cursor")
                 connection.execute(
                     """
                     UPDATE task_checkpoints
-                    SET root_page = ?, replies_json = ?, complete = ?, updated_at = ?
+                    SET root_page = ?, replies_json = ?, complete = ?, root_cursor = ?,
+                        requested_pages = ?, declared_comments = ?,
+                        declared_reply_counts_json = ?, updated_at = ?
                     WHERE task_id = ?
                     """,
                     (
                         int(checkpoint.get("root_page", 1)),
-                        json.dumps(checkpoint.get("replies", {}), sort_keys=True),
+                        json.dumps(reply_pages, sort_keys=True),
                         int(bool(checkpoint.get("complete", False))),
+                        int(root_cursor) if root_cursor is not None else None,
+                        int(checkpoint.get("requested_pages", 0)),
+                        int(checkpoint.get("declared_comments", 0)),
+                        json.dumps(
+                            checkpoint.get("declared_reply_counts", {}), sort_keys=True
+                        ),
                         timestamp,
                         task_id,
                     ),
@@ -250,8 +262,20 @@ class TaskStore:
             "SELECT * FROM task_checkpoints WHERE task_id = ?", (task_id,)
         ).fetchone()
         if row is None:
-            return {"root_page": 1, "replies": {}, "complete": False}
+            return {
+                "root_cursor": None,
+                "requested_pages": 0,
+                "declared_comments": 0,
+                "declared_reply_counts": {},
+                "root_page": 1,
+                "replies": {},
+                "complete": False,
+            }
         return {
+            "root_cursor": int(row["root_cursor"]) if row["root_cursor"] is not None else None,
+            "requested_pages": int(row["requested_pages"]),
+            "declared_comments": int(row["declared_comments"]),
+            "declared_reply_counts": json.loads(row["declared_reply_counts_json"]),
             "root_page": int(row["root_page"]),
             "replies": json.loads(row["replies_json"]),
             "complete": bool(row["complete"]),
@@ -259,13 +283,19 @@ class TaskStore:
 
     @classmethod
     def video_id_from_url(cls, video_url: str) -> str:
-        match = cls.VIDEO_ID_PATTERN.search(video_url)
+        parsed = urlparse(video_url)
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme.lower() != "https" or hostname not in cls.SUPPORTED_VIDEO_HOSTS:
+            raise UnsupportedVideoError(
+                "Only ordinary HTTPS Bilibili video URLs are supported"
+            )
+        match = cls.VIDEO_ID_PATTERN.fullmatch(parsed.path)
         if match is None:
             raise UnsupportedVideoError(
-                "Only ordinary Bilibili video URLs containing a BV or av identifier are supported"
+                "Only ordinary Bilibili video URLs containing a BV identifier are supported"
             )
         value = match.group(1)
-        return value if value.startswith("BV") else value.lower()
+        return f"BV{value[2:]}"
 
     @staticmethod
     def _from_row(row: object) -> VideoTask:

@@ -6,6 +6,7 @@ import {
   type ConnectionState,
 } from "../../shared/state.js";
 import type {
+  AuthSession,
   BlacklistItem,
   Evidence,
   ReviewAction,
@@ -24,6 +25,7 @@ interface ManagementState {
   activeView: ViewName;
   loading: boolean;
   connection: ConnectionState;
+  auth: AuthSession | null;
   tasks: Collection<VideoTask>;
   uids: Collection<UidRecord>;
   evidence: Collection<Evidence>;
@@ -50,6 +52,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     activeView: "dashboard",
     loading: false,
     connection: { kind: "loading", label: "正在连接本机服务" },
+    auth: null,
     tasks: { items: null },
     uids: { items: null },
     evidence: { items: null },
@@ -88,13 +91,15 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       return;
     }
 
-    const [tasks, uids, evidence, samples, blacklist] = await Promise.all([
+    const [auth, tasks, uids, evidence, samples, blacklist] = await Promise.all([
+      api.getAuthSession().catch(() => null),
       loadCollection(() => api.listTasks()),
       loadCollection(() => api.listUids()),
       loadCollection(() => api.listEvidence()),
       loadCollection(() => api.listSamples()),
       loadCollection(() => api.listBlacklist()),
     ]);
+    state.auth = auth;
     state.tasks = tasks;
     state.uids = uids;
     state.evidence = evidence;
@@ -346,6 +351,7 @@ function renderDashboard(state: ManagementState): string {
       <div><p class="eyebrow">当前主动作</p><h3>新建视频任务</h3><p class="muted">提交一个普通 BV 视频，后台会异步采集评论并保留任务状态。</p></div>
       ${renderTaskForm()}
     </section>
+    ${renderAuthDiagnostic(state.auth)}
     <section class="stat-grid" aria-label="工作区统计">
       ${renderStat("视频任务", taskItems ? String(taskItems.length) : "未加载", "任务列表")}
       ${renderStat("本地 UID", uidItems ? String(uidItems.length) : "未加载", "名单权威在本机服务")}
@@ -356,6 +362,21 @@ function renderDashboard(state: ManagementState): string {
       <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">任务阶段</p><h3>最近视频任务</h3></div><button class="button button-ghost" data-view="tasks" type="button">查看全部</button></div>${renderTaskCollection(state.tasks, "dashboard")}</section>
       <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">需要判断</p><h3>待复核 UID</h3></div><button class="button button-ghost" data-view="reviews" type="button">打开证据</button></div>${renderEvidenceCollection(state.evidence, "dashboard")}</section>
     </div>`;
+}
+
+function renderAuthDiagnostic(session: AuthSession | null): string {
+  if (!session) {
+    return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">登录态诊断</p><h3>认证状态暂不可用</h3></div><span class="status-pill" data-state="error">无法读取</span></div><p class="muted">请刷新管理页后重试。</p></section>`;
+  }
+  const state = session.status === "valid" ? "ready" : session.status === "missing" ? "paused" : "error";
+  const label = ({
+    valid: "会话有效",
+    invalid: "会话已失效",
+    missing: "尚未同步",
+    verification_failed: "验证失败",
+  } as const)[session.status];
+  const checkedAt = session.checkedAt ? `最近检查：${session.checkedAt}` : "尚未检查时间";
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">登录态诊断</p><h3>后台认证状态</h3></div><span class="status-pill" data-state="${state}">${label}</span></div><p class="muted">${escapeHtml(session.detail)} · ${escapeHtml(checkedAt)}${session.cookiePresent ? " · 已收到会话" : " · 未收到会话"}</p></section>`;
 }
 
 function renderTasks(state: ManagementState): string {

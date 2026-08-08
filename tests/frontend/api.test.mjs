@@ -62,6 +62,27 @@ test("API client maps review actions and cookie sessions to backend payloads", a
   assert.equal(review.action, "positive-sample");
 });
 
+test("API client exposes the latest authentication diagnostic without cookie values", async () => {
+  const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
+    assert.equal(input, "http://127.0.0.1:8765/api/auth/session");
+    return jsonResponse({
+      status: "verification_failed",
+      detail: "Bilibili session verification failed",
+      checked_at: "2026-08-09T00:00:00Z",
+      cookie_present: true,
+    });
+  });
+
+  const session = await client.getAuthSession();
+
+  assert.deepEqual(session, {
+    status: "verification_failed",
+    detail: "Bilibili session verification failed",
+    checkedAt: "2026-08-09T00:00:00Z",
+    cookiePresent: true,
+  });
+});
+
 test("API client keeps versioned samples and cancelled blacklist items", async () => {
   const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
     if (String(input).endsWith("/api/samples")) {

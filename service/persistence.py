@@ -49,6 +49,20 @@ class CommentStore:
         ).fetchone()
         return int(row["count"])
 
+    def stats_for_task(self, task_id: str) -> tuple[int, int, int]:
+        row = self.database.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN level = 'root' THEN 1 ELSE 0 END), 0) AS roots,
+                COALESCE(SUM(CASE WHEN level = 'reply' THEN 1 ELSE 0 END), 0) AS replies,
+                COALESCE(SUM(CASE WHEN is_pinned = 1 THEN 1 ELSE 0 END), 0) AS pinned
+            FROM comments
+            WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        return int(row["roots"]), int(row["replies"]), int(row["pinned"])
+
     def list_for_task(self, task_id: str) -> tuple[CommentRecord, ...]:
         rows = self.database.execute(
             "SELECT * FROM comments WHERE task_id = ? ORDER BY rowid", (task_id,)

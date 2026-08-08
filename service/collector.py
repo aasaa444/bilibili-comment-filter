@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -30,6 +31,10 @@ class CollectionCheckpoint:
     root_page: int = 1
     reply_pages: dict[str, int] = field(default_factory=dict)
     complete: bool = False
+    requested_pages: int = 0
+    declared_comments: int = 0
+    declared_reply_counts: dict[str, int] = field(default_factory=dict)
+    root_cursor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -72,22 +77,41 @@ class BilibiliCommentTransport:
     service-owned session provider and are never returned by this adapter.
     """
 
+    root_cursor_mode = True
+
     def __init__(
         self,
         cookies_provider: Callable[[], dict[str, str] | None],
         *,
         base_url: str = "https://api.bilibili.com",
         timeout: float = 20.0,
+        min_interval: float = 0.5,
+        max_retries: int = 3,
+        client: httpx.Client | None = None,
     ) -> None:
         self.cookies_provider = cookies_provider
-        self.client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+        self.client = client or httpx.Client(
+            base_url=base_url.rstrip("/"),
+            timeout=timeout,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://www.bilibili.com/",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+                ),
+            },
+        )
         self._video_oid_cache: dict[str, str] = {}
+        self._min_interval = max(0.0, min_interval)
+        self._max_retries = max(0, max_retries)
+        self._last_request = 0.0
 
     def fetch_root_page(self, video_id: str, page: int) -> dict[str, Any]:
         oid = self._resolve_oid(video_id)
         return self._get(
-            "/x/v2/reply",
-            {"type": 1, "oid": oid, "pn": page, "ps": 20, "sort": 2},
+            "/x/v2/reply/main",
+            {"type": 1, "oid": oid, "mode": 3, "next": page, "ps": 20},
         )
 
     def fetch_replies(self, video_id: str, root_id: str, page: int) -> dict[str, Any]:
@@ -114,12 +138,36 @@ class BilibiliCommentTransport:
 
     def _get(self, path: str, params: dict[str, object]) -> dict[str, Any]:
         cookies = self.cookies_provider() or {}
-        response = self.client.get(path, params=params, cookies=cookies)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
+        headers = (
+            {"Cookie": "; ".join(f"{name}={value}" for name, value in cookies.items())}
+            if cookies
+            else None
+        )
+        retryable_codes = {-352, -412, -509}
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_request = time.monotonic()
+            response = self.client.get(path, params=params, headers=headers)
+            if response.status_code == 412 or response.status_code >= 500:
+                last_error = RuntimeError(f"Bilibili HTTP {response.status_code}")
+                if attempt < self._max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                response.raise_for_status()
+            response.raise_for_status()
+            payload = response.json()
+            code = payload.get("code")
+            if code == 0:
+                return payload.get("data") or {}
+            if code in retryable_codes and attempt < self._max_retries:
+                last_error = RuntimeError(payload.get("message") or f"Bilibili code {code}")
+                time.sleep(0.5 * (attempt + 1))
+                continue
             raise RuntimeError(payload.get("message") or "Bilibili comment request failed")
-        return payload.get("data") or {}
+        raise RuntimeError(f"Bilibili request failed: {last_error}") from last_error
 
 
 class BilibiliCommentCollector:
@@ -131,46 +179,65 @@ class BilibiliCommentCollector:
         seen_ids: set[str] = set()
         failed_items: list[str] = []
         reply_pages = dict(checkpoint.reply_pages)
+        declared_reply_by_root = dict(checkpoint.declared_reply_counts)
         root_page = checkpoint.root_page
-        requested_pages = 0
-        declared_comments = 0
-        declared_replies = 0
+        root_cursor = checkpoint.root_cursor
+        requested_pages = checkpoint.requested_pages
+        declared_comments = checkpoint.declared_comments
         pinned_comments = 0
-        declared_reply_by_root: dict[str, int] = {}
 
         while True:
             requested_pages += 1
             try:
-                payload = self.transport.fetch_root_page(task.video_id, root_page)
+                request_page = (
+                    root_cursor
+                    if root_cursor is not None
+                    else 0
+                    if getattr(self.transport, "root_cursor_mode", False)
+                    else root_page
+                )
+                payload = self.transport.fetch_root_page(task.video_id, request_page)
             except Exception:
                 failed_items.append(f"root_page:{root_page}")
                 return self._result(
                     comments,
-                    CollectionCheckpoint(root_page, reply_pages, False),
+                    self._checkpoint(
+                        root_page,
+                        reply_pages,
+                        False,
+                        requested_pages,
+                        declared_comments,
+                        declared_reply_by_root,
+                        root_cursor,
+                    ),
                     requested_pages,
                     pinned_comments,
                     declared_comments,
-                    declared_replies,
+                    sum(declared_reply_by_root.values()),
                     failed_items,
                 )
 
             root_items = list(payload.get("replies") or [])
-            top_items = payload.get("top")
-            if isinstance(top_items, dict):
-                root_items.append(top_items)
-            elif isinstance(top_items, list):
-                root_items.extend(top_items)
+            root_items.extend(_pinned_items(payload))
             declared_comments = max(declared_comments, _declared_count(payload))
             root_ids = [self._comment_id(item) for item in root_items]
             if root_ids and all(comment_id in seen_ids for comment_id in root_ids):
                 failed_items.append(f"duplicate_root_page:{root_page}")
                 return self._result(
                     comments,
-                    CollectionCheckpoint(root_page, reply_pages, False),
+                    self._checkpoint(
+                        root_page,
+                        reply_pages,
+                        False,
+                        requested_pages,
+                        declared_comments,
+                        declared_reply_by_root,
+                        root_cursor,
+                    ),
                     requested_pages,
                     pinned_comments,
                     declared_comments,
-                    declared_replies,
+                    sum(declared_reply_by_root.values()),
                     failed_items,
                 )
 
@@ -193,6 +260,7 @@ class BilibiliCommentCollector:
                 reply_page = reply_pages.get(root_id, 1)
                 while True:
                     try:
+                        requested_pages += 1
                         reply_payload = self.transport.fetch_replies(
                             task.video_id, root_id, reply_page
                         )
@@ -200,13 +268,19 @@ class BilibiliCommentCollector:
                         failed_items.append(f"reply:{root_id}:{reply_page}")
                         return self._result(
                             comments,
-                            CollectionCheckpoint(
-                                root_page, {**reply_pages, root_id: reply_page}, False
+                            self._checkpoint(
+                                root_page,
+                                {**reply_pages, root_id: reply_page},
+                                False,
+                                requested_pages,
+                                declared_comments,
+                                declared_reply_by_root,
+                                root_cursor,
                             ),
                             requested_pages,
                             pinned_comments,
                             declared_comments,
-                            declared_replies,
+                            sum(declared_reply_by_root.values()),
                             failed_items,
                         )
                     reply_items = list(reply_payload.get("replies") or [])
@@ -218,8 +292,14 @@ class BilibiliCommentCollector:
                         failed_items.append(f"duplicate_reply_page:{root_id}:{reply_page}")
                         return self._result(
                             comments,
-                            CollectionCheckpoint(
-                                root_page, {**reply_pages, root_id: reply_page}, False
+                            self._checkpoint(
+                                root_page,
+                                {**reply_pages, root_id: reply_page},
+                                False,
+                                requested_pages,
+                                declared_comments,
+                                declared_reply_by_root,
+                                root_cursor,
                             ),
                             requested_pages,
                             pinned_comments,
@@ -247,10 +327,19 @@ class BilibiliCommentCollector:
                     break
             if _has_more(payload, root_page):
                 root_page += 1
+                root_cursor = _next_cursor(payload)
                 continue
             return self._result(
                 comments,
-                CollectionCheckpoint(root_page + 1, reply_pages, True),
+                self._checkpoint(
+                    root_page + 1,
+                    reply_pages,
+                    True,
+                    requested_pages,
+                    declared_comments,
+                    declared_reply_by_root,
+                    None,
+                ),
                 requested_pages,
                 pinned_comments,
                 declared_comments,
@@ -331,17 +420,68 @@ class BilibiliCommentCollector:
             failed_items=tuple(failed_items),
         )
 
+    @staticmethod
+    def _checkpoint(
+        root_page: int,
+        reply_pages: dict[str, int],
+        complete: bool,
+        requested_pages: int,
+        declared_comments: int,
+        declared_reply_counts: dict[str, int],
+        root_cursor: int | None = None,
+    ) -> CollectionCheckpoint:
+        return CollectionCheckpoint(
+            root_page=root_page,
+            reply_pages=dict(reply_pages),
+            complete=complete,
+            requested_pages=requested_pages,
+            declared_comments=declared_comments,
+            declared_reply_counts=dict(declared_reply_counts),
+            root_cursor=root_cursor,
+        )
+
 
 def _declared_count(payload: dict[str, Any]) -> int:
     if payload.get("declared_count") is not None:
         return int(payload["declared_count"])
     page = payload.get("page") or {}
-    return int(page.get("count") or 0)
+    page_count = int(page.get("count") or 0)
+    if page_count:
+        return page_count
+    cursor = payload.get("cursor") or {}
+    return int(cursor.get("all_count") or 0)
 
 
 def _has_more(payload: dict[str, Any], page: int) -> bool:
     if "has_more" in payload:
         return bool(payload["has_more"])
+    cursor = payload.get("cursor") or {}
+    if "is_end" in cursor:
+        return not bool(cursor.get("is_end")) and cursor.get("next") is not None
     page_info = payload.get("page") or {}
     page_count = int(page_info.get("page_count") or 0)
-    return page_count > page
+    if page_count:
+        return page_count > page
+    page_size = int(page_info.get("size") or 0)
+    total = int(page_info.get("count") or page_info.get("acount") or 0)
+    return bool(page_size and total and total > page * page_size)
+
+
+def _next_cursor(payload: dict[str, Any]) -> int | None:
+    cursor = payload.get("cursor") or {}
+    value = cursor.get("next")
+    return int(value) if value is not None else None
+
+
+def _pinned_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for key in ("top", "top_replies"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, dict))
+    upper = payload.get("upper") or {}
+    if isinstance(upper, dict) and isinstance(upper.get("top"), dict):
+        candidates.append(upper["top"])
+    return [{**item, "is_top": True} for item in candidates]

@@ -25,6 +25,7 @@ if ! "$python_path" -c 'import fastapi, httpx, pydantic, uvicorn, playwright' >/
   printf '%s\n' 'Project dependency installation failed.' >&2
   exit 1
 fi
+"$python_path" -m playwright install chromium chromium-headless-shell
 
 if [ -f "$repo_root/data/service.pid" ]; then
   existing_pid=$(cat "$repo_root/data/service.pid" || true)
@@ -44,6 +45,20 @@ sleep 1
 if ! kill -0 "$service_pid" 2>/dev/null; then
   rm -f "$repo_root/data/service.pid"
   printf '%s\n' 'Service exited during startup; check data/logs/service.err.log.' >&2
+  exit 1
+fi
+healthy=false
+for _ in $(seq 1 30); do
+  if "$python_path" -c 'import json, urllib.request; data=json.load(urllib.request.urlopen("http://127.0.0.1:8765/api/health", timeout=2)); raise SystemExit(0 if data.get("status") == "ready" else 1)' >/dev/null 2>&1; then
+    healthy=true
+    break
+  fi
+  sleep 0.5
+done
+if [ "$healthy" != true ]; then
+  kill "$service_pid" 2>/dev/null || true
+  rm -f "$repo_root/data/service.pid"
+  printf '%s\n' 'Service did not become healthy at /api/health; check data/logs/service.err.log.' >&2
   exit 1
 fi
 printf '%s\n' '服务已在后台启动: http://127.0.0.1:8765/'

@@ -97,22 +97,25 @@ def create_app(
     collector = collector or BilibiliCommentCollector(
         BilibiliCommentTransport(database.latest_auth_cookies)
     )
+    model_base_url = _env_text(
+        "BILIBILI_FILTER_OPENAI_BASE_URL",
+        "http://127.0.0.1:11434/v1",
+        "BILIBILI_FILTER_MODEL_URL",
+    )
+    model_api_key = _env_optional_text(
+        "BILIBILI_FILTER_OPENAI_API_KEY", "BILIBILI_FILTER_MODEL_KEY"
+    )
+    model_name = _env_text(
+        "BILIBILI_FILTER_OPENAI_MODEL", "local-model", "BILIBILI_FILTER_MODEL"
+    )
     analyzer = analyzer or OpenAICompatibleBatchAnalyzer(
         transport=OpenAICompatibleTransport(
-            base_url=os.getenv(
-                "BILIBILI_FILTER_OPENAI_BASE_URL",
-                os.getenv("BILIBILI_FILTER_MODEL_URL", "http://127.0.0.1:11434/v1"),
-            ),
-            api_key=os.getenv(
-                "BILIBILI_FILTER_OPENAI_API_KEY", os.getenv("BILIBILI_FILTER_MODEL_KEY")
-            ),
-            model=os.getenv(
-                "BILIBILI_FILTER_OPENAI_MODEL", os.getenv("BILIBILI_FILTER_MODEL", "local-model")
-            ),
+            base_url=model_base_url,
+            api_key=model_api_key,
+            model=model_name,
         ),
-        model=os.getenv(
-            "BILIBILI_FILTER_OPENAI_MODEL", os.getenv("BILIBILI_FILTER_MODEL", "local-model")
-        ),
+        model=model_name,
+        context_budget=_env_positive_int("BILIBILI_FILTER_OPENAI_CONTEXT_TOKENS", 100000),
     )
     orchestrator = TaskOrchestrator(
         task_store=task_store,
@@ -428,6 +431,31 @@ def normalize_cookies(cookies: dict[str, str] | list[AuthCookie]) -> dict[str, s
     if isinstance(cookies, dict):
         return cookies
     return {cookie.name: cookie.value for cookie in cookies}
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    try:
+        parsed = int(value) if value is not None else default
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _env_text(name: str, default: str, *aliases: str) -> str:
+    for candidate in (name, *aliases):
+        value = os.getenv(candidate)
+        if value and value.strip():
+            return value.strip()
+    return default
+
+
+def _env_optional_text(name: str, *aliases: str) -> str | None:
+    for candidate in (name, *aliases):
+        value = os.getenv(candidate)
+        if value and value.strip():
+            return value.strip()
+    return None
 
 
 def comment_response(comment: object) -> dict[str, object]:

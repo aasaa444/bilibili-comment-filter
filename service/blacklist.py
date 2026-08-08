@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -75,6 +76,16 @@ class RecordingBlacklistExecutor:
 class PlaywrightBlacklistExecutor:
     """Production browser boundary; selectors are deliberately configuration-driven."""
 
+    _PLATFORM_INTERCEPTION_MARKERS = (
+        "安全验证",
+        "请求过频",
+        "请求过于频繁",
+        "操作频繁",
+        "访问受限",
+        "风控",
+        "平台拦截",
+    )
+
     def __init__(
         self,
         *,
@@ -95,8 +106,9 @@ class PlaywrightBlacklistExecutor:
         try:
             with sync_playwright() as playwright:
                 browser = None
+                context = None
                 try:
-                    browser = playwright.chromium.launch(headless=True)
+                    browser = playwright.chromium.launch(headless=_headless_mode())
                     context = browser.new_context(
                         locale="zh-CN",
                         viewport={"width": 1280, "height": 900},
@@ -117,18 +129,55 @@ class PlaywrightBlacklistExecutor:
                             ExecutionFailureKind.CAPTCHA,
                             "Bilibili requested a captcha; queue paused",
                         )
+                    if self._platform_interception_detected(page):
+                        raise BlacklistExecutionError(
+                            ExecutionFailureKind.BLOCKED,
+                            "Bilibili blocked the native blacklist action; queue blocked",
+                        )
+                    if page.get_by_text("已拉黑", exact=True).count() > 0:
+                        return ExecutionResult(detail="UID is already blacklisted")
                     button = page.get_by_text("拉黑", exact=True)
                     if button.count() == 0:
-                        if page.get_by_text("已拉黑", exact=True).count() > 0:
-                            return ExecutionResult(detail="UID is already blacklisted")
                         raise BlacklistExecutionError(
                             ExecutionFailureKind.INTERCEPTED,
                             "Native blacklist control was not found",
                         )
                     button.click()
-                    page.get_by_text("确定", exact=True).click()
+                    confirm = page.get_by_text("确定", exact=True)
+                    if confirm.count() == 0:
+                        raise BlacklistExecutionError(
+                            ExecutionFailureKind.INTERCEPTED,
+                            "Native blacklist confirmation control was not found",
+                        )
+                    confirm.click()
+                    page.wait_for_load_state("networkidle", timeout=10_000)
+                    if self._platform_interception_detected(page):
+                        raise BlacklistExecutionError(
+                            ExecutionFailureKind.BLOCKED,
+                            "Bilibili blocked the native blacklist action; queue blocked",
+                        )
+                    success = page.get_by_text("已拉黑", exact=True)
+                    try:
+                        success.wait_for(state="visible", timeout=10_000)
+                    except Exception as exc:
+                        raise BlacklistExecutionError(
+                            ExecutionFailureKind.TEMPORARY,
+                            "Native blacklist success state was not confirmed",
+                        ) from exc
+                    if success.count() == 0:
+                        raise BlacklistExecutionError(
+                            ExecutionFailureKind.TEMPORARY,
+                            "Native blacklist success state was not confirmed",
+                        )
+                    return ExecutionResult(detail="UID is blacklisted")
                 finally:
-                    if browser is not None:
+                    if context is not None:
+                        try:
+                            context.close()
+                        finally:
+                            if browser is not None:
+                                browser.close()
+                    elif browser is not None:
                         browser.close()
         except BlacklistExecutionError:
             raise
@@ -137,7 +186,12 @@ class PlaywrightBlacklistExecutor:
                 ExecutionFailureKind.TEMPORARY,
                 f"Native blacklist action failed: {exc}",
             ) from exc
-        return ExecutionResult()
+
+    def _platform_interception_detected(self, page: object) -> bool:
+        return any(
+            page.get_by_text(marker, exact=False).count() > 0
+            for marker in self._PLATFORM_INTERCEPTION_MARKERS
+        )
 
     def _browser_cookies(self) -> list[dict[str, object]]:
         if self.cookies_provider is None:
@@ -153,6 +207,11 @@ class PlaywrightBlacklistExecutor:
             for name, value in cookies.items()
             if name and isinstance(value, str)
         ]
+
+
+def _headless_mode() -> bool:
+    value = os.getenv("BILIBILI_FILTER_BROWSER_HEADLESS", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 class BlacklistQueueError(ValueError):

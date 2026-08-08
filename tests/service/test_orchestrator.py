@@ -116,6 +116,16 @@ class FixedAnalyzer:
         )
 
 
+class ExplodingCollector:
+    def collect(self, _task, _checkpoint: CollectionCheckpoint) -> CollectionResult:
+        raise TimeoutError("fixture collector timeout")
+
+
+class ExplodingAnalyzer:
+    def analyze(self, _accounts, _samples):
+        raise TimeoutError("fixture model timeout")
+
+
 def test_orchestrator_applies_three_states_and_repeats_idempotently() -> None:
     collector = FixedCollector()
     analyzer = FixedAnalyzer()
@@ -147,3 +157,51 @@ def test_orchestrator_applies_three_states_and_repeats_idempotently() -> None:
     assert uid_items["1001"]["state"] == "queued"
     assert uid_items["1002"]["state"] == "review"
     assert "1003" not in uid_items
+
+
+def test_orchestrator_turns_unexpected_collection_errors_into_partial_tasks() -> None:
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=ExplodingCollector(),
+        analyzer=FixedAnalyzer(),
+    )
+    from fastapi.testclient import TestClient
+
+    http = TestClient(app)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1collectionerror"}
+    ).json()
+
+    summary = app.state.orchestrator.run(task["task_id"])
+
+    assert summary.status.value == "partial"
+    detail = http.get(f"/api/tasks/{task['task_id']}").json()
+    assert detail["status"] == "partial"
+    assert detail["error_code"] == "collection_failed"
+    assert "fixture collector timeout" in detail["error_message"]
+
+
+def test_orchestrator_turns_unexpected_analysis_errors_into_failed_tasks() -> None:
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=FixedCollector(),
+        analyzer=ExplodingAnalyzer(),
+    )
+    from fastapi.testclient import TestClient
+
+    http = TestClient(app)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1analysiserror"}
+    ).json()
+
+    summary = app.state.orchestrator.run(task["task_id"])
+
+    assert summary.status.value == "failed"
+    detail = http.get(f"/api/tasks/{task['task_id']}").json()
+    assert detail["status"] == "failed"
+    assert detail["error_code"] == "analysis_failed"
+    assert "fixture model timeout" in detail["error_message"]

@@ -95,6 +95,23 @@ def test_samples_can_be_previewed_deduplicated_and_published() -> None:
     assert published.json()["version"] == "samples-v1"
 
 
+def test_highlighted_review_sample_is_published_for_follow_up_analysis() -> None:
+    _, http, task_id = seeded_app()
+    evidence_id = http.get("/api/reviews", params={"task_id": task_id}).json()["items"][0][
+        "evidence_id"
+    ]
+
+    response = http.post(
+        f"/api/reviews/{evidence_id}",
+        json={"action": "highlight", "actor": "reviewer"},
+    )
+
+    assert response.status_code == 200
+    samples = http.get("/api/samples").json()["items"]
+    assert len(samples) == 1
+    assert samples[0]["status"] == "published"
+
+
 def test_blacklist_queue_pause_resume_and_test_executor_are_observable() -> None:
     database = Database(":memory:")
     database.initialize()

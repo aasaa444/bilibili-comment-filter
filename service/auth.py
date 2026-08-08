@@ -22,18 +22,33 @@ class AuthVerifier(Protocol):
 
 
 class BilibiliAuthVerifier:
-    def __init__(self, base_url: str = "https://api.bilibili.com", timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str = "https://api.bilibili.com",
+        timeout: float = 10.0,
+        client: httpx.Client | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.client = client
 
     def verify(self, cookies: dict[str, str]) -> AuthVerification:
         if not cookies:
             return AuthVerification(AuthStatus.MISSING, "No Bilibili session was provided")
         cookie_header = "; ".join(f"{key}={value}" for key, value in cookies.items())
         try:
-            response = httpx.get(
+            request = self.client.get if self.client is not None else httpx.get
+            response = request(
                 f"{self.base_url}/x/web-interface/nav",
-                headers={"Cookie": cookie_header},
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "Cookie": cookie_header,
+                    "Referer": "https://www.bilibili.com/",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+                    ),
+                },
                 timeout=self.timeout,
             )
             response.raise_for_status()
@@ -43,12 +58,18 @@ class BilibiliAuthVerifier:
                 AuthStatus.VERIFICATION_FAILED,
                 f"Bilibili session verification failed: {exc}",
             )
+        if not isinstance(payload, dict):
+            return AuthVerification(
+                AuthStatus.VERIFICATION_FAILED,
+                "Bilibili session verification returned an invalid JSON object",
+            )
         if payload.get("code") != 0:
             return AuthVerification(
                 AuthStatus.INVALID,
                 str(payload.get("message") or "Bilibili rejected the session"),
             )
-        if not payload.get("data", {}).get("isLogin", False):
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("isLogin", False):
             return AuthVerification(AuthStatus.INVALID, "Bilibili session is not logged in")
         return AuthVerification(AuthStatus.VALID, "Bilibili session is valid")
 
