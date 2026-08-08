@@ -31,6 +31,7 @@ class TaskProgress:
     pinned_comments: int = 0
     declared_comments: int = 0
     declared_replies: int = 0
+    declared_total: int | None = None
     coverage: float = 0.0
     failed_items: tuple[str, ...] = ()
 
@@ -213,6 +214,7 @@ class TaskStore:
                 UPDATE video_tasks
                 SET requested_pages = ?, saved_comments = ?, saved_replies = ?,
                     pinned_comments = ?, declared_comments = ?, declared_replies = ?,
+                    declared_total = ?,
                     coverage = ?, failed_items_json = ?, updated_at = ?
                 WHERE task_id = ?
                 """,
@@ -223,6 +225,7 @@ class TaskStore:
                     progress.pinned_comments,
                     progress.declared_comments,
                     progress.declared_replies,
+                    progress.declared_total,
                     progress.coverage,
                     json.dumps(list(progress.failed_items)),
                     timestamp,
@@ -236,7 +239,7 @@ class TaskStore:
                     """
                     UPDATE task_checkpoints
                     SET root_page = ?, replies_json = ?, complete = ?, root_cursor = ?,
-                        requested_pages = ?, declared_comments = ?,
+                        requested_pages = ?, declared_comments = ?, declared_total = ?,
                         declared_reply_counts_json = ?, updated_at = ?
                     WHERE task_id = ?
                     """,
@@ -247,6 +250,11 @@ class TaskStore:
                         int(root_cursor) if root_cursor is not None else None,
                         int(checkpoint.get("requested_pages", 0)),
                         int(checkpoint.get("declared_comments", 0)),
+                        (
+                            int(checkpoint["declared_total"])
+                            if checkpoint.get("declared_total") is not None
+                            else None
+                        ),
                         json.dumps(
                             checkpoint.get("declared_reply_counts", {}), sort_keys=True
                         ),
@@ -266,6 +274,7 @@ class TaskStore:
                 "root_cursor": None,
                 "requested_pages": 0,
                 "declared_comments": 0,
+                "declared_total": None,
                 "declared_reply_counts": {},
                 "root_page": 1,
                 "replies": {},
@@ -275,6 +284,9 @@ class TaskStore:
             "root_cursor": int(row["root_cursor"]) if row["root_cursor"] is not None else None,
             "requested_pages": int(row["requested_pages"]),
             "declared_comments": int(row["declared_comments"]),
+            "declared_total": (
+                int(row["declared_total"]) if row["declared_total"] is not None else None
+            ),
             "declared_reply_counts": json.loads(row["declared_reply_counts_json"]),
             "root_page": int(row["root_page"]),
             "replies": json.loads(row["replies_json"]),
@@ -317,6 +329,9 @@ class TaskStore:
                 pinned_comments=int(row["pinned_comments"]),
                 declared_comments=int(row["declared_comments"]),
                 declared_replies=int(row["declared_replies"]),
+                declared_total=(
+                    int(row["declared_total"]) if row["declared_total"] is not None else None
+                ),
                 coverage=float(row["coverage"]),
                 failed_items=tuple(json.loads(row["failed_items_json"])),
             ),

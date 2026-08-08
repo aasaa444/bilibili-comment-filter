@@ -17,6 +17,19 @@ $logPath = Join-Path $dataPath 'logs'
 $pidPath = Join-Path $dataPath 'service.pid'
 $webIndexPath = Join-Path $repoRoot 'dist\web\index.html'
 
+function Get-ProjectServiceProcess {
+  param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+  $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
+  if (-not $processInfo) { return $null }
+  $expectedPython = [IO.Path]::GetFullPath($pythonPath)
+  $actualPython = if ($processInfo.ExecutablePath) { [IO.Path]::GetFullPath($processInfo.ExecutablePath) } else { '' }
+  if (-not [string]::Equals($actualPython, $expectedPython, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+  $commandLine = [string]$processInfo.CommandLine
+  if ($commandLine -notmatch '(?i)(^|\s)-m\s+service\.cli(\s|$)' -or $commandLine -notmatch '(?i)(^|\s)--port\s+8765(\s|$)') { return $null }
+  return $processInfo
+}
+
 New-Item -ItemType Directory -Path $dataPath -Force | Out-Null
 New-Item -ItemType Directory -Path $logPath -Force | Out-Null
 
@@ -66,9 +79,12 @@ if ($LASTEXITCODE -ne 0) {
 
 if (Test-Path -LiteralPath $pidPath) {
   $existingPid = Get-Content -LiteralPath $pidPath -ErrorAction SilentlyContinue
-  if ($existingPid -and (Get-Process -Id ([int]$existingPid) -ErrorAction SilentlyContinue)) {
-    Write-Output "Service is already running: http://127.0.0.1:8765/"
-    exit 0
+  $existingPidValue = 0
+  if ($existingPid -and [int]::TryParse(([string]$existingPid).Trim(), [ref]$existingPidValue)) {
+    if (Get-ProjectServiceProcess -ProcessId $existingPidValue) {
+      Write-Output "Service is already running: http://127.0.0.1:8765/"
+      exit 0
+    }
   }
   Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
 }
@@ -79,7 +95,7 @@ $arguments = @('-m', 'service.cli', 'serve', '--host', '127.0.0.1', '--port', '8
 $process = Start-Process -FilePath $pythonPath -ArgumentList $arguments -WorkingDirectory $repoRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 $process.Id | Set-Content -LiteralPath $pidPath -Encoding ascii
 Start-Sleep -Seconds 1
-if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+if (-not (Get-ProjectServiceProcess -ProcessId $process.Id)) {
   Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
   throw "Service exited during startup. Check $stderrPath for details."
 }

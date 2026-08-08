@@ -6,7 +6,8 @@
   "description": "Manifest V3 extension and management UI for the local-first Bilibili comment filter",
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-assets.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test tests/frontend/*.test.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.270",

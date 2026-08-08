@@ -8,6 +8,7 @@ from service.analyzer import (
     AnalysisDecision,
     AnalyzerContextLimitError,
     AnalyzerInvalidResponseError,
+    AnalyzerUnavailableError,
     CommentForAnalysis,
     OpenAICompatibleBatchAnalyzer,
     OpenAICompatibleTransport,
@@ -62,7 +63,7 @@ def test_analyzer_batches_accounts_and_keeps_same_uid_together() -> None:
     analyzer = OpenAICompatibleBatchAnalyzer(
         transport=transport,
         model="fixture-model",
-        context_budget=130,
+        context_budget=1050,
     )
     accounts = [
         AccountBundle(
@@ -142,7 +143,7 @@ def test_analyzer_rejects_invalid_structured_model_response() -> None:
             return "not-json"
 
     analyzer = OpenAICompatibleBatchAnalyzer(
-        transport=InvalidTransport(), model="fixture-model", context_budget=100
+        transport=InvalidTransport(), model="fixture-model", context_budget=1000
     )
 
     with pytest.raises(AnalyzerInvalidResponseError):
@@ -173,11 +174,53 @@ def test_analyzer_rejects_incomplete_or_foreign_evidence(response: dict) -> None
             return response
 
     analyzer = OpenAICompatibleBatchAnalyzer(
-        transport=IncompleteTransport(), model="fixture-model", context_budget=100
+        transport=IncompleteTransport(), model="fixture-model", context_budget=1000
     )
 
     with pytest.raises(AnalyzerInvalidResponseError):
         analyzer.analyze([account("1001", "needs analysis")], SampleSet("v1", ()))
+
+
+def test_analyzer_accepts_openai_text_content_segments() -> None:
+    encoded = json.dumps(
+        {
+            "results": [
+                {
+                    "uid": "1001",
+                    "decision": "uncertain",
+                    "evidence_comment_ids": ["c1"],
+                    "reason": "Needs review",
+                    "confidence": 0.5,
+                    "model_version": "fixture-model",
+                }
+            ]
+        }
+    )
+
+    class SegmentedTransport:
+        def complete(self, payload: dict) -> dict:
+            midpoint = len(encoded) // 2
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": encoded[:midpoint]},
+                                {"type": "text", "text": encoded[midpoint:]},
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=SegmentedTransport(), model="fixture-model", context_budget=1000
+    )
+
+    result = analyzer.analyze([account("1001", "needs analysis")], SampleSet("v1", ()))
+
+    assert result.results[0].uid == "1001"
+    assert result.results[0].decision is AnalysisDecision.UNCERTAIN
 
 
 def test_openai_transport_sends_batch_request_with_authentication() -> None:
@@ -190,6 +233,7 @@ def test_openai_transport_sends_batch_request_with_authentication() -> None:
         assert request.headers["authorization"] == "Bearer fixture-key"
         body = json.loads(request.content)
         assert body["model"] == "fixture-model"
+        assert body["max_tokens"] == 321
         assert body["response_format"] == {"type": "json_object"}
         return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
 
@@ -202,6 +246,7 @@ def test_openai_transport_sends_batch_request_with_authentication() -> None:
             base_url="https://model.example/v1",
             api_key="fixture-key",
             model="fixture-model",
+            max_output_tokens=321,
             client=client,
         )
         assert transport.complete({"accounts": []}) == {
@@ -290,6 +335,147 @@ def test_openai_transport_classifies_context_limit_without_retry() -> None:
         client.close()
 
     assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "error_body",
+    [
+        {
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "The request exceeded the model context length",
+            }
+        },
+        "maximum context length is 4096 tokens",
+    ],
+)
+def test_openai_transport_classifies_nested_or_text_context_error_without_retry(
+    error_body: dict | str,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if isinstance(error_body, str):
+            return httpx.Response(400, content=error_body.encode())
+        return httpx.Response(400, json=error_body)
+
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key=None,
+            model="fixture-model",
+            client=client,
+            max_retries=3,
+            retry_backoff=0,
+        )
+        with pytest.raises(AnalyzerContextLimitError):
+            transport.complete({"accounts": []})
+    finally:
+        client.close()
+
+    assert calls == 1
+
+
+def test_openai_transport_retries_timeout_and_raises_unavailable() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("fixture timeout")
+
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key=None,
+            model="fixture-model",
+            client=client,
+            max_retries=1,
+            retry_backoff=0,
+        )
+        with pytest.raises(AnalyzerUnavailableError, match="fixture timeout"):
+            transport.complete({"accounts": []})
+    finally:
+        client.close()
+
+    assert calls == 2
+
+
+def test_analyzer_routes_nested_context_error_to_batch_splitting() -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_body = json.loads(request.content)
+        payload = json.loads(request_body["messages"][1]["content"])
+        accounts = payload["accounts"]
+        calls.append(len(accounts))
+        if len(accounts) > 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "maximum context length exceeded",
+                    }
+                },
+            )
+        item = accounts[0]
+        response = {
+            "results": [
+                {
+                    "uid": item["uid"],
+                    "decision": "uncertain",
+                    "evidence_comment_ids": [item["comments"][0]["comment_id"]],
+                    "reason": "fixture review",
+                    "confidence": 0.5,
+                    "model_version": "fixture-model",
+                }
+            ]
+        }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(response)}}]},
+        )
+
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key=None,
+            model="fixture-model",
+            client=client,
+            max_output_tokens=64,
+            max_retries=3,
+            retry_backoff=0,
+        )
+        analyzer = OpenAICompatibleBatchAnalyzer(
+            transport=transport,
+            model="fixture-model",
+            context_budget=1000,
+        )
+        result = analyzer.analyze(
+            [account("1001", "ordinary one"), account("1002", "ordinary two")],
+            SampleSet("v1", ()),
+        )
+    finally:
+        client.close()
+
+    assert calls == [2, 1, 1]
+    assert result.batch_count == 3
+    assert {item.uid for item in result.results} == {"1001", "1002"}
 
 
 def test_analyzer_splits_a_server_rejected_batch_and_keeps_single_uid_fallback() -> None:

@@ -164,6 +164,85 @@ def test_collector_follows_bilibili_num_size_count_reply_pages() -> None:
     assert result.stats.coverage == 1.0
 
 
+def test_collector_requests_next_reply_page_after_full_page_without_metadata() -> None:
+    class FullReplyPageTransport:
+        def fetch_root_page(self, video_id: str, page: int) -> dict:
+            assert (video_id, page) == ("BV1collector1", 1)
+            return {
+                "replies": [
+                    {
+                        "rpid": 350,
+                        "member": {"mid": 3500, "uname": "root"},
+                        "content": {"message": "root"},
+                        "rcount": 20,
+                    }
+                ],
+                "page": {"count": 1, "page_count": 1},
+            }
+
+        def fetch_replies(self, video_id: str, root_id: str, page: int) -> dict:
+            assert (video_id, root_id) == ("BV1collector1", "350")
+            if page == 1:
+                replies = [
+                    {
+                        "rpid": 3500 + index,
+                        "member": {"mid": 4500 + index, "uname": f"reply-{index}"},
+                        "content": {"message": f"reply {index}"},
+                        "root": 350,
+                        "parent": 350,
+                    }
+                    for index in range(20)
+                ]
+                return {"replies": replies}
+            assert page == 2
+            return {"replies": []}
+
+    result = BilibiliCommentCollector(FullReplyPageTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert result.stats.saved_replies == 20
+    assert result.stats.requested_pages == 3
+
+
+def test_collector_records_deleted_comments_and_inconsistent_comment_shapes() -> None:
+    class AnomalyTransport:
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page == 1
+            return {
+                "replies": [
+                    {
+                        "rpid": 360,
+                        "member": {"mid": 3600, "uname": "valid"},
+                        "content": {"message": "kept"},
+                    },
+                    {
+                        "rpid": 361,
+                        "member": {"mid": 3601, "uname": "deleted"},
+                        "content": {"message": "[该评论已删除]"},
+                    },
+                    {"rpid": 362, "content": {"message": "missing uid"}},
+                ],
+                "page": {"count": 3},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("anomaly fixture has no replies")
+
+    result = BilibiliCommentCollector(AnomalyTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert result.stats.saved_comments == 2
+    assert "deleted_comment:361" in result.failed_items
+    assert any(
+        item.startswith("inconsistent_root_item:1:362:missing_uid")
+        for item in result.failed_items
+    )
+
+
 class CursorTransport:
     def __init__(self) -> None:
         self.pages: list[int] = []
@@ -201,6 +280,56 @@ def test_collector_follows_cursor_and_declared_all_count() -> None:
     assert result.stats.saved_comments == 2
     assert result.stats.declared_comments == 2
     assert result.stats.requested_pages == 2
+    assert result.stats.coverage == 1.0
+
+
+def test_cursor_total_count_is_not_added_to_declared_reply_counts() -> None:
+    class CursorWithRepliesTransport:
+        root_cursor_mode = True
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page == 0
+            return {
+                "replies": [
+                    {
+                        "rpid": 500,
+                        "member": {"mid": 5000, "uname": "root-a"},
+                        "content": {"message": "root a"},
+                        "rcount": 1,
+                    },
+                    {
+                        "rpid": 501,
+                        "member": {"mid": 5001, "uname": "root-b"},
+                        "content": {"message": "root b"},
+                        "rcount": 1,
+                    },
+                ],
+                "cursor": {"all_count": 4, "next": 0, "is_end": True},
+            }
+
+        def fetch_replies(self, _video_id: str, root_id: str, page: int) -> dict:
+            assert page == 1
+            return {
+                "replies": [
+                    {
+                        "rpid": int(root_id) + 100,
+                        "member": {"mid": int(root_id) + 1000, "uname": "reply"},
+                        "content": {"message": "reply"},
+                        "root": int(root_id),
+                        "parent": int(root_id),
+                    }
+                ],
+                "page": {"count": 1},
+            }
+
+    task = make_task()
+    result = BilibiliCommentCollector(CursorWithRepliesTransport()).collect(
+        task, CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert result.stats.declared_comments == 4
+    assert result.stats.declared_replies == 2
     assert result.stats.coverage == 1.0
 
 
@@ -299,6 +428,27 @@ def test_bilibili_transport_maps_login_required_response_to_authentication_error
             min_interval=0,
         )
         with pytest.raises(BilibiliAuthenticationError, match="账号未登录"):
+            transport.fetch_root_page("12345", 1)
+    finally:
+        client.close()
+
+
+def test_bilibili_transport_maps_invalid_csrf_response_to_authentication_error() -> None:
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, json={"code": -111, "message": "csrf check failed"}
+            )
+        ),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: {"SESSDATA": "expired"},
+            client=client,
+            min_interval=0,
+        )
+        with pytest.raises(BilibiliAuthenticationError, match="csrf check failed"):
             transport.fetch_root_page("12345", 1)
     finally:
         client.close()

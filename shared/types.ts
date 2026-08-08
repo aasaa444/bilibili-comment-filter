@@ -58,6 +58,7 @@ export interface VideoTask {
   pinnedComments?: number;
   declaredComments?: number;
   declaredReplies?: number;
+  declaredTotal?: number;
   coverage?: number;
   failedItems?: string[];
   errorCode?: string;

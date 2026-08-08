@@ -38,6 +38,7 @@ class CollectionCheckpoint:
     complete: bool = False
     requested_pages: int = 0
     declared_comments: int = 0
+    declared_total: int | None = None
     declared_reply_counts: dict[str, int] = field(default_factory=dict)
     root_cursor: int | None = None
 
@@ -170,7 +171,7 @@ class BilibiliCommentTransport:
             code = payload.get("code")
             if code == 0:
                 return payload.get("data") or {}
-            if code == -101:
+            if code in {-101, -111}:
                 raise BilibiliAuthenticationError(
                     payload.get("message") or "Bilibili session is no longer valid"
                 )
@@ -197,7 +198,9 @@ class BilibiliCommentCollector:
         root_cursor = checkpoint.root_cursor
         requested_pages = checkpoint.requested_pages
         declared_comments = checkpoint.declared_comments
+        declared_total = checkpoint.declared_total
         pinned_comments = 0
+        invalid_item = False
         fresh_checkpoint = (
             checkpoint.root_page == 1
             and checkpoint.root_cursor is None
@@ -230,17 +233,70 @@ class BilibiliCommentCollector:
                         declared_comments,
                         declared_reply_by_root,
                         root_cursor,
+                        declared_total=declared_total,
                     ),
                     requested_pages,
                     pinned_comments,
                     declared_comments,
                     sum(declared_reply_by_root.values()),
                     failed_items,
+                    declared_total=declared_total,
                 )
 
-            root_items = list(payload.get("replies") or [])
+            if not isinstance(payload, dict):
+                failed_items.append(f"inconsistent_root_payload:{root_page}:not_object")
+                return self._result(
+                    comments,
+                    self._checkpoint(
+                        root_page,
+                        reply_pages,
+                        False,
+                        requested_pages,
+                        declared_comments,
+                        declared_reply_by_root,
+                        root_cursor,
+                        declared_total=declared_total,
+                    ),
+                    requested_pages,
+                    pinned_comments,
+                    declared_comments,
+                    sum(declared_reply_by_root.values()),
+                    failed_items,
+                    declared_total=declared_total,
+                )
+            if "replies" not in payload:
+                failed_items.append(f"inconsistent_root_payload:{root_page}:missing_replies")
+                return self._result(
+                    comments,
+                    self._checkpoint(
+                        root_page,
+                        reply_pages,
+                        False,
+                        requested_pages,
+                        declared_comments,
+                        declared_reply_by_root,
+                        root_cursor,
+                        declared_total=declared_total,
+                    ),
+                    requested_pages,
+                    pinned_comments,
+                    declared_comments,
+                    sum(declared_reply_by_root.values()),
+                    failed_items,
+                    declared_total=declared_total,
+                )
+            raw_root_items = list(payload.get("replies") or [])
+            invalid_item = invalid_item or len(raw_root_items) != sum(
+                isinstance(item, dict) for item in raw_root_items
+            )
+            if invalid_item:
+                failed_items.append(f"inconsistent_root_item:{root_page}:not_object")
+            root_items = [item for item in raw_root_items if isinstance(item, dict)]
             root_items.extend(_pinned_items(payload))
             declared_comments = max(declared_comments, _declared_count(payload))
+            source_total = _declared_total(payload)
+            if source_total is not None:
+                declared_total = max(declared_total or 0, source_total)
             root_ids = [self._comment_id(item) for item in root_items]
             if root_ids and all(comment_id in seen_ids for comment_id in root_ids):
                 failed_items.append(f"duplicate_root_page:{root_page}")
@@ -254,22 +310,36 @@ class BilibiliCommentCollector:
                         declared_comments,
                         declared_reply_by_root,
                         root_cursor,
+                        declared_total=declared_total,
                     ),
                     requested_pages,
                     pinned_comments,
                     declared_comments,
                     sum(declared_reply_by_root.values()),
                     failed_items,
+                    declared_total=declared_total,
                 )
 
+            if not root_items:
+                failed_items.append(f"empty_root_page:{root_page}")
+
             for item in root_items:
-                comment = self._parse_comment(
-                    task.video_id,
-                    item,
-                    root_id=self._comment_id(item),
-                    parent_id=None,
-                    level="root",
-                )
+                comment_id = self._comment_id(item)
+                try:
+                    comment = self._parse_comment(
+                        task.video_id,
+                        item,
+                        root_id=comment_id,
+                        parent_id=None,
+                        level="root",
+                    )
+                except ValueError as exc:
+                    invalid_item = True
+                    failed_items.append(
+                        f"inconsistent_root_item:{root_page}:{comment_id or 'unknown'}:{exc}"
+                    )
+                    continue
+                failed_items.extend(self._comment_anomalies(comment, item))
                 if comment.comment_id in seen_ids:
                     index = comment_indexes[comment.comment_id]
                     existing = comments[index]
@@ -305,14 +375,72 @@ class BilibiliCommentCollector:
                                 declared_comments,
                                 declared_reply_by_root,
                                 root_cursor,
+                                declared_total=declared_total,
                             ),
                             requested_pages,
                             pinned_comments,
                             declared_comments,
                             sum(declared_reply_by_root.values()),
                             failed_items,
+                            declared_total=declared_total,
                         )
-                    reply_items = list(reply_payload.get("replies") or [])
+                    if not isinstance(reply_payload, dict):
+                        failed_items.append(
+                            f"inconsistent_reply_payload:{root_id}:{reply_page}:not_object"
+                        )
+                        return self._result(
+                            comments,
+                            self._checkpoint(
+                                root_page,
+                                {**reply_pages, root_id: reply_page},
+                                False,
+                                requested_pages,
+                                declared_comments,
+                                declared_reply_by_root,
+                                root_cursor,
+                                declared_total=declared_total,
+                            ),
+                            requested_pages,
+                            pinned_comments,
+                            declared_comments,
+                            sum(declared_reply_by_root.values()),
+                            failed_items,
+                            declared_total=declared_total,
+                        )
+                    if "replies" not in reply_payload:
+                        failed_items.append(
+                            f"inconsistent_reply_payload:{root_id}:{reply_page}:missing_replies"
+                        )
+                        return self._result(
+                            comments,
+                            self._checkpoint(
+                                root_page,
+                                {**reply_pages, root_id: reply_page},
+                                False,
+                                requested_pages,
+                                declared_comments,
+                                declared_reply_by_root,
+                                root_cursor,
+                                declared_total=declared_total,
+                            ),
+                            requested_pages,
+                            pinned_comments,
+                            declared_comments,
+                            sum(declared_reply_by_root.values()),
+                            failed_items,
+                            declared_total=declared_total,
+                        )
+                    raw_reply_items = list(reply_payload.get("replies") or [])
+                    if len(raw_reply_items) != sum(
+                        isinstance(item, dict) for item in raw_reply_items
+                    ):
+                        invalid_item = True
+                        failed_items.append(
+                            f"inconsistent_reply_item:{root_id}:{reply_page}:not_object"
+                        )
+                    reply_items = [item for item in raw_reply_items if isinstance(item, dict)]
+                    if not reply_items:
+                        failed_items.append(f"empty_reply_page:{root_id}:{reply_page}")
                     declared_reply_by_root[root_id] = max(
                         declared_reply_by_root.get(root_id, 0), _declared_count(reply_payload)
                     )
@@ -329,21 +457,37 @@ class BilibiliCommentCollector:
                                 declared_comments,
                                 declared_reply_by_root,
                                 root_cursor,
+                                declared_total=declared_total,
                             ),
                             requested_pages,
                             pinned_comments,
                             declared_comments,
                             sum(declared_reply_by_root.values()),
                             failed_items,
+                            declared_total=declared_total,
                         )
                     for reply in reply_items:
-                        parsed = self._parse_comment(
-                            task.video_id,
-                            reply,
-                            root_id=root_id,
-                            parent_id=str(reply.get("parent")) if reply.get("parent") else root_id,
-                            level="reply",
-                        )
+                        comment_id = self._comment_id(reply)
+                        try:
+                            parsed = self._parse_comment(
+                                task.video_id,
+                                reply,
+                                root_id=root_id,
+                                parent_id=(
+                                    str(reply.get("parent"))
+                                    if reply.get("parent")
+                                    else root_id
+                                ),
+                                level="reply",
+                            )
+                        except ValueError as exc:
+                            invalid_item = True
+                            failed_items.append(
+                                f"inconsistent_reply_item:{root_id}:{reply_page}:"
+                                f"{comment_id or 'unknown'}:{exc}"
+                            )
+                            continue
+                        failed_items.extend(self._comment_anomalies(parsed, reply))
                         if parsed.comment_id in seen_ids:
                             index = comment_indexes[parsed.comment_id]
                             existing = comments[index]
@@ -354,7 +498,7 @@ class BilibiliCommentCollector:
                         seen_ids.add(parsed.comment_id)
                         comment_indexes[parsed.comment_id] = len(comments)
                         comments.append(parsed)
-                    if _has_more(reply_payload, reply_page):
+                    if _has_more(reply_payload, reply_page, item_count=len(reply_items)):
                         reply_page += 1
                         reply_pages[root_id] = reply_page
                         continue
@@ -364,7 +508,9 @@ class BilibiliCommentCollector:
                 root_page += 1
                 root_cursor = _next_cursor(payload)
                 continue
-            total_declared = declared_comments + sum(declared_reply_by_root.values())
+            total_declared = _total_declared(
+                declared_comments, sum(declared_reply_by_root.values()), declared_total
+            )
             total_saved = len(comments)
             return self._result(
                 comments,
@@ -375,22 +521,25 @@ class BilibiliCommentCollector:
                         not fresh_checkpoint
                         or not total_declared
                         or total_saved >= total_declared
-                    ),
+                    ) and not invalid_item,
                     requested_pages,
                     declared_comments,
                     declared_reply_by_root,
                     None,
+                    declared_total=declared_total,
                 ),
                 requested_pages,
                 pinned_comments,
                 declared_comments,
                 sum(declared_reply_by_root.values()),
                 failed_items,
+                declared_total=declared_total,
             )
 
     @staticmethod
     def _comment_id(item: dict[str, Any]) -> str:
-        return str(item.get("rpid") or item.get("id"))
+        raw_id = item.get("rpid") or item.get("id")
+        return str(raw_id) if raw_id not in (None, "") else ""
 
     @staticmethod
     def _parse_comment(
@@ -401,9 +550,19 @@ class BilibiliCommentCollector:
         parent_id: str | None,
         level: str,
     ) -> CommentRecord:
-        member = item.get("member") or {}
-        content = item.get("content") or {}
-        comment_id = str(item.get("rpid") or item.get("id"))
+        raw_comment_id = item.get("rpid") or item.get("id")
+        if raw_comment_id in (None, ""):
+            raise ValueError("missing_comment_id")
+        comment_id = str(raw_comment_id)
+        member = item.get("member")
+        if not isinstance(member, dict):
+            member = {}
+        content = item.get("content")
+        if not isinstance(content, dict):
+            content = {}
+        raw_uid = item.get("mid") or member.get("mid")
+        if raw_uid in (None, "", 0, "0"):
+            raise ValueError("missing_uid")
         raw_root = item.get("root")
         raw_parent = item.get("parent")
         resolved_root = str(raw_root) if raw_root not in (None, 0, "0") else root_id
@@ -415,7 +574,7 @@ class BilibiliCommentCollector:
         )
         return CommentRecord(
             comment_id=comment_id,
-            uid=str(item.get("mid") or member.get("mid") or "0"),
+            uid=str(raw_uid),
             nickname=member.get("uname") or item.get("nickname"),
             content=str(content.get("message") or item.get("message") or ""),
             video_id=video_id,
@@ -423,10 +582,27 @@ class BilibiliCommentCollector:
             root_id=resolved_root,
             parent_id=resolved_parent,
             level=level,
-            created_at=int(item["ctime"]) if item.get("ctime") is not None else None,
+            created_at=_created_at(item.get("ctime")),
             is_pinned=bool(item.get("is_top") or item.get("top")),
             context=context,
         )
+
+    @staticmethod
+    def _comment_anomalies(comment: CommentRecord, item: dict[str, Any]) -> tuple[str, ...]:
+        anomalies: list[str] = []
+        if not comment.nickname:
+            anomalies.append(f"inconsistent_comment:{comment.comment_id}:missing_nickname")
+        if (
+            item.get("is_deleted")
+            or item.get("deleted")
+            or item.get("status") == -1
+            or comment.content in {
+                "[\u8be5\u8bc4\u8bba\u5df2\u5220\u9664]",
+                "\u8be5\u8bc4\u8bba\u5df2\u5220\u9664",
+            }
+        ):
+            anomalies.append(f"deleted_comment:{comment.comment_id}")
+        return tuple(anomalies)
 
     @staticmethod
     def _result(
@@ -437,11 +613,13 @@ class BilibiliCommentCollector:
         declared_comments: int,
         declared_replies: int,
         failed_items: list[str],
+        *,
+        declared_total: int | None = None,
     ) -> CollectionResult:
         saved_comments = sum(comment.level == "root" for comment in comments)
         saved_replies = sum(comment.level == "reply" for comment in comments)
         total_saved = saved_comments + saved_replies
-        total_declared = declared_comments + declared_replies
+        total_declared = _total_declared(declared_comments, declared_replies, declared_total)
         coverage = (
             min(1.0, total_saved / total_declared) if total_declared else float(bool(total_saved))
         )
@@ -457,7 +635,7 @@ class BilibiliCommentCollector:
                 declared_replies=declared_replies,
                 coverage=coverage,
             ),
-            complete=checkpoint.complete and not failed_items,
+            complete=checkpoint.complete,
             failed_items=tuple(failed_items),
         )
 
@@ -470,6 +648,8 @@ class BilibiliCommentCollector:
         declared_comments: int,
         declared_reply_counts: dict[str, int],
         root_cursor: int | None = None,
+        *,
+        declared_total: int | None = None,
     ) -> CollectionCheckpoint:
         return CollectionCheckpoint(
             root_page=root_page,
@@ -477,6 +657,7 @@ class BilibiliCommentCollector:
             complete=complete,
             requested_pages=requested_pages,
             declared_comments=declared_comments,
+            declared_total=declared_total,
             declared_reply_counts=dict(declared_reply_counts),
             root_cursor=root_cursor,
         )
@@ -493,7 +674,31 @@ def _declared_count(payload: dict[str, Any]) -> int:
     return int(cursor.get("all_count") or 0)
 
 
-def _has_more(payload: dict[str, Any], page: int) -> bool:
+def _created_at(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_ctime") from exc
+
+
+def _declared_total(payload: dict[str, Any]) -> int | None:
+    if payload.get("declared_total") is not None:
+        return int(payload["declared_total"])
+    cursor = payload.get("cursor") or {}
+    if "all_count" in cursor and cursor.get("all_count") is not None:
+        return int(cursor["all_count"])
+    return None
+
+
+def _total_declared(
+    declared_comments: int, declared_replies: int, declared_total: int | None
+) -> int:
+    return declared_total if declared_total is not None else declared_comments + declared_replies
+
+
+def _has_more(payload: dict[str, Any], page: int, *, item_count: int | None = None) -> bool:
     if "has_more" in payload:
         return bool(payload["has_more"])
     cursor = payload.get("cursor") or {}
@@ -505,7 +710,9 @@ def _has_more(payload: dict[str, Any], page: int) -> bool:
         return page_count > page
     page_size = int(page_info.get("size") or 0)
     total = int(page_info.get("count") or page_info.get("acount") or 0)
-    return bool(page_size and total and total > page * page_size)
+    if page_size and total:
+        return total > page * page_size
+    return item_count is not None and item_count >= 20
 
 
 def _next_cursor(payload: dict[str, Any]) -> int | None:

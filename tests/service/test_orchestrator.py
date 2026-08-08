@@ -73,7 +73,7 @@ class FixedCollector:
         )
         return CollectionResult(
             comments=comments,
-            checkpoint=CollectionCheckpoint(root_page=2, complete=True),
+            checkpoint=CollectionCheckpoint(root_page=2, complete=True, declared_total=3),
             stats=CollectionStats(
                 requested_pages=1,
                 saved_comments=3,
@@ -159,6 +159,75 @@ class IncompleteButMarkedCompleteCollector:
         )
 
 
+class RestartCollector:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def collect(self, task, checkpoint: CollectionCheckpoint) -> CollectionResult:
+        self.calls += 1
+        if self.calls == 1:
+            comment = CommentRecord(
+                "restart-root-1",
+                "1001",
+                "first-user",
+                "first page",
+                task.video_id,
+                "https://example.test/restart-root-1",
+                "restart-root-1",
+                None,
+                "root",
+                1700000010,
+                False,
+            )
+            return CollectionResult(
+                comments=(comment,),
+                checkpoint=CollectionCheckpoint(
+                    root_page=2,
+                    complete=False,
+                    requested_pages=1,
+                    declared_comments=2,
+                ),
+                stats=CollectionStats(
+                    requested_pages=1,
+                    saved_comments=1,
+                    declared_comments=2,
+                    coverage=0.5,
+                ),
+                complete=False,
+            )
+
+        assert checkpoint.root_page == 2
+        comment = CommentRecord(
+            "restart-root-2",
+            "1002",
+            "second-user",
+            "second page",
+            task.video_id,
+            "https://example.test/restart-root-2",
+            "restart-root-2",
+            None,
+            "root",
+            1700000011,
+            False,
+        )
+        return CollectionResult(
+            comments=(comment,),
+            checkpoint=CollectionCheckpoint(
+                root_page=3,
+                complete=True,
+                requested_pages=2,
+                declared_comments=2,
+            ),
+            stats=CollectionStats(
+                requested_pages=1,
+                saved_comments=1,
+                declared_comments=2,
+                coverage=0.5,
+            ),
+            complete=True,
+        )
+
+
 class ExpiredSessionCollector:
     def collect(self, _task, _checkpoint: CollectionCheckpoint) -> CollectionResult:
         raise BilibiliAuthenticationError("fixture session expired")
@@ -208,6 +277,7 @@ def test_orchestrator_applies_three_states_and_repeats_idempotently() -> None:
     assert collector.calls == 1
     assert analyzer.calls == 1
     assert http.get("/api/tasks").json()["items"][0]["status"] == "completed"
+    assert http.get("/api/tasks").json()["items"][0]["progress"]["declared_total"] == 3
     uid_items = {item["uid"]: item for item in http.get("/api/uids").json()["items"]}
     assert uid_items["1001"]["state"] == "queued"
     assert uid_items["1002"]["state"] == "review"
@@ -284,6 +354,50 @@ def test_orchestrator_pauses_when_collection_session_expires() -> None:
     detail = http.get(f"/api/tasks/{task['task_id']}").json()
     assert detail["error_code"] == "auth_unavailable"
     assert "fixture session expired" in detail["error_message"]
+    auth = http.get("/api/auth/session").json()
+    assert auth["status"] == "invalid"
+    assert auth["detail"] == "fixture session expired"
+
+
+def test_orchestrator_resumes_checkpoint_after_rebuilding_app(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    db_path = tmp_path / "restart.sqlite3"
+    collector = RestartCollector()
+    first_app = create_app(
+        db_path=db_path,
+        auth_verifier=ValidVerifier(),
+        collector=collector,
+        analyzer=FixedAnalyzer(),
+    )
+    with TestClient(
+        first_app
+    ) as first_client:
+        first_client.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+        task = first_client.post(
+            "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1restart"}
+        ).json()
+        first_run = first_client.post(f"/api/tasks/{task['task_id']}/run")
+        assert first_run.json()["status"] == "partial"
+        assert first_app.state.task_store.checkpoint(task["task_id"])["root_page"] == 2
+
+    app = create_app(
+        db_path=db_path,
+        auth_verifier=ValidVerifier(),
+        collector=collector,
+        analyzer=FixedAnalyzer(),
+    )
+    with TestClient(app) as second_client:
+        app.state.task_store.retry(task["task_id"])
+        resumed = second_client.post(f"/api/tasks/{task['task_id']}/run")
+        assert resumed.json()["status"] == "completed"
+        comments = second_client.get(f"/api/tasks/{task['task_id']}/comments").json()["items"]
+        assert [item["comment_id"] for item in comments] == [
+            "restart-root-1",
+            "restart-root-2",
+        ]
+        assert app.state.task_store.checkpoint(task["task_id"])["complete"] is True
+    assert collector.calls == 2
 
 
 def test_orchestrator_turns_unexpected_analysis_errors_into_failed_tasks() -> None:

@@ -114,6 +114,20 @@ class AuthService:
         )
         return verification, checked_at
 
+    def mark_invalid(self, detail: str, *, source: str = "runtime") -> AuthVerification:
+        """Persist an invalidation observed after a session had already been accepted."""
+
+        cookies = self.database.latest_auth_cookies() or {}
+        verification = AuthVerification(AuthStatus.INVALID, detail)
+        self.database.save_auth_session(
+            cookies=cookies,
+            status=verification.status.value,
+            detail=verification.detail,
+            source=source,
+            checked_at=datetime.now(UTC).isoformat(),
+        )
+        return verification
+
     def is_valid(self) -> bool:
         verification, _, _ = self.current()
         return verification.status is AuthStatus.VALID

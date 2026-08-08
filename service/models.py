@@ -125,6 +125,7 @@ class TaskProgressResponse(BaseModel):
     pinned_comments: int
     declared_comments: int
     declared_replies: int
+    declared_total: int | None
     coverage: float
     failed_items: list[str]
 

@@ -114,6 +114,9 @@ def create_app(
             base_url=model_base_url,
             api_key=model_api_key,
             model=model_name,
+            max_output_tokens=_env_positive_int(
+                "BILIBILI_FILTER_OPENAI_MAX_OUTPUT_TOKENS", 512
+            ),
         ),
         model=model_name,
         context_budget=_env_positive_int("BILIBILI_FILTER_OPENAI_CONTEXT_TOKENS", 100000),
@@ -567,6 +570,7 @@ def task_response(task: VideoTask) -> TaskResponse:
             pinned_comments=task.progress.pinned_comments,
             declared_comments=task.progress.declared_comments,
             declared_replies=task.progress.declared_replies,
+            declared_total=task.progress.declared_total,
             coverage=task.progress.coverage,
             failed_items=list(task.progress.failed_items),
         ),

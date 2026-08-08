@@ -27,6 +27,7 @@ test("API client normalizes completed tasks, nested progress and evidence decisi
           pinned_comments: 1,
           declared_comments: 5,
           declared_replies: 3,
+          declared_total: 8,
           coverage: 1,
           failed_items: ["reply:root-1:2"],
         },
@@ -44,6 +45,7 @@ test("API client normalizes completed tasks, nested progress and evidence decisi
   assert.equal(tasks.items[0].pinnedComments, 1);
   assert.equal(tasks.items[0].declaredComments, 5);
   assert.equal(tasks.items[0].declaredReplies, 3);
+  assert.equal(tasks.items[0].declaredTotal, 8);
   assert.equal(tasks.items[0].coverage, 1);
   assert.deepEqual(tasks.items[0].failedItems, ["reply:root-1:2"]);
   assert.equal(tasks.items[0].errorCode, "partial_collection");

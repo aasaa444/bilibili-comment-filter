@@ -10,6 +10,23 @@ from typing import Any, Protocol
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+_DEFAULT_MAX_OUTPUT_TOKENS = 512
+_REQUEST_JSON_OVERHEAD_TOKENS = 128
+_SYSTEM_PROMPT = (
+    "You classify Bilibili comment authors at UID level for a local "
+    "high-recall filter. Judge all comments belonging to one UID together, "
+    "using nickname, wording, thread context, and provided samples. "
+    "Mark hit for explicit insults, malicious denigration, sustained "
+    "mockery, obvious hostility toward James, or a clearly hostile "
+    "nickname. Mark non_target only when the account is clearly ordinary, "
+    "friendly, or neutral. Use uncertain when evidence is ambiguous, but "
+    "always cite at least one supplied comment for hit or uncertain. "
+    "A configured friendly exception such as Mamba Buster must not be "
+    "treated as a hit. Return exactly one result for every input UID, "
+    "with only the values hit, non_target, or uncertain in decision. "
+    "Return one JSON object with a results array and no markdown."
+)
+
 
 class AnalysisDecision(StrEnum):
     HIT = "hit"
@@ -232,6 +249,7 @@ class OpenAICompatibleTransport:
         api_key: str | None,
         model: str,
         timeout: float = 30.0,
+        max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
         max_retries: int = 2,
         retry_backoff: float = 0.25,
         client: httpx.Client | None = None,
@@ -239,6 +257,7 @@ class OpenAICompatibleTransport:
         self.client = client or httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
         self.api_key = api_key
         self.model = model
+        self.max_output_tokens = max(1, int(max_output_tokens))
         self.max_retries = max(0, max_retries)
         self.retry_backoff = max(0.0, retry_backoff)
 
@@ -246,23 +265,11 @@ class OpenAICompatibleTransport:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         request = {
             "model": self.model,
+            "max_tokens": self.max_output_tokens,
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You classify Bilibili comment authors at UID level for a local "
-                        "high-recall filter. Judge all comments belonging to one UID together, "
-                        "using nickname, wording, thread context, and provided samples. "
-                        "Mark hit for explicit insults, malicious denigration, sustained "
-                        "mockery, obvious hostility toward James, or a clearly hostile "
-                        "nickname. Mark non_target only when the account is clearly ordinary, "
-                        "friendly, or neutral. Use uncertain when evidence is ambiguous, but "
-                        "always cite at least one supplied comment for hit or uncertain. "
-                        "A configured friendly exception such as Mamba Buster must not be "
-                        "treated as a hit. Return exactly one result for every input UID, "
-                        "with only the values hit, non_target, or uncertain in decision. "
-                        "Return one JSON object with a results array and no markdown."
-                    ),
+                    "content": _SYSTEM_PROMPT,
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
@@ -332,13 +339,17 @@ class OpenAICompatibleBatchAnalyzer:
         self.transport = transport
         self.model = model
         self.context_budget = context_budget
+        self.max_output_tokens = max(
+            1,
+            int(getattr(transport, "max_output_tokens", _DEFAULT_MAX_OUTPUT_TOKENS)),
+        )
         self.rule_engine = rule_engine or RuleEngine()
         self.sample_injector = sample_injector or SampleInjector()
 
     def analyze(
         self, accounts: tuple[AccountBundle, ...], samples: SampleSet
     ) -> AnalysisBatchResult:
-        sample_context = self.sample_injector.prepare(samples, accounts, self.context_budget)
+        sample_context = self.sample_injector.prepare(samples, accounts, self._input_budget())
         rule_results: list[AnalysisResult] = []
         unresolved: list[AccountBundle] = []
         available_tokens = self._available_tokens(sample_context)
@@ -437,8 +448,19 @@ class OpenAICompatibleBatchAnalyzer:
         return [tuple(batch) for batch in batches]
 
     def _available_tokens(self, sample_context: SampleContext) -> int:
-        sample_tokens = sum(_estimate_text(item.content) for item in sample_context.items)
-        return max(1, self.context_budget - sample_tokens - 16)
+        sample_tokens = _estimate_text(
+            json.dumps([item.__dict__ for item in sample_context.items], ensure_ascii=False)
+        )
+        return max(1, self._input_budget() - sample_tokens)
+
+    def _input_budget(self) -> int:
+        return max(
+            1,
+            self.context_budget
+            - _estimate_text(_SYSTEM_PROMPT)
+            - _REQUEST_JSON_OVERHEAD_TOKENS
+            - self.max_output_tokens,
+        )
 
     def _context_overflow_result(
         self,
@@ -478,7 +500,13 @@ class OpenAICompatibleBatchAnalyzer:
     ) -> list[AnalysisResult]:
         payload = raw
         if isinstance(payload, dict) and payload.get("choices"):
-            payload = payload["choices"][0].get("message", {}).get("content", "")
+            choice = payload["choices"][0]
+            if not isinstance(choice, dict):
+                raise AnalyzerInvalidResponseError("Model response choice must be an object")
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise AnalyzerInvalidResponseError("Model response message must be an object")
+            payload = _message_content_text(message.get("content"))
         if isinstance(payload, str):
             payload = _parse_json_text(payload)
         if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
@@ -597,11 +625,58 @@ def _is_context_limit_response(response: httpx.Response) -> bool:
         return True
     if response.status_code != 400:
         return False
-    body = response.text.casefold()
+    fragments = [response.text]
+    try:
+        fragments.extend(_text_fragments(response.json()))
+    except ValueError:
+        pass
+    body = re.sub(r"[_-]+", " ", "\n".join(fragments).casefold())
     return any(
         marker in body
-        for marker in ("context length", "context window", "too many tokens", "max tokens")
+        for marker in (
+            "context length exceeded",
+            "maximum context length",
+            "context length",
+            "context window",
+            "too many tokens",
+            "max tokens",
+        )
     )
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        segments: list[str] = []
+        for segment in content:
+            if isinstance(segment, str):
+                segments.append(segment)
+            elif isinstance(segment, dict) and isinstance(segment.get("text"), str):
+                segments.append(segment["text"])
+            else:
+                raise AnalyzerInvalidResponseError(
+                    "Model message content must contain text segments"
+                )
+        return "".join(segments)
+    raise AnalyzerInvalidResponseError("Model message content must be a string or text segments")
+
+
+def _text_fragments(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        fragments: list[str] = []
+        for key, item in value.items():
+            fragments.append(str(key))
+            fragments.extend(_text_fragments(item))
+        return fragments
+    if isinstance(value, list):
+        fragments = []
+        for item in value:
+            fragments.extend(_text_fragments(item))
+        return fragments
+    if isinstance(value, str):
+        return [value]
+    return []
 
 
 def _keywords(value: str) -> tuple[str, ...]:

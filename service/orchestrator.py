@@ -89,6 +89,11 @@ class TaskOrchestrator:
             complete=bool(checkpoint_data.get("complete", False)),
             requested_pages=int(checkpoint_data.get("requested_pages", 0)),
             declared_comments=int(checkpoint_data.get("declared_comments", 0)),
+            declared_total=(
+                int(checkpoint_data["declared_total"])
+                if checkpoint_data.get("declared_total") is not None
+                else None
+            ),
             declared_reply_counts={
                 str(key): int(value)
                 for key, value in dict(checkpoint_data.get("declared_reply_counts", {})).items()
@@ -101,7 +106,11 @@ class TaskOrchestrator:
         )
         if checkpoint.complete:
             declared_replies = sum(checkpoint.declared_reply_counts.values())
-            total_declared = checkpoint.declared_comments + declared_replies
+            total_declared = (
+                checkpoint.declared_total
+                if checkpoint.declared_total is not None
+                else checkpoint.declared_comments + declared_replies
+            )
             collection = CollectionResult(
                 comments=(),
                 checkpoint=checkpoint,
@@ -117,6 +126,8 @@ class TaskOrchestrator:
             try:
                 collection = self.collector.collect(collecting, checkpoint)
             except BilibiliAuthenticationError as exc:
+                if self.auth_service is not None:
+                    self.auth_service.mark_invalid(str(exc))
                 paused = self.task_store.transition(
                     task_id,
                     TaskStatus.PAUSED,
@@ -145,7 +156,16 @@ class TaskOrchestrator:
                 sum(checkpoint.declared_reply_counts.values()),
                 collection.stats.declared_replies,
             )
-        total_declared = declared_comments + declared_replies
+        declared_total = (
+            collection.checkpoint.declared_total
+            if collection.checkpoint.declared_total is not None
+            else checkpoint.declared_total
+        )
+        total_declared = (
+            declared_total
+            if declared_total is not None
+            else declared_comments + declared_replies
+        )
         coverage = (
             min(1.0, (saved_comments + saved_replies) / total_declared)
             if total_declared
@@ -160,6 +180,7 @@ class TaskOrchestrator:
             pinned_comments=pinned_comments,
             declared_comments=declared_comments,
             declared_replies=declared_replies,
+            declared_total=declared_total,
             coverage=coverage,
             failed_items=collection.failed_items,
         )
@@ -173,6 +194,7 @@ class TaskOrchestrator:
                 and (not total_declared or saved_comments + saved_replies >= total_declared),
                 "requested_pages": collection.checkpoint.requested_pages,
                 "declared_comments": collection.checkpoint.declared_comments,
+                "declared_total": collection.checkpoint.declared_total,
                 "declared_reply_counts": collection.checkpoint.declared_reply_counts,
                 "root_cursor": collection.checkpoint.root_cursor,
             },

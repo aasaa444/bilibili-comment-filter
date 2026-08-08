@@ -291,6 +291,7 @@ function normalizeVideoTask(value: unknown): VideoTask | null {
     pinnedComments: numberValue(candidate.pinned_comments) ?? numberValue(candidate.pinnedComments) ?? numberValue(progressObject.pinned_comments) ?? undefined,
     declaredComments: numberValue(candidate.declared_comments) ?? numberValue(candidate.declaredComments) ?? numberValue(progressObject.declared_comments) ?? undefined,
     declaredReplies: numberValue(candidate.declared_replies) ?? numberValue(candidate.declaredReplies) ?? numberValue(progressObject.declared_replies) ?? undefined,
+    declaredTotal: numberValue(candidate.declared_total) ?? numberValue(candidate.declaredTotal) ?? numberValue(progressObject.declared_total) ?? numberValue(progressObject.declaredTotal) ?? undefined,
     coverage: numberValue(candidate.coverage) ?? numberValue(progressObject.coverage) ?? undefined,
     failedItems: failedItems === null ? undefined : stringArray(failedItems),
     errorCode: stringValue(candidate.error_code) ?? stringValue(candidate.errorCode),

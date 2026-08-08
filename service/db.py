@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS video_tasks (
     pinned_comments INTEGER NOT NULL DEFAULT 0,
     declared_comments INTEGER NOT NULL DEFAULT 0,
     declared_replies INTEGER NOT NULL DEFAULT 0,
+    declared_total INTEGER,
     coverage REAL NOT NULL DEFAULT 0,
     failed_items_json TEXT NOT NULL DEFAULT '[]'
 );
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
     root_cursor INTEGER,
     requested_pages INTEGER NOT NULL DEFAULT 0,
     declared_comments INTEGER NOT NULL DEFAULT 0,
+    declared_total INTEGER,
     declared_reply_counts_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES video_tasks(task_id)
@@ -182,9 +184,17 @@ class Database:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.executescript(SCHEMA)
+        self._migrate_video_tasks()
         self._migrate_task_checkpoints()
         self._connection.commit()
         self.recover_blacklist_processing()
+
+    def _migrate_video_tasks(self) -> None:
+        columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(video_tasks)")
+        }
+        if "declared_total" not in columns:
+            self.connection.execute("ALTER TABLE video_tasks ADD COLUMN declared_total INTEGER")
 
     def _migrate_task_checkpoints(self) -> None:
         columns = {
@@ -195,6 +205,7 @@ class Database:
             "root_cursor": "INTEGER",
             "requested_pages": "INTEGER NOT NULL DEFAULT 0",
             "declared_comments": "INTEGER NOT NULL DEFAULT 0",
+            "declared_total": "INTEGER",
             "declared_reply_counts_json": "TEXT NOT NULL DEFAULT '{}'",
         }
         for name, definition in additions.items():

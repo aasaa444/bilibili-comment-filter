@@ -111,6 +111,7 @@ def test_empty_model_environment_values_use_local_defaults(monkeypatch) -> None:
     monkeypatch.setenv("BILIBILI_FILTER_OPENAI_BASE_URL", "   ")
     monkeypatch.setenv("BILIBILI_FILTER_OPENAI_MODEL", "")
     monkeypatch.setenv("BILIBILI_FILTER_OPENAI_API_KEY", " ")
+    monkeypatch.setenv("BILIBILI_FILTER_OPENAI_MAX_OUTPUT_TOKENS", "321")
     monkeypatch.delenv("BILIBILI_FILTER_MODEL_URL", raising=False)
     monkeypatch.delenv("BILIBILI_FILTER_MODEL", raising=False)
     monkeypatch.delenv("BILIBILI_FILTER_MODEL_KEY", raising=False)
@@ -124,3 +125,4 @@ def test_empty_model_environment_values_use_local_defaults(monkeypatch) -> None:
     assert str(transport.client.base_url) == "http://127.0.0.1:11434/v1/"
     assert transport.model == "local-model"
     assert transport.api_key is None
+    assert transport.max_output_tokens == 321

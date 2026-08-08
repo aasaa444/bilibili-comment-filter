@@ -54,6 +54,7 @@ function createTask(taskId, title) {
     pinnedComments: 1,
     declaredComments: 5,
     declaredReplies: 3,
+    declaredTotal: 8,
     coverage: 0.8,
     failedItems: ["reply:root-1:2"],
   };
@@ -133,6 +134,8 @@ test("task rows expose a detail entry and render normalized root/reply comments 
     assert.match(root.content.innerHTML, /保存根评论/);
     assert.match(root.content.innerHTML, /覆盖率/);
     assert.match(root.content.innerHTML, /80%/);
+    assert.match(root.content.innerHTML, /声明总量/);
+    assert.match(root.content.innerHTML, />8</);
     assert.match(root.content.innerHTML, /失败项/);
     assert.match(root.content.innerHTML, /reply:root-1:2/);
     assert.match(root.content.innerHTML, /根评论/);

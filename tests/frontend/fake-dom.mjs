@@ -1,5 +1,5 @@
 export class FakeElement {
-  constructor({ tagName = "div", id = "", classes = [], attributes = {}, text = "" } = {}) {
+  constructor({ tagName = "div", id = "", classes = [], attributes = {}, text = "", shadowRoot = null } = {}) {
     this.tagName = tagName.toUpperCase();
     this.id = id;
     this.className = classes.join(" ");
@@ -8,6 +8,7 @@ export class FakeElement {
     if (classes.length) this.attributes.set("class", this.className);
     this.children = [];
     this.parentElement = null;
+    this.shadowRoot = shadowRoot;
     this.hidden = false;
     this.textContent = text;
   }
@@ -60,6 +61,7 @@ export class FakeElement {
   }
 
   matchesSimple(selector) {
+    if (selector === "*") return true;
     if (selector.startsWith("#")) return this.id === selector.slice(1);
     if (selector.startsWith(".")) return this.className.split(/\s+/).includes(selector.slice(1));
     const attrMatch = selector.match(/^([^\[]+)?\[([^=\]]+)(?:=["']?([^\]"']+)["']?)?\]$/);
@@ -108,6 +110,24 @@ export function createComment(uid, { reply = false } = {}) {
       "data-user-id": uid,
     },
   });
+}
+
+export function createShadowComment(uid, { reply = false } = {}) {
+  const comment = new FakeElement({
+    tagName: reply ? "bili-comment-reply-renderer" : "bili-comment-renderer",
+  });
+  const shadowRoot = new FakeElement({ tagName: "shadow-root" });
+  const user = new FakeElement({
+    tagName: "a",
+    attributes: {
+      id: "user-avatar",
+      "data-user-profile-id": uid,
+      href: `//space.bilibili.com/${uid}`,
+    },
+  });
+  shadowRoot.append(user);
+  comment.shadowRoot = shadowRoot;
+  return comment;
 }
 
 export class FakeMutationObserver {
