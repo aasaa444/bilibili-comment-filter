@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>B站评论过滤</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="popup-header">
+        <div>
+          <p class="eyebrow">本地评论过滤</p>
+          <h1>B站评论过滤</h1>
+        </div>
+        <button id="refresh-state" class="button button-quiet" type="button">刷新</button>
+      </header>
+
+      <section class="status-section" aria-labelledby="connection-heading">
+        <h2 id="connection-heading">本机服务</h2>
+        <p id="connection-status" data-state="loading">正在连接本机服务</p>
+        <p id="connection-detail" class="muted">正在读取健康状态</p>
+      </section>
+
+      <section class="video-section" aria-labelledby="video-heading">
+        <h2 id="video-heading">当前视频</h2>
+        <p id="video-title" class="video-title">正在读取当前页面</p>
+        <p id="video-id" class="mono">等待页面身份</p>
+        <p id="unsupported" class="muted" hidden>仅支持已登录桌面端普通 BV 视频页</p>
+        <button id="submit-video" class="button button-primary" type="button" disabled>提交这个视频</button>
+      </section>
+
+      <section class="cache-section" aria-labelledby="cache-heading">
+        <h2 id="cache-heading">本地过滤缓存</h2>
+        <p id="cache-summary" class="muted">正在读取缓存状态</p>
+      </section>
+
+      <section class="task-section" aria-labelledby="task-heading">
+        <h2 id="task-heading">最近任务</h2>
+        <p id="task-state" data-state="empty" class="muted">还没有提交当前视频任务</p>
+      </section>
+
+      <p id="popup-error" class="error" hidden></p>
+    </main>
+    <script type="module" src="src/popup.js"></script>
+  </body>
+</html>

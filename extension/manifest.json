@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "B站评论过滤",
+  "version": "0.1.0",
+  "description": "在普通 B 站视频评论区按本地同步 UID 缓存隐藏评论和回复。",
+  "permissions": ["storage", "cookies", "alarms"],
+  "host_permissions": [
+    "https://www.bilibili.com/*",
+    "https://*.bilibili.com/*",
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*"
+  ],
+  "background": {
+    "service_worker": "src/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "B站评论过滤",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.bilibili.com/video/*", "https://bilibili.com/video/*"],
+      "js": ["src/content-script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

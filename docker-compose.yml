@@ -1,0 +1,23 @@
+name: bilibili-filter
+
+services:
+  bilibili-filter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8765:8765"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BILIBILI_FILTER_HOST: 0.0.0.0
+      BILIBILI_FILTER_DATABASE: /data/bilibili-filter.sqlite3
+      BILIBILI_FILTER_WEB_ROOT: /app/web/dist
+      BILIBILI_FILTER_BROWSER_HEADLESS: "true"
+    volumes:
+      - bilibili_filter_data:/data
+    restart: unless-stopped
+
+volumes:
+  bilibili_filter_data:
