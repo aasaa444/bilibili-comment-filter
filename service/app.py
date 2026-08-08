@@ -344,6 +344,25 @@ def create_app(
             ]
         )
 
+    @app.get("/api/review-actions", response_model=list[ReviewActionResponse])
+    def list_review_actions(
+        evidence_id: str | None = None,
+        uid: str | None = None,
+    ) -> list[ReviewActionResponse]:
+        return [
+            ReviewActionResponse(
+                action_id=record.action_id,
+                evidence_id=record.evidence_id,
+                uid=record.uid,
+                action=record.action,
+                before_state=record.before_state,
+                after_state=record.after_state,
+                actor=record.actor,
+                created_at=record.created_at,
+            )
+            for record in review_service.list(evidence_id=evidence_id, uid=uid)
+        ]
+
     @app.post("/api/reviews/{evidence_id}", response_model=ReviewActionResponse)
     def apply_review(evidence_id: str, request: ReviewActionRequest) -> ReviewActionResponse:
         try:
@@ -505,7 +524,6 @@ def evidence_response(record: object) -> EvidenceResponse:
 
 
 def sample_response(record: object) -> dict[str, object]:
-    kind = "nickname-positive" if record.kind == "nickname" else "comment-positive"
     return {
         "sample_id": record.sample_id,
         "version": int(record.version) if record.version.isdigit() else record.version,
@@ -513,7 +531,13 @@ def sample_response(record: object) -> dict[str, object]:
         "items": [
             {
                 "text": item.content,
-                "kind": kind,
+                "kind": (
+                    "nickname-positive"
+                    if record.kind == "nickname"
+                    else "comment-negative"
+                    if item.label == "negative"
+                    else "comment-positive"
+                ),
                 "source": "review" if record.label == "review" else "manual",
                 "content": item.content,
                 "label": item.label,

@@ -119,8 +119,8 @@ export function createShadowComment(uid, { reply = false } = {}) {
   const shadowRoot = new FakeElement({ tagName: "shadow-root" });
   const user = new FakeElement({
     tagName: "a",
+    id: "user-avatar",
     attributes: {
-      id: "user-avatar",
       "data-user-profile-id": uid,
       href: `//space.bilibili.com/${uid}`,
     },
@@ -128,6 +128,23 @@ export function createShadowComment(uid, { reply = false } = {}) {
   shadowRoot.append(user);
   comment.shadowRoot = shadowRoot;
   return comment;
+}
+
+export function createBilibiliCommentsFixture({ blockedUid, ordinaryUid }) {
+  const comments = new FakeElement({ tagName: "bili-comments" });
+  const commentsShadow = new FakeElement({ tagName: "shadow-root" });
+  const thread = new FakeElement({ tagName: "bili-comment-thread-renderer" });
+  const threadShadow = new FakeElement({ tagName: "shadow-root" });
+  const rootComment = createShadowComment(blockedUid);
+  const reply = createShadowComment(blockedUid, { reply: true });
+  const ordinary = createShadowComment(ordinaryUid);
+
+  threadShadow.append(rootComment, reply, ordinary);
+  thread.shadowRoot = threadShadow;
+  commentsShadow.append(thread);
+  comments.shadowRoot = commentsShadow;
+
+  return { comments, thread, rootComment, reply, ordinary };
 }
 
 export class FakeMutationObserver {

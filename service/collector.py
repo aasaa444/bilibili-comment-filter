@@ -80,6 +80,20 @@ class BilibiliAuthenticationError(RuntimeError):
     """The comment endpoint rejected the current session as unauthenticated."""
 
 
+class BilibiliTransportError(RuntimeError):
+    """A Bilibili response failed without exposing session material."""
+
+    def __init__(self, code: int | str, message: str, *, category: str = "api") -> None:
+        self.code = code
+        self.category = category
+        self.detail = message
+        super().__init__(message)
+
+
+class BilibiliRateLimitError(BilibiliTransportError):
+    """Bilibili rejected a request for rate, risk-control, or overload reasons."""
+
+
 class BilibiliCommentTransport:
     """HTTP boundary for Bilibili's public comment read endpoints.
 
@@ -95,8 +109,9 @@ class BilibiliCommentTransport:
         *,
         base_url: str = "https://api.bilibili.com",
         timeout: float = 20.0,
-        min_interval: float = 0.5,
+        min_interval: float = 1.0,
         max_retries: int = 3,
+        retry_backoff: float = 0.5,
         client: httpx.Client | None = None,
         user_agent: str = DEFAULT_BILIBILI_USER_AGENT,
     ) -> None:
@@ -114,6 +129,7 @@ class BilibiliCommentTransport:
         self._video_oid_cache: dict[str, str] = {}
         self._min_interval = max(0.0, min_interval)
         self._max_retries = max(0, max_retries)
+        self._retry_backoff = max(0.0, retry_backoff)
         self._last_request = 0.0
 
     def fetch_root_page(self, video_id: str, page: int) -> dict[str, Any]:
@@ -121,6 +137,7 @@ class BilibiliCommentTransport:
         return self._get(
             "/x/v2/reply/main",
             {"type": 1, "oid": oid, "mode": 3, "next": page, "ps": 20},
+            referer=f"https://www.bilibili.com/video/{video_id}/",
         )
 
     def fetch_replies(self, video_id: str, root_id: str, page: int) -> dict[str, Any]:
@@ -128,6 +145,7 @@ class BilibiliCommentTransport:
         return self._get(
             "/x/v2/reply/reply",
             {"type": 1, "oid": oid, "root": root_id, "pn": page, "ps": 20},
+            referer=f"https://www.bilibili.com/video/{video_id}/",
         )
 
     def _resolve_oid(self, video_id: str) -> str:
@@ -145,29 +163,67 @@ class BilibiliCommentTransport:
         self._video_oid_cache[video_id] = resolved
         return resolved
 
-    def _get(self, path: str, params: dict[str, object]) -> dict[str, Any]:
+    def _get(
+        self,
+        path: str,
+        params: dict[str, object],
+        *,
+        referer: str | None = None,
+    ) -> dict[str, Any]:
         cookies = self.cookies_provider() or {}
-        headers = {"User-Agent": self.user_agent}
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": referer or "https://www.bilibili.com/",
+            "User-Agent": self.user_agent,
+        }
         if cookies:
             headers["Cookie"] = "; ".join(
                 f"{name}={value}" for name, value in cookies.items()
             )
         retryable_codes = {-352, -412, -509}
-        last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
             elapsed = time.monotonic() - self._last_request
             if elapsed < self._min_interval:
                 time.sleep(self._min_interval - elapsed)
             self._last_request = time.monotonic()
-            response = self.client.get(path, params=params, headers=headers)
-            if response.status_code == 412 or response.status_code >= 500:
-                last_error = RuntimeError(f"Bilibili HTTP {response.status_code}")
+            try:
+                response = self.client.get(path, params=params, headers=headers)
+            except httpx.RequestError as exc:
                 if attempt < self._max_retries:
-                    time.sleep(0.5 * (attempt + 1))
+                    self._sleep_before_retry(attempt)
                     continue
-                response.raise_for_status()
+                raise BilibiliTransportError(
+                    "network",
+                    f"Bilibili request failed: {exc}",
+                    category="network",
+                ) from exc
+            if response.status_code == 412 or response.status_code >= 500:
+                if attempt < self._max_retries:
+                    self._sleep_before_retry(attempt)
+                    continue
+                raise BilibiliRateLimitError(
+                    response.status_code,
+                    f"Bilibili HTTP {response.status_code}",
+                    category="http_rate_limit"
+                    if response.status_code == 412
+                    else "http_server_error",
+                )
             response.raise_for_status()
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise BilibiliTransportError(
+                    "invalid_json",
+                    "Bilibili comment request returned invalid JSON",
+                    category="protocol",
+                ) from exc
+            if not isinstance(payload, dict):
+                raise BilibiliTransportError(
+                    "invalid_payload",
+                    "Bilibili comment request returned an invalid JSON object",
+                    category="protocol",
+                )
             code = payload.get("code")
             if code == 0:
                 return payload.get("data") or {}
@@ -175,12 +231,18 @@ class BilibiliCommentTransport:
                 raise BilibiliAuthenticationError(
                     payload.get("message") or "Bilibili session is no longer valid"
                 )
-            if code in retryable_codes and attempt < self._max_retries:
-                last_error = RuntimeError(payload.get("message") or f"Bilibili code {code}")
-                time.sleep(0.5 * (attempt + 1))
-                continue
-            raise RuntimeError(payload.get("message") or "Bilibili comment request failed")
-        raise RuntimeError(f"Bilibili request failed: {last_error}") from last_error
+            message = str(payload.get("message") or f"Bilibili code {code}")
+            if code in retryable_codes:
+                if attempt < self._max_retries:
+                    self._sleep_before_retry(attempt)
+                    continue
+                raise BilibiliRateLimitError(code, message, category="api_rate_limit")
+            raise BilibiliTransportError(code, message)
+        raise AssertionError("Bilibili request retry loop did not return or raise")
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        if self._retry_backoff:
+            time.sleep(self._retry_backoff * (2**attempt))
 
 
 class BilibiliCommentCollector:
@@ -221,8 +283,8 @@ class BilibiliCommentCollector:
                 payload = self.transport.fetch_root_page(task.video_id, request_page)
             except BilibiliAuthenticationError:
                 raise
-            except Exception:
-                failed_items.append(f"root_page:{root_page}")
+            except Exception as exc:
+                failed_items.append(_format_failed_item(f"root_page:{root_page}", exc))
                 return self._result(
                     comments,
                     self._checkpoint(
@@ -363,8 +425,10 @@ class BilibiliCommentCollector:
                         )
                     except BilibiliAuthenticationError:
                         raise
-                    except Exception:
-                        failed_items.append(f"reply:{root_id}:{reply_page}")
+                    except Exception as exc:
+                        failed_items.append(
+                            _format_failed_item(f"reply:{root_id}:{reply_page}", exc)
+                        )
                         return self._result(
                             comments,
                             self._checkpoint(
@@ -681,6 +745,13 @@ def _created_at(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid_ctime") from exc
+
+
+def _format_failed_item(prefix: str, error: Exception) -> str:
+    if not isinstance(error, BilibiliTransportError):
+        return prefix
+    detail = " ".join(str(error.detail).split())[:160]
+    return f"{prefix}:{error.category}:{error.code}:{detail}"
 
 
 def _declared_total(payload: dict[str, Any]) -> int | None:

@@ -14,12 +14,14 @@
 - 旧 SQLite 兼容：启动时为缺少的新列执行增量迁移，旧任务仍可读取。
 - 前端：TypeScript 类型检查、构建、Node fixture 测试通过；公开 Shadow DOM fixture 覆盖根评论、楼中楼和弹幕不处理。
 - 任务详情：API 与管理页展示保存数量、声明评论/回复、声明总量、覆盖率和失败项。
+- 复核闭环：复核动作可通过 `GET /api/review-actions` 按 UID/证据查询，并在管理页展示历史、操作者和状态变化。
+- 真实协议探针：在 `BV1rBuM6QEfe` 上，一级评论接口返回 20 条、声明总量 536、仍有下一页；楼中楼接口在未同步会话的探针中返回 `-352`，已被 transport 分类为 `api_rate_limit` 并保留脱敏失败原因。
 - 启停脚本：PowerShell 语法解析通过；后台启动使用隐藏窗口；停止前校验 PID 对应的 Python 可执行文件、模块和端口参数。
 - Compose 配置：`docker compose config --quiet` 通过。
 
 ## 仅 fixture 或静态验证
 
-- B 站评论 transport 使用替身响应；没有在真实评论接口上验收分页、认证失效或完整评论区收敛。
+- B 站评论 transport 的固定响应、分页、失败记录和重试已验证；真实探针只确认了一级接口响应形状和楼中楼限流分类，没有完成同步真实账号后的完整评论区收敛。
 - AI transport 使用固定的 HTTP mock；没有调用实际 OpenAI-compatible endpoint，也没有验证供应商对 token 计数、`max_tokens` 或响应分段的具体差异。
 - 官方拉黑使用替身 executor；没有执行真实 B 站拉黑、批量操作或账号状态变更。
 - 浏览器插件使用本地 DOM fixture 验证过滤逻辑。此前对已登录 Chrome 页面仅做了只读 DOM 结构检查，没有读取或输出 Cookie，也没有执行评论、拉黑或账号操作。

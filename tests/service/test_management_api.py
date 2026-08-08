@@ -53,6 +53,10 @@ def test_review_exception_restores_display_and_cancels_pending_blacklist() -> No
 
     assert action.status_code == 200
     assert action.json()["after_state"] == "exception"
+    history = http.get("/api/review-actions", params={"uid": "1001"})
+    assert history.status_code == 200
+    assert history.json()[0]["action"] == "exception"
+    assert history.json()[0]["actor"] == "test-user"
     uid = next(item for item in http.get("/api/uids").json()["items"] if item["uid"] == "1001")
     assert uid["state"] == "exception"
     queue = next(
@@ -93,6 +97,18 @@ def test_samples_can_be_previewed_deduplicated_and_published() -> None:
     assert published.status_code == 200
     assert published.json()["status"] == "published"
     assert published.json()["version"] == "samples-v1"
+
+
+def test_negative_sample_response_keeps_negative_kind() -> None:
+    _, http, _ = seeded_app()
+
+    response = http.post(
+        "/api/samples",
+        json={"kind": "comment", "label": "negative", "text": "普通批评"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["items"][0]["kind"] == "comment-negative"
 
 
 def test_highlighted_review_sample_is_published_for_follow_up_analysis() -> None:

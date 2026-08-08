@@ -6,7 +6,7 @@ import {
   FakeElement,
   FakeMutationObserver,
   createComment,
-  createShadowComment,
+  createBilibiliCommentsFixture,
 } from "./fake-dom.mjs";
 
 function createCommentPage() {
@@ -93,26 +93,33 @@ test("async comments are filtered after re-render and become visible after revoc
   assert.equal(lateComment.hidden, false);
 });
 
-test("comment filtering traverses Bilibili open Shadow DOM and keeps danmaku untouched", () => {
+test("comment filtering traverses the observed nested Bilibili Shadow DOM and keeps danmaku untouched", () => {
   const document = new FakeElement({ tagName: "document" });
-  const comments = new FakeElement({ tagName: "bili-comments" });
-  const rootComment = createShadowComment("1001");
-  const reply = createShadowComment("1001", { reply: true });
-  const ordinary = createShadowComment("9001");
-  const commentsShadow = new FakeElement({ tagName: "shadow-root" });
-  commentsShadow.append(rootComment, reply, ordinary);
-  comments.shadowRoot = commentsShadow;
+  const blockedUid = String(900_000_001);
+  const ordinaryUid = String(900_000_002);
+  const fixture = createBilibiliCommentsFixture({ blockedUid, ordinaryUid });
   const danmaku = new FakeElement({
     classes: ["danmaku"],
-    attributes: { "data-user-id": "1001" },
+    attributes: { "data-user-id": blockedUid },
   });
-  document.append(comments, danmaku);
+  document.append(fixture.comments, danmaku);
+
+  assert.equal(fixture.comments.shadowRoot.querySelector("bili-comment-thread-renderer"), fixture.thread);
+  assert.equal(fixture.thread.shadowRoot.querySelector("bili-comment-renderer"), fixture.rootComment);
+  assert.equal(fixture.thread.shadowRoot.querySelector("bili-comment-reply-renderer"), fixture.reply);
+  const rootAvatar = fixture.rootComment.shadowRoot.querySelector("[data-user-profile-id]");
+  const replyAvatar = fixture.reply.shadowRoot.querySelector("[data-user-profile-id]");
+  assert.equal(rootAvatar.tagName, "A");
+  assert.equal(rootAvatar.id, "user-avatar");
+  assert.equal(rootAvatar.getAttribute("data-user-profile-id"), blockedUid);
+  assert.equal(replyAvatar.id, "user-avatar");
+  assert.equal(replyAvatar.getAttribute("data-user-profile-id"), blockedUid);
 
   const cache = applyUidSync(createEmptyUidCache(), {
     version: 1,
     mode: "snapshot",
     records: [{
-      uid: "1001",
+      uid: blockedUid,
       nicknameSnapshot: "目标账号",
       status: "hidden",
       hidden: true,
@@ -129,8 +136,8 @@ test("comment filtering traverses Bilibili open Shadow DOM and keeps danmaku unt
 
   assert.equal(stats.scanned, 3);
   assert.equal(stats.hidden, 2);
-  assert.equal(rootComment.hidden, true);
-  assert.equal(reply.hidden, true);
-  assert.equal(ordinary.hidden, false);
+  assert.equal(fixture.rootComment.hidden, true);
+  assert.equal(fixture.reply.hidden, true);
+  assert.equal(fixture.ordinary.hidden, false);
   assert.equal(danmaku.hidden, false);
 });

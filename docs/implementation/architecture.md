@@ -65,6 +65,7 @@ The initial API is intentionally small and observable:
 - `GET/POST /api/tasks`, `GET /api/tasks/{task_id}`, `POST /api/tasks/{task_id}/retry`
 - `GET /api/tasks/{task_id}/comments`
 - `GET/POST /api/reviews`, `POST /api/reviews/{evidence_id}`
+- `GET /api/review-actions`
 - `GET/POST /api/samples`, `POST /api/samples/{sample_id}/publish`
 - `GET /api/blacklist`, `POST /api/blacklist/{item_id}/pause`, `/resume`, `/retry`
 - `GET /api/uids/sync?since=<version>`

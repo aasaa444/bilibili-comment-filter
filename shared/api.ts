@@ -108,6 +108,17 @@ export class ApiClient {
     return this.requestList(`/api/reviews${query.size ? `?${query}` : ""}`, "evidence", normalizeEvidence);
   }
 
+  listReviewActions(params: { evidenceId?: string; uid?: string } = {}): Promise<ApiList<ReviewRecord>> {
+    const query = new URLSearchParams();
+    if (params.evidenceId) query.set("evidence_id", params.evidenceId);
+    if (params.uid) query.set("uid", params.uid);
+    return this.requestList(
+      `/api/review-actions${query.size ? `?${query}` : ""}`,
+      "review_actions",
+      normalizeReviewRecord,
+    );
+  }
+
   reviewEvidence(evidenceId: string, action: string): Promise<ReviewRecord> {
     return this.request<unknown>(`/api/reviews/${encodeURIComponent(evidenceId)}`, {
       method: "POST",
@@ -253,8 +264,13 @@ function normalizeUidSync(value: unknown): UidSyncResponse {
   if (version === null) throw new ApiRequestError(502, "UID 同步响应缺少有效版本");
   const mode = candidate.mode === "delta" ? "delta" : "snapshot";
   const records = normalizeItems(arrayValue(candidate.records) ?? arrayValue(candidate.uids) ?? arrayValue(candidate.items) ?? [], normalizeUidRecord);
-  const upserts = normalizeItems(arrayValue(candidate.upserts) ?? [], normalizeUidRecord);
-  const removals = (arrayValue(candidate.removals) ?? []).filter((uid): uid is string => typeof uid === "string");
+  const upserts = normalizeItems(
+    arrayValue(candidate.upserts) ?? (mode === "delta" ? arrayValue(candidate.items) : null) ?? [],
+    normalizeUidRecord,
+  );
+  const removals = (
+    arrayValue(candidate.removals) ?? arrayValue(candidate.removed) ?? []
+  ).filter((uid): uid is string => typeof uid === "string");
   return {
     version,
     mode,
@@ -363,6 +379,7 @@ function normalizeReviewRecord(value: unknown): ReviewRecord | null {
     action,
     previousStatus: isUidStatus(candidate.previous_status) ? candidate.previous_status : isUidStatus(candidate.before_state) ? candidate.before_state : null,
     nextStatus: isUidStatus(candidate.next_status) ? candidate.next_status : isUidStatus(candidate.after_state) ? candidate.after_state : null,
+    actor: stringValue(candidate.actor),
     createdAt: stringValue(candidate.created_at) ?? stringValue(candidate.createdAt) ?? "",
   };
 }

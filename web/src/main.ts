@@ -10,6 +10,7 @@ import type {
   BlacklistItem,
   Evidence,
   ReviewAction,
+  ReviewRecord,
   SampleItem,
   SampleKind,
   SampleSet,
@@ -38,6 +39,7 @@ interface ManagementState {
   taskDetails: Record<string, TaskDetailState>;
   uids: Collection<UidRecord>;
   evidence: Collection<Evidence>;
+  reviewActions: Collection<ReviewRecord>;
   samples: Collection<SampleSet>;
   blacklist: Collection<BlacklistItem>;
   filters: Partial<Record<ViewName, string>>;
@@ -66,6 +68,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     taskDetails: {},
     uids: { items: null },
     evidence: { items: null },
+    reviewActions: { items: null },
     samples: { items: null },
     blacklist: { items: null },
     filters: {},
@@ -101,11 +104,12 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       return;
     }
 
-    const [auth, tasks, uids, evidence, samples, blacklist] = await Promise.all([
+    const [auth, tasks, uids, evidence, reviewActions, samples, blacklist] = await Promise.all([
       api.getAuthSession().catch(() => null),
       loadCollection(() => api.listTasks()),
       loadCollection(() => api.listUids()),
       loadCollection(() => api.listEvidence()),
+      loadCollection(() => api.listReviewActions()),
       loadCollection(() => api.listSamples()),
       loadCollection(() => api.listBlacklist()),
     ]);
@@ -113,6 +117,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     state.tasks = tasks;
     state.uids = uids;
     state.evidence = evidence;
+    state.reviewActions = reviewActions;
     state.samples = samples;
     state.blacklist = blacklist;
     state.loading = false;
@@ -441,7 +446,7 @@ function renderUids(state: ManagementState): string {
 
 function renderReviews(state: ManagementState): string {
   const filter = state.filters.reviews ?? "";
-  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">完整证据</p><h3>判定复核</h3></div>${renderFilter("reviews", "搜索 UID、评论或来源视频", filter)}</div>${renderEvidenceCollection(state.evidence, "reviews", filter)}</section>`;
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">完整证据</p><h3>判定复核</h3></div>${renderFilter("reviews", "搜索 UID、评论或来源视频", filter)}</div>${renderEvidenceCollection(state.evidence, "reviews", filter)}<div class="list-heading"><h3>复核历史</h3></div>${renderReviewHistory(state.reviewActions, filter)}</section>`;
 }
 
 function renderSamples(state: ManagementState): string {
@@ -527,6 +532,27 @@ function renderEvidenceRow(evidence: Evidence): string {
   return `<details class="evidence-row"><summary><span><strong class="mono">${escapeHtml(evidence.uid)}</strong> ${escapeHtml(evidence.nicknameSnapshot || "无昵称快照")}</span><span class="status-pill" data-state="${evidence.result === "hit" ? "ready" : "processing"}">${evidence.result === "hit" ? "命中" : "不确定"}</span></summary><div class="evidence-body"><p class="evidence-comment">${escapeHtml(evidence.commentText)}</p><dl><div><dt>楼层上下文</dt><dd>${escapeHtml(evidence.threadContext ?? "未提供")}</dd></div><div><dt>来源视频</dt><dd>${evidence.sourceVideo ? `<a href="${escapeAttribute(evidence.sourceVideo)}" target="_blank" rel="noreferrer">${escapeHtml(evidence.sourceVideo)}</a>` : "未提供"}</dd></div><div><dt>评论链接</dt><dd>${evidence.commentUrl ? `<a href="${escapeAttribute(evidence.commentUrl)}" target="_blank" rel="noreferrer">打开来源</a>` : "未提供"}</dd></div><div><dt>命中信号</dt><dd>${escapeHtml(evidence.signal ?? "未提供")}</dd></div><div><dt>模型理由</dt><dd>${escapeHtml(evidence.modelReason ?? "未提供")}</dd></div><div><dt>模型版本</dt><dd class="mono">${escapeHtml(evidence.modelVersion ?? "未提供")}</dd></div></dl><div class="action-row"><button class="button button-quiet" data-review-action="keep" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">保留判定</button><button class="button button-quiet" data-review-action="revoke" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">撤销隐藏</button><button class="button button-quiet" data-review-action="hide-only" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">仅保留隐藏</button><button class="button button-danger" data-review-action="exception" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">加入例外</button><button class="button button-ghost" data-review-action="positive-sample" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">标记显著样例</button></div></div></details>`;
 }
 
+function renderReviewHistory(collection: Collection<ReviewRecord>, filter: string): string {
+  if (collection.items === null) {
+    return collection.error
+      ? renderState("error", "复核历史加载失败", collection.error)
+      : renderState("loading", "正在载入复核历史", "");
+  }
+  const items = collection.items.filter((item) =>
+    `${item.uid} ${item.evidenceId} ${item.action} ${item.actor ?? ""}`
+      .toLowerCase()
+      .includes(filter.toLowerCase()),
+  );
+  if (items.length === 0) {
+    return renderState(
+      filter ? "filtered-empty" : "empty",
+      filter ? "当前筛选没有匹配复核记录" : "还没有复核记录",
+      filter ? "清除筛选或查看完整历史" : "对证据执行操作后会在这里留下历史",
+    );
+  }
+  return `<div class="list">${items.map((item) => `<article class="list-row"><div class="row-main"><strong class="mono">${escapeHtml(item.uid)}</strong><span>${reviewActionLabel(item.action)} · ${escapeHtml(item.actor ?? "local-user")}</span><small>${escapeHtml(item.createdAt || "未提供")} · 证据 ${escapeHtml(item.evidenceId)}</small></div><div class="row-actions"><span class="status-pill" data-state="info">${escapeHtml(item.previousStatus ?? "无")} → ${escapeHtml(item.nextStatus ?? "无")}</span></div></article>`).join("")}</div>`;
+}
+
 function renderSampleCollection(collection: Collection<SampleSet>): string {
   if (collection.items === null) return collection.error ? renderState("error", "样本库加载失败", collection.error) : renderState("loading", "正在载入样本库", "");
   if (collection.items.length === 0) return renderState("empty", "还没有样本版本", "通过文本或文件导入后创建草稿");
@@ -572,6 +598,16 @@ function blacklistStatusLabel(status: BlacklistItem["status"]): string {
 
 function sampleKindLabel(kind: SampleKind): string {
   return ({ "comment-positive": "评论正例", "comment-negative": "评论反例", "nickname-positive": "昵称正例" })[kind];
+}
+
+function reviewActionLabel(action: ReviewAction): string {
+  return ({
+    keep: "保留判定",
+    revoke: "撤销隐藏",
+    "hide-only": "仅保留隐藏",
+    exception: "加入例外",
+    "positive-sample": "标记显著样例",
+  })[action];
 }
 
 function messageFromError(error: unknown): string {

@@ -105,6 +105,7 @@ export interface ReviewRecord {
   action: ReviewAction;
   previousStatus: UidStatus | null;
   nextStatus: UidStatus | null;
+  actor?: string;
   createdAt: string;
 }
 

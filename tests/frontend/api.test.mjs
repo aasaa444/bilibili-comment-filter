@@ -104,6 +104,35 @@ test("API client exposes the latest authentication diagnostic without cookie val
   });
 });
 
+test("API client exposes review action history with filters", async () => {
+  const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
+    assert.equal(input, "http://127.0.0.1:8765/api/review-actions?uid=1001");
+    return jsonResponse([{
+      action_id: "review-1",
+      evidence_id: "evidence-1",
+      uid: "1001",
+      action: "exception",
+      before_state: "review",
+      after_state: "exception",
+      actor: "reviewer",
+      created_at: "2026-08-09T00:00:00Z",
+    }]);
+  });
+
+  const history = await client.listReviewActions({ uid: "1001" });
+
+  assert.deepEqual(history.items[0], {
+    reviewId: "review-1",
+    evidenceId: "evidence-1",
+    uid: "1001",
+    action: "exception",
+    previousStatus: "review",
+    nextStatus: "exception",
+    actor: "reviewer",
+    createdAt: "2026-08-09T00:00:00Z",
+  });
+});
+
 test("API client keeps versioned samples and cancelled blacklist items", async () => {
   const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
     if (String(input).endsWith("/api/samples")) {

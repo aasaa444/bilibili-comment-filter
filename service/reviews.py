@@ -108,6 +108,36 @@ class ReviewService:
             created_at=timestamp,
         )
 
+    def list(
+        self,
+        *,
+        evidence_id: str | None = None,
+        uid: str | None = None,
+        limit: int = 200,
+    ) -> tuple[ReviewRecord, ...]:
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if evidence_id:
+            conditions.append("evidence_id = ?")
+            parameters.append(evidence_id)
+        if uid:
+            conditions.append("uid = ?")
+            parameters.append(uid)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        safe_limit = max(1, min(limit, 1000))
+        rows = self.database.execute(
+            f"""
+            SELECT action_id, evidence_id, uid, action, before_state, after_state,
+                   actor, created_at
+            FROM review_actions
+            {where}
+            ORDER BY created_at DESC, action_id DESC
+            LIMIT ?
+            """,
+            (*parameters, safe_limit),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
     def _update_or_create(self, uid: str, nickname: str | None, state: UidState):
         try:
             current = self.uid_registry.get(uid)
@@ -117,6 +147,19 @@ class ReviewService:
         if current.state is state:
             return current
         return self.uid_registry.update(uid=uid, nickname=nickname, state=state)
+
+    @staticmethod
+    def _from_row(row: object) -> ReviewRecord:
+        return ReviewRecord(
+            action_id=row["action_id"],
+            evidence_id=row["evidence_id"],
+            uid=row["uid"],
+            action=row["action"],
+            before_state=UidState(row["before_state"]) if row["before_state"] else None,
+            after_state=UidState(row["after_state"]) if row["after_state"] else None,
+            actor=row["actor"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
 
 
 def _first_comment_content(comments: tuple[dict[str, object], ...]) -> str:

@@ -131,6 +131,28 @@ test("UID sync maps backend state/nickname to the cache DTO and keeps the versio
   }]);
 });
 
+test("UID delta sync accepts the backend items/removed envelope", async () => {
+  const client = new ApiClient("http://127.0.0.1:8000", mockFetch({
+    "/api/uids/sync": {
+      mode: "delta",
+      version: 4,
+      items: [{ uid: "1002", state: "review", nickname: "增量昵称" }],
+      removed: ["1001"],
+    },
+  }, []));
+
+  const sync = await client.syncUids(3);
+
+  assert.deepEqual(sync.upserts, [{
+    uid: "1002",
+    nicknameSnapshot: "增量昵称",
+    status: "review",
+    hidden: true,
+    updatedAt: "",
+  }]);
+  assert.deepEqual(sync.removals, ["1001"]);
+});
+
 test("UID writes use backend state/nickname names", async () => {
   const calls = [];
   const client = new ApiClient("http://127.0.0.1:8000", mockFetch({

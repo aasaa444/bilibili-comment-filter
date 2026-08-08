@@ -7,6 +7,7 @@ from service.collector import (
     BilibiliAuthenticationError,
     BilibiliCommentCollector,
     BilibiliCommentTransport,
+    BilibiliRateLimitError,
     CollectionCheckpoint,
 )
 from service.db import Database
@@ -340,6 +341,10 @@ def test_bilibili_transport_resolves_bv_and_passes_cookie_to_comment_requests() 
         requests.append(request)
         assert request.headers["cookie"] == "SESSDATA=session-secret"
         assert request.headers["User-Agent"] == COMPATIBLE_USER_AGENT
+        if request.url.path in {"/x/v2/reply/main", "/x/v2/reply/reply"}:
+            assert request.headers["Referer"] == (
+                "https://www.bilibili.com/video/BV1realvideo/"
+            )
         if request.url.path == "/x/web-interface/view":
             assert dict(request.url.params) == {"bvid": "BV1realvideo"}
             return httpx.Response(200, json={"code": 0, "data": {"aid": 7788}})
@@ -386,6 +391,35 @@ def test_bilibili_transport_resolves_bv_and_passes_cookie_to_comment_requests() 
     ]
 
 
+def test_collector_records_and_stops_on_a_duplicate_root_page() -> None:
+    class DuplicateTransport:
+        root_cursor_mode = False
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page in {1, 2}
+            return {
+                "replies": [
+                    {
+                        "rpid": 901,
+                        "member": {"mid": 9001, "uname": "duplicate-user"},
+                        "content": {"message": "duplicate page"},
+                    }
+                ],
+                "page": {"count": 2, "page_count": 2},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            return {"replies": []}
+
+    result = BilibiliCommentCollector(DuplicateTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert result.stats.saved_comments == 1
+    assert "duplicate_root_page:2" in result.failed_items
+
+
 def test_bilibili_transport_accepts_custom_user_agent() -> None:
     requests: list[httpx.Request] = []
 
@@ -410,6 +444,55 @@ def test_bilibili_transport_accepts_custom_user_agent() -> None:
         client.close()
 
     assert requests[0].headers["User-Agent"] == "fixture-browser/1.0"
+
+
+def test_bilibili_transport_preserves_final_rate_limit_reason() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"code": -352, "message": "风控系统检测到请求异常"})
+
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: {"SESSDATA": "fixture"},
+            client=client,
+            min_interval=0,
+            max_retries=1,
+            retry_backoff=0,
+        )
+        with pytest.raises(BilibiliRateLimitError) as raised:
+            transport.fetch_root_page("12345", 1)
+    finally:
+        client.close()
+
+    assert calls == 2
+    assert raised.value.code == -352
+    assert raised.value.category == "api_rate_limit"
+    assert str(raised.value) == "风控系统检测到请求异常"
+
+
+def test_collector_records_rate_limit_reason_in_failed_item() -> None:
+    class RateLimitedTransport:
+        def fetch_root_page(self, _video_id: str, _page: int) -> dict:
+            raise BilibiliRateLimitError(-352, "风控系统检测到请求异常", category="api_rate_limit")
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("reply collection must not start")
+
+    result = BilibiliCommentCollector(RateLimitedTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert result.failed_items == (
+        "root_page:1:api_rate_limit:-352:风控系统检测到请求异常",
+    )
 
 
 def test_bilibili_transport_maps_login_required_response_to_authentication_error() -> None:
