@@ -200,6 +200,34 @@ def test_native_executor_confirms_blacklist_and_uses_configured_headless_mode(
     assert_resources_closed(browser)
 
 
+def test_native_executor_injects_the_latest_cookie_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = FakeBrowser(FakePage())
+    install_fake_playwright(monkeypatch, browser)
+
+    result = PlaywrightBlacklistExecutor(
+        cookies_provider=lambda: {"SESSDATA": "fixture-session", "bili_jct": "fixture-csrf"}
+    ).execute(make_item())
+
+    assert result.success is True
+    assert browser.context.cookies == [
+        {
+            "name": "SESSDATA",
+            "value": "fixture-session",
+            "domain": ".bilibili.com",
+            "path": "/",
+        },
+        {
+            "name": "bili_jct",
+            "value": "fixture-csrf",
+            "domain": ".bilibili.com",
+            "path": "/",
+        },
+    ]
+    assert_resources_closed(browser)
+
+
 def test_native_executor_does_not_report_success_without_blacklist_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
