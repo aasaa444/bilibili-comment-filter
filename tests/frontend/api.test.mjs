@@ -18,7 +18,18 @@ test("API client normalizes completed tasks, nested progress and evidence decisi
         video_id: "BV1example01",
         video_url: "https://www.bilibili.com/video/BV1example01",
         status: "completed",
-        progress: { saved_comments: 4, saved_replies: 2, coverage: 1 },
+        error_code: "partial_collection",
+        error_message: "部分回复页获取失败",
+        progress: {
+          requested_pages: 3,
+          saved_comments: 4,
+          saved_replies: 2,
+          pinned_comments: 1,
+          declared_comments: 5,
+          declared_replies: 3,
+          coverage: 1,
+          failed_items: ["reply:root-1:2"],
+        },
       }],
     });
   });
@@ -29,6 +40,14 @@ test("API client normalizes completed tasks, nested progress and evidence decisi
   assert.equal(tasks.items[0].progress, 100);
   assert.equal(tasks.items[0].collectedComments, 4);
   assert.equal(tasks.items[0].replyCount, 2);
+  assert.equal(tasks.items[0].requestedPages, 3);
+  assert.equal(tasks.items[0].pinnedComments, 1);
+  assert.equal(tasks.items[0].declaredComments, 5);
+  assert.equal(tasks.items[0].declaredReplies, 3);
+  assert.equal(tasks.items[0].coverage, 1);
+  assert.deepEqual(tasks.items[0].failedItems, ["reply:root-1:2"]);
+  assert.equal(tasks.items[0].errorCode, "partial_collection");
+  assert.equal(tasks.items[0].error, "部分回复页获取失败");
 });
 
 test("API client maps review actions and cookie sessions to backend payloads", async () => {

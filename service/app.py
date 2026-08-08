@@ -32,6 +32,7 @@ from .models import (
     AuthSessionResponse,
     BlacklistListResponse,
     BlacklistResponse,
+    CommentListResponse,
     ComponentHealth,
     EvidenceListResponse,
     EvidenceResponse,
@@ -181,7 +182,9 @@ def create_app(
     @app.get("/api/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         database_ready, database_detail = database.check()
-        worker_ready = app.state.worker_available and worker.available
+        worker_ready = app.state.worker_available and (
+            worker.running if app.state.start_background_worker else True
+        )
         auth_verification, _, _ = auth_service.current()
         worker_detail = "Task worker is available" if worker_ready else "Task worker is unavailable"
         service_status = "ready" if database_ready and worker_ready else "unavailable"
@@ -212,14 +215,15 @@ def create_app(
 
     @app.post("/api/auth/session", response_model=AuthSessionResponse)
     def post_auth_session(request: AuthSessionRequest) -> AuthSessionResponse:
+        normalized_cookies = normalize_cookies(request.cookies)
         verification, checked_at = auth_service.synchronize(
-            cookies=normalize_cookies(request.cookies), source=request.source
+            cookies=normalized_cookies, source=request.source
         )
         return AuthSessionResponse(
             status=verification.status,
             detail=verification.detail,
             checked_at=checked_at,
-            cookie_present=True,
+            cookie_present=bool(normalized_cookies),
         )
 
     @app.get("/api/uids/sync", response_model=UidSyncResponse)
@@ -302,15 +306,17 @@ def create_app(
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"Task {task_id} was not found") from exc
 
-    @app.get("/api/tasks/{task_id}/comments", response_model=object)
-    def list_task_comments(task_id: str) -> object:
+    @app.get("/api/tasks/{task_id}/comments", response_model=CommentListResponse)
+    def list_task_comments(task_id: str) -> CommentListResponse:
         try:
             task_store.get(task_id)
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"Task {task_id} was not found") from exc
-        return {
-            "items": [comment_response(comment) for comment in comment_store.list_for_task(task_id)]
-        }
+        return CommentListResponse(
+            items=[
+                comment_response(comment) for comment in comment_store.list_for_task(task_id)
+            ]
+        )
 
     @app.get("/api/reviews", response_model=EvidenceListResponse)
     def list_reviews(

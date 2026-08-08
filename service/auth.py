@@ -9,6 +9,11 @@ import httpx
 from .db import Database
 from .models import AuthStatus
 
+DEFAULT_BILIBILI_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 
 @dataclass(frozen=True)
 class AuthVerification:
@@ -27,10 +32,12 @@ class BilibiliAuthVerifier:
         base_url: str = "https://api.bilibili.com",
         timeout: float = 10.0,
         client: httpx.Client | None = None,
+        user_agent: str = DEFAULT_BILIBILI_USER_AGENT,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.client = client
+        self.user_agent = user_agent
 
     def verify(self, cookies: dict[str, str]) -> AuthVerification:
         if not cookies:
@@ -44,10 +51,7 @@ class BilibiliAuthVerifier:
                     "Accept": "application/json, text/plain, */*",
                     "Cookie": cookie_header,
                     "Referer": "https://www.bilibili.com/",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
-                    ),
+                    "User-Agent": self.user_agent,
                 },
                 timeout=self.timeout,
             )
@@ -88,12 +92,18 @@ class AuthService:
                 False,
             )
         checked_at = datetime.fromisoformat(row["checked_at"])
-        return AuthVerification(AuthStatus(row["status"]), row["detail"]), checked_at, True
+        cookie_present = bool(self.database.latest_auth_cookies())
+        status = AuthStatus(row["status"]) if cookie_present else AuthStatus.MISSING
+        return AuthVerification(status, row["detail"]), checked_at, cookie_present
 
     def synchronize(
         self, *, cookies: dict[str, str], source: str
     ) -> tuple[AuthVerification, datetime]:
-        verification = self.verifier.verify(cookies)
+        verification = (
+            AuthVerification(AuthStatus.MISSING, "No Bilibili session was provided")
+            if not cookies
+            else self.verifier.verify(cookies)
+        )
         checked_at = datetime.now(UTC)
         self.database.save_auth_session(
             cookies=cookies,

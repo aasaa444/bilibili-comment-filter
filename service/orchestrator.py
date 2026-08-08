@@ -16,7 +16,13 @@ from .analyzer import (
 )
 from .auth import AuthService
 from .blacklist import BlacklistQueueService
-from .collector import CollectionCheckpoint, CommentCollector
+from .collector import (
+    BilibiliAuthenticationError,
+    CollectionCheckpoint,
+    CollectionResult,
+    CollectionStats,
+    CommentCollector,
+)
 from .persistence import CommentStore, EvidenceStore
 from .registry import UidNotFoundError, UidRegistry
 from .tasks import TaskProgress, TaskStatus, TaskStore, VideoTask
@@ -93,16 +99,39 @@ class TaskOrchestrator:
                 else None
             ),
         )
-        try:
-            collection = self.collector.collect(collecting, checkpoint)
-        except Exception as exc:
-            partial = self.task_store.transition(
-                task_id,
-                TaskStatus.PARTIAL,
-                error_code="collection_failed",
-                error_message=str(exc),
+        if checkpoint.complete:
+            declared_replies = sum(checkpoint.declared_reply_counts.values())
+            total_declared = checkpoint.declared_comments + declared_replies
+            collection = CollectionResult(
+                comments=(),
+                checkpoint=checkpoint,
+                stats=CollectionStats(
+                    requested_pages=checkpoint.requested_pages,
+                    declared_comments=checkpoint.declared_comments,
+                    declared_replies=declared_replies,
+                    coverage=1.0 if total_declared else 0.0,
+                ),
+                complete=True,
             )
-            return self._summary(partial)
+        else:
+            try:
+                collection = self.collector.collect(collecting, checkpoint)
+            except BilibiliAuthenticationError as exc:
+                paused = self.task_store.transition(
+                    task_id,
+                    TaskStatus.PAUSED,
+                    error_code="auth_unavailable",
+                    error_message=str(exc),
+                )
+                return self._summary(paused)
+            except Exception as exc:
+                partial = self.task_store.transition(
+                    task_id,
+                    TaskStatus.PARTIAL,
+                    error_code="collection_failed",
+                    error_message=str(exc),
+                )
+                return self._summary(partial)
         self.comment_store.save_many(task_id, collection.comments)
         saved_comments, saved_replies, pinned_comments = self.comment_store.stats_for_task(task_id)
         declared_comments = max(
@@ -140,14 +169,18 @@ class TaskOrchestrator:
             checkpoint={
                 "root_page": collection.checkpoint.root_page,
                 "replies": collection.checkpoint.reply_pages,
-                "complete": collection.complete,
+                "complete": collection.complete
+                and (not total_declared or saved_comments + saved_replies >= total_declared),
                 "requested_pages": collection.checkpoint.requested_pages,
                 "declared_comments": collection.checkpoint.declared_comments,
                 "declared_reply_counts": collection.checkpoint.declared_reply_counts,
                 "root_cursor": collection.checkpoint.root_cursor,
             },
         )
-        if not collection.complete:
+        collection_complete = collection.complete and (
+            not total_declared or saved_comments + saved_replies >= total_declared
+        )
+        if not collection_complete:
             partial = self.task_store.transition(
                 task_id,
                 TaskStatus.PARTIAL,

@@ -1,14 +1,21 @@
 from dataclasses import dataclass
 
 import httpx
+import pytest
 
 from service.collector import (
+    BilibiliAuthenticationError,
     BilibiliCommentCollector,
     BilibiliCommentTransport,
     CollectionCheckpoint,
 )
 from service.db import Database
 from service.tasks import TaskStore
+
+COMPATIBLE_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def make_task():
@@ -203,6 +210,7 @@ def test_bilibili_transport_resolves_bv_and_passes_cookie_to_comment_requests() 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.headers["cookie"] == "SESSDATA=session-secret"
+        assert request.headers["User-Agent"] == COMPATIBLE_USER_AGENT
         if request.url.path == "/x/web-interface/view":
             assert dict(request.url.params) == {"bvid": "BV1realvideo"}
             return httpx.Response(200, json={"code": 0, "data": {"aid": 7788}})
@@ -247,3 +255,154 @@ def test_bilibili_transport_resolves_bv_and_passes_cookie_to_comment_requests() 
         "/x/v2/reply/main",
         "/x/v2/reply/reply",
     ]
+
+
+def test_bilibili_transport_accepts_custom_user_agent() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"code": 0, "data": {"replies": []}})
+
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: None,
+            client=client,
+            min_interval=0,
+            user_agent="fixture-browser/1.0",
+        )
+
+        assert transport.fetch_root_page("12345", 1) == {"replies": []}
+    finally:
+        client.close()
+
+    assert requests[0].headers["User-Agent"] == "fixture-browser/1.0"
+
+
+def test_bilibili_transport_maps_login_required_response_to_authentication_error() -> None:
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, json={"code": -101, "message": "账号未登录"}
+            )
+        ),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: {"SESSDATA": "expired"},
+            client=client,
+            min_interval=0,
+        )
+        with pytest.raises(BilibiliAuthenticationError, match="账号未登录"):
+            transport.fetch_root_page("12345", 1)
+    finally:
+        client.close()
+
+
+def test_collector_does_not_swallow_authentication_error() -> None:
+    class ExpiredTransport:
+        def fetch_root_page(self, _video_id: str, _page: int) -> dict:
+            raise BilibiliAuthenticationError("fixture session expired")
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("reply collection must not start")
+
+    database = Database(":memory:")
+    database.initialize()
+    try:
+        task, _ = TaskStore(database).create(
+            video_url="https://www.bilibili.com/video/BV1expiredcollector"
+        )
+        with pytest.raises(BilibiliAuthenticationError, match="fixture session expired"):
+            BilibiliCommentCollector(ExpiredTransport()).collect(
+                task, CollectionCheckpoint()
+            )
+    finally:
+        database.close()
+
+
+def test_collector_preserves_pinned_flag_when_root_is_in_both_lists() -> None:
+    class PinnedTransport:
+        root_cursor_mode = False
+
+        def fetch_root_page(self, _video_id: str, _page: int) -> dict:
+            return {
+                "replies": [
+                    {
+                        "rpid": 100,
+                        "mid": 1000,
+                        "member": {"mid": 1000, "uname": "pinned-user"},
+                        "content": {"message": "top comment"},
+                    }
+                ],
+                "top": {
+                    "rpid": 100,
+                    "mid": 1000,
+                    "member": {"mid": 1000, "uname": "pinned-user"},
+                    "content": {"message": "top comment"},
+                },
+                "page": {"count": 1, "page_count": 1},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            return {"replies": []}
+
+    database = Database(":memory:")
+    database.initialize()
+    try:
+        task, _ = TaskStore(database).create(
+            video_url="https://www.bilibili.com/video/BV1pinnedroot"
+        )
+        result = BilibiliCommentCollector(PinnedTransport()).collect(
+            task, CollectionCheckpoint()
+        )
+    finally:
+        database.close()
+
+    assert result.complete is True
+    assert len(result.comments) == 1
+    assert result.comments[0].is_pinned is True
+    assert result.stats.pinned_comments == 1
+
+
+def test_collector_keeps_incomplete_when_declared_count_exceeds_saved_comments() -> None:
+    class ShortTransport:
+        root_cursor_mode = False
+
+        def fetch_root_page(self, _video_id: str, _page: int) -> dict:
+            return {
+                "replies": [
+                    {
+                        "rpid": 200,
+                        "mid": 2000,
+                        "member": {"mid": 2000, "uname": "short-user"},
+                        "content": {"message": "only comment"},
+                    }
+                ],
+                "page": {"count": 2, "page_count": 1},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            return {"replies": []}
+
+    database = Database(":memory:")
+    database.initialize()
+    try:
+        task, _ = TaskStore(database).create(
+            video_url="https://www.bilibili.com/video/BV1shortcount"
+        )
+        result = BilibiliCommentCollector(ShortTransport()).collect(
+            task, CollectionCheckpoint()
+        )
+    finally:
+        database.close()
+
+    assert result.complete is False
+    assert result.checkpoint.complete is False
+    assert result.stats.declared_comments == 2
+    assert result.stats.saved_comments == 1

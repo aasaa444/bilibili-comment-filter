@@ -9,6 +9,7 @@ import type {
   HealthResponse,
   ReviewRecord,
   SampleSet,
+  TaskComment,
   TaskStatus,
   UidRecord,
   UidSyncResponse,
@@ -89,6 +90,10 @@ export class ApiClient {
 
   getTask(taskId: string): Promise<VideoTask> {
     return this.request<unknown>(`/api/tasks/${encodeURIComponent(taskId)}`).then(requireVideoTask);
+  }
+
+  listTaskComments(taskId: string): Promise<ApiList<TaskComment>> {
+    return this.requestList(`/api/tasks/${encodeURIComponent(taskId)}/comments`, "comments", normalizeTaskComment);
   }
 
   retryTask(taskId: string): Promise<VideoTask> {
@@ -269,6 +274,7 @@ function normalizeVideoTask(value: unknown): VideoTask | null {
   if (!taskId || !bvid || !isTaskStatus(status)) return null;
   const progressObject = asRecord(candidate.progress);
   const progressValue = numberValue(candidate.progress) ?? numberValue(progressObject.coverage);
+  const failedItems = arrayValue(candidate.failed_items) ?? arrayValue(progressObject.failed_items);
   return {
     taskId,
     bvid,
@@ -281,8 +287,37 @@ function normalizeVideoTask(value: unknown): VideoTask | null {
     phase: stringValue(candidate.phase) ?? (status === "processing" ? "处理中" : undefined),
     collectedComments: numberValue(candidate.collected_comments) ?? numberValue(candidate.collectedComments) ?? numberValue(progressObject.saved_comments) ?? undefined,
     replyCount: numberValue(candidate.reply_count) ?? numberValue(candidate.replyCount) ?? numberValue(progressObject.saved_replies) ?? undefined,
+    requestedPages: numberValue(candidate.requested_pages) ?? numberValue(candidate.requestedPages) ?? numberValue(progressObject.requested_pages) ?? undefined,
+    pinnedComments: numberValue(candidate.pinned_comments) ?? numberValue(candidate.pinnedComments) ?? numberValue(progressObject.pinned_comments) ?? undefined,
+    declaredComments: numberValue(candidate.declared_comments) ?? numberValue(candidate.declaredComments) ?? numberValue(progressObject.declared_comments) ?? undefined,
+    declaredReplies: numberValue(candidate.declared_replies) ?? numberValue(candidate.declaredReplies) ?? numberValue(progressObject.declared_replies) ?? undefined,
     coverage: numberValue(candidate.coverage) ?? numberValue(progressObject.coverage) ?? undefined,
+    failedItems: failedItems === null ? undefined : stringArray(failedItems),
+    errorCode: stringValue(candidate.error_code) ?? stringValue(candidate.errorCode),
     error: stringValue(candidate.error) ?? stringValue(candidate.error_message),
+  };
+}
+
+function normalizeTaskComment(value: unknown): TaskComment | null {
+  const candidate = asRecord(value);
+  const commentId = stringValue(candidate.comment_id) ?? stringValue(candidate.commentId) ?? stringValue(candidate.id);
+  const uid = stringValue(candidate.uid);
+  const rootId = stringValue(candidate.root_id) ?? stringValue(candidate.rootId) ?? commentId;
+  const parentId = stringValue(candidate.parent_id) ?? stringValue(candidate.parentId) ?? null;
+  if (!commentId || !uid || !rootId) return null;
+  return {
+    commentId,
+    uid,
+    nickname: stringValue(candidate.nickname) ?? stringValue(candidate.nickname_snapshot) ?? stringValue(candidate.nicknameSnapshot) ?? "",
+    content: stringValue(candidate.content) ?? stringValue(candidate.comment_text) ?? "",
+    videoId: stringValue(candidate.video_id) ?? stringValue(candidate.videoId) ?? "",
+    commentUrl: stringValue(candidate.comment_url) ?? stringValue(candidate.commentUrl) ?? "",
+    rootId,
+    parentId,
+    level: stringValue(candidate.level) ?? (parentId ? "reply" : "root"),
+    createdAt: numberValue(candidate.created_at) ?? numberValue(candidate.createdAt),
+    isPinned: booleanValue(candidate.is_pinned) ?? booleanValue(candidate.isPinned) ?? false,
+    context: stringArray(candidate.context),
   };
 }
 

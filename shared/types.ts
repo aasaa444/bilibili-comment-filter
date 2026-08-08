@@ -54,8 +54,29 @@ export interface VideoTask {
   phase?: string;
   collectedComments?: number;
   replyCount?: number;
+  requestedPages?: number;
+  pinnedComments?: number;
+  declaredComments?: number;
+  declaredReplies?: number;
   coverage?: number;
+  failedItems?: string[];
+  errorCode?: string;
   error?: string;
+}
+
+export interface TaskComment {
+  commentId: string;
+  uid: string;
+  nickname: string;
+  content: string;
+  videoId: string;
+  commentUrl: string;
+  rootId: string;
+  parentId: string | null;
+  level: string;
+  createdAt: number | null;
+  isPinned: boolean;
+  context: string[];
 }
 
 export interface Evidence {

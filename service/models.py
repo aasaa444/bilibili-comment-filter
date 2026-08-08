@@ -50,7 +50,7 @@ class HealthResponse(BaseModel):
 class AuthSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    cookies: dict[str, str] | list[AuthCookie] = Field(min_length=1)
+    cookies: dict[str, str] | list[AuthCookie] = Field(default_factory=dict)
     source: str = Field(default="extension", min_length=1, max_length=64)
     origin: str | None = Field(default=None, max_length=2048)
 

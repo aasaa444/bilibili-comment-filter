@@ -1,5 +1,15 @@
 $ErrorActionPreference = 'Stop'
 
+function Stop-ProcessTree {
+  param([Parameter(Mandatory = $true)][int]$RootPid)
+
+  $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $RootPid" -ErrorAction SilentlyContinue
+  foreach ($child in $children) {
+    Stop-ProcessTree -RootPid ([int]$child.ProcessId)
+  }
+  Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $pythonPath = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $dataPath = Join-Path $repoRoot 'data'
@@ -88,7 +98,7 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
   Start-Sleep -Milliseconds 500
 }
 if (-not $healthy) {
-  Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+  Stop-ProcessTree -RootPid $process.Id
   Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
   throw "Service did not become healthy at /api/health. Check $stderrPath for details."
 }

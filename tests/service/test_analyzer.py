@@ -6,12 +6,14 @@ import pytest
 from service.analyzer import (
     AccountBundle,
     AnalysisDecision,
+    AnalyzerContextLimitError,
     AnalyzerInvalidResponseError,
     CommentForAnalysis,
     OpenAICompatibleBatchAnalyzer,
     OpenAICompatibleTransport,
     RuleCatalog,
     RuleEngine,
+    SampleInjector,
     SampleItem,
     SampleSet,
 )
@@ -117,6 +119,21 @@ def test_rule_engine_prioritizes_friendly_exception_and_requires_context_for_ter
     assert contextual_term.decision is AnalysisDecision.HIT
     assert nickname is not None
     assert nickname.decision is AnalysisDecision.HIT
+
+
+def test_sample_injector_compresses_chinese_samples_within_budget() -> None:
+    context = SampleInjector().prepare(
+        SampleSet(
+            "samples-v1",
+            (SampleItem("s1", "comment", "positive", "詹黑样本" * 20),),
+        ),
+        (),
+        20,
+    )
+
+    assert context.mode == "compressed"
+    assert len(context.items) == 1
+    assert len(context.items[0].content) <= 10
 
 
 def test_analyzer_rejects_invalid_structured_model_response() -> None:
@@ -244,6 +261,93 @@ def test_openai_transport_rejects_invalid_http_json() -> None:
             transport.complete({"accounts": []})
     finally:
         client.close()
+
+
+def test_openai_transport_classifies_context_limit_without_retry() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(413, json={"error": "request too large"})
+
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key=None,
+            model="fixture-model",
+            client=client,
+            max_retries=3,
+            retry_backoff=0,
+        )
+        with pytest.raises(AnalyzerContextLimitError):
+            transport.complete({"accounts": []})
+    finally:
+        client.close()
+
+    assert calls == 1
+
+
+def test_analyzer_splits_a_server_rejected_batch_and_keeps_single_uid_fallback() -> None:
+    class SplittingTransport:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def complete(self, payload: dict) -> dict:
+            self.calls.append(len(payload["accounts"]))
+            if len(payload["accounts"]) > 1:
+                raise AnalyzerContextLimitError("fixture context limit")
+            item = payload["accounts"][0]
+            return {
+                "results": [
+                    {
+                        "uid": item["uid"],
+                        "decision": "uncertain",
+                        "evidence_comment_ids": [item["comments"][0]["comment_id"]],
+                        "reason": "fixture review",
+                        "confidence": 0.5,
+                        "model_version": "fixture-model",
+                    }
+                ]
+            }
+
+    transport = SplittingTransport()
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=transport,
+        model="fixture-model",
+        context_budget=1000,
+    )
+
+    result = analyzer.analyze(
+        [account("1001", "ordinary one"), account("1002", "ordinary two")],
+        SampleSet("v1", ()),
+    )
+
+    assert transport.calls == [2, 1, 1]
+    assert result.batch_count == 3
+    assert {item.uid for item in result.results} == {"1001", "1002"}
+
+
+def test_analyzer_keeps_a_single_uid_when_the_server_still_rejects_context() -> None:
+    class RejectingTransport:
+        def complete(self, _payload: dict) -> dict:
+            raise AnalyzerContextLimitError("fixture context limit")
+
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=RejectingTransport(),
+        model="fixture-model",
+        context_budget=1000,
+    )
+
+    result = analyzer.analyze([account("1001", "ordinary")], SampleSet("v1", ()))
+
+    assert result.batch_count == 1
+    assert result.results[0].decision is AnalysisDecision.UNCERTAIN
+    assert result.results[0].signals == ("context_overflow", "server_context_limit")
 
 
 def test_oversized_uid_context_becomes_explicit_uncertain_result() -> None:

@@ -13,6 +13,7 @@ import type {
   SampleItem,
   SampleKind,
   SampleSet,
+  TaskComment,
   UidRecord,
   VideoTask,
 } from "../../shared/types.js";
@@ -21,12 +22,20 @@ import { mergeSampleItems, parseSampleText } from "./sample-import.js";
 type ViewName = "dashboard" | "tasks" | "uids" | "reviews" | "samples" | "blacklist";
 type Collection<T> = { items: T[] | null; error?: string };
 
+interface TaskDetailState {
+  open: boolean;
+  loading: boolean;
+  comments: TaskComment[] | null;
+  error?: string;
+}
+
 interface ManagementState {
   activeView: ViewName;
   loading: boolean;
   connection: ConnectionState;
   auth: AuthSession | null;
   tasks: Collection<VideoTask>;
+  taskDetails: Record<string, TaskDetailState>;
   uids: Collection<UidRecord>;
   evidence: Collection<Evidence>;
   samples: Collection<SampleSet>;
@@ -54,6 +63,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     connection: { kind: "loading", label: "正在连接本机服务" },
     auth: null,
     tasks: { items: null },
+    taskDetails: {},
     uids: { items: null },
     evidence: { items: null },
     samples: { items: null },
@@ -133,6 +143,21 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     if (retryTask) {
       const task = await runAction(() => api.retryTask(retryTask.dataset.retryTask ?? ""), "任务已重新排队");
       if (task) replaceTask(task);
+      return;
+    }
+    const retryComments = target.closest<HTMLElement>("[data-task-comments-retry]");
+    if (retryComments) {
+      await loadTaskComments(retryComments.dataset.taskCommentsRetry ?? "");
+      return;
+    }
+    const taskDetailsButton = target.closest<HTMLElement>("[data-task-details]");
+    if (taskDetailsButton) {
+      const taskId = taskDetailsButton.dataset.taskDetails ?? "";
+      const detail = state.taskDetails[taskId] ?? { open: false, loading: false, comments: null };
+      detail.open = !detail.open;
+      state.taskDetails[taskId] = detail;
+      renderContent();
+      if (detail.open && detail.comments === null && !detail.loading) await loadTaskComments(taskId);
       return;
     }
     const reviewButton = target.closest<HTMLElement>("[data-review-action]");
@@ -252,6 +277,29 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     }
   }
 
+  async function loadTaskComments(taskId: string): Promise<void> {
+    const detail = state.taskDetails[taskId] ?? { open: true, loading: false, comments: null };
+    detail.open = true;
+    detail.loading = true;
+    detail.comments = null;
+    detail.error = undefined;
+    state.taskDetails[taskId] = detail;
+    renderContent();
+    try {
+      detail.comments = (await api.listTaskComments(taskId)).items;
+    } catch (error) {
+      detail.error = messageFromError(error);
+    } finally {
+      detail.loading = false;
+      renderContent();
+    }
+  }
+
+  function renderContent(): void {
+    const content = root.querySelector<HTMLElement>("[data-content]");
+    if (content) content.innerHTML = renderView(state);
+  }
+
   function replaceTask(task: VideoTask): void {
     const items = state.tasks.items ?? [];
     state.tasks = { items: [task, ...items.filter((item) => item.taskId !== task.taskId)] };
@@ -359,7 +407,7 @@ function renderDashboard(state: ManagementState): string {
       ${renderStat("拉黑队列", queueItems ? String(queueItems.length) : "未加载", "官方动作")}
     </section>
     <div class="dashboard-columns">
-      <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">任务阶段</p><h3>最近视频任务</h3></div><button class="button button-ghost" data-view="tasks" type="button">查看全部</button></div>${renderTaskCollection(state.tasks, "dashboard")}</section>
+      <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">任务阶段</p><h3>最近视频任务</h3></div><button class="button button-ghost" data-view="tasks" type="button">查看全部</button></div>${renderTaskCollection(state.tasks, "dashboard", "", state.taskDetails)}</section>
       <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">需要判断</p><h3>待复核 UID</h3></div><button class="button button-ghost" data-view="reviews" type="button">打开证据</button></div>${renderEvidenceCollection(state.evidence, "dashboard")}</section>
     </div>`;
 }
@@ -381,7 +429,7 @@ function renderAuthDiagnostic(session: AuthSession | null): string {
 
 function renderTasks(state: ManagementState): string {
   const filter = state.filters.tasks ?? "";
-  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">异步工作单元</p><h3>视频任务</h3></div>${renderFilter("tasks", "搜索任务 ID、BVID 或标题", filter)}</div>${renderTaskForm()}${renderTaskCollection(state.tasks, "tasks", filter)}</section>`;
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">异步工作单元</p><h3>视频任务</h3></div>${renderFilter("tasks", "搜索任务 ID、BVID 或标题", filter)}</div>${renderTaskForm()}${renderTaskCollection(state.tasks, "tasks", filter, state.taskDetails)}</section>`;
 }
 
 function renderUids(state: ManagementState): string {
@@ -411,16 +459,54 @@ function renderTaskForm(): string {
   return `<form class="task-form" data-form="task"><label>视频 URL<input name="videoUrl" type="url" placeholder="https://www.bilibili.com/video/BV..." required /></label><label>BVID<input name="bvid" placeholder="可从 URL 自动提取" /></label><label>标题快照<input name="title" placeholder="可选" /></label><button class="button button-primary" type="submit">创建视频任务</button></form>`;
 }
 
-function renderTaskCollection(collection: Collection<VideoTask>, view: "dashboard" | "tasks", filter = ""): string {
+function renderTaskCollection(collection: Collection<VideoTask>, view: "dashboard" | "tasks", filter = "", taskDetails: Record<string, TaskDetailState> = {}): string {
   if (collection.items === null) return collection.error ? renderState("error", "任务列表加载失败", collection.error) : renderState("loading", "正在载入任务", "");
   const items = collection.items.filter((task) => `${task.taskId} ${task.bvid} ${task.title}`.toLowerCase().includes(filter.toLowerCase()));
   if (items.length === 0) return renderState(filter ? "filtered-empty" : "empty", filter ? "当前筛选没有匹配任务" : "还没有视频任务", filter ? "清除筛选或回到完整集合" : "从上方提交一个普通 BV 视频");
-  return `<div class="list" data-list="${view}">${items.slice(0, view === "dashboard" ? 5 : undefined).map(renderTaskRow).join("")}</div>`;
+  return `<div class="list" data-list="${view}">${items.slice(0, view === "dashboard" ? 5 : undefined).map((task) => renderTaskRow(task, taskDetails[task.taskId])).join("")}</div>`;
 }
 
-function renderTaskRow(task: VideoTask): string {
+function renderTaskRow(task: VideoTask, detail?: TaskDetailState): string {
   const view = taskViewState(task.status);
-  return `<article class="list-row" data-state="${view.kind}"><div class="row-main"><strong>${escapeHtml(task.title || task.bvid)}</strong><span class="mono">${escapeHtml(task.taskId)} · ${escapeHtml(task.bvid)}</span><small>${escapeHtml(task.phase ?? "")} ${task.progress === undefined ? "" : `${task.progress}%`}</small></div><div class="row-actions"><span class="status-pill" data-state="${view.kind}">${view.label}</span>${task.status === "failed" ? `<button class="button button-ghost" data-retry-task="${escapeHtml(task.taskId)}" type="button">重试</button>` : ""}</div></article>`;
+  const isOpen = detail?.open === true;
+  return `<article class="task-row" data-state="${view.kind}"><div class="list-row"><div class="row-main"><strong>${escapeHtml(task.title || task.bvid)}</strong><span class="mono">${escapeHtml(task.taskId)} · ${escapeHtml(task.bvid)}</span><small>${escapeHtml(task.phase ?? "")} ${task.progress === undefined ? "" : `${task.progress}%`}</small></div><div class="row-actions"><span class="status-pill" data-state="${view.kind}">${view.label}</span><button class="button button-ghost" data-task-details="${escapeHtml(task.taskId)}" type="button" aria-expanded="${isOpen ? "true" : "false"}">${isOpen ? "收起详情" : "查看评论详情"}</button>${task.status === "failed" ? `<button class="button button-ghost" data-retry-task="${escapeHtml(task.taskId)}" type="button">重试</button>` : ""}</div></div>${isOpen ? renderTaskDetail(task, detail) : ""}</article>`;
+}
+
+function renderTaskDetail(task: VideoTask, detail: TaskDetailState): string {
+  const failedItems = task.failedItems;
+  const failedMarkup = failedItems === undefined
+    ? `<p class="muted">未提供</p>`
+    : failedItems.length === 0
+      ? `<p class="muted">无</p>`
+      : `<ul class="task-failure-list">${failedItems.map((item) => `<li class="mono">${escapeHtml(item)}</li>`).join("")}</ul>`;
+  let commentsMarkup: string;
+  if (detail.loading) {
+    commentsMarkup = renderState("loading", "正在载入任务评论", "只更新当前任务详情");
+  } else if (detail.error) {
+    commentsMarkup = `<div class="task-comments-error">${renderState("error", "评论加载失败", detail.error)}<button class="button button-ghost" data-task-comments-retry="${escapeHtml(task.taskId)}" type="button">重试加载评论</button></div>`;
+  } else if (!detail.comments || detail.comments.length === 0) {
+    commentsMarkup = renderState("empty", "暂无已保存评论", "该任务没有可展示的根评论或楼中楼");
+  } else {
+    commentsMarkup = `<div class="task-comments">${detail.comments.map(renderTaskComment).join("")}</div>`;
+  }
+  return `<section class="task-detail" data-task-detail="${escapeHtml(task.taskId)}" aria-label="任务详情"><div class="task-detail-heading"><div><p class="eyebrow">采集结果</p><h4>任务详情</h4></div>${task.error ? `<span class="status-pill" data-state="error">${escapeHtml(task.errorCode ?? "任务有失败项")}</span>` : `<span class="status-pill" data-state="ready">已保存结果</span>`}</div><div class="task-stat-grid"><div class="task-stat"><span>保存根评论</span><strong>${formatTaskNumber(task.collectedComments)}</strong></div><div class="task-stat"><span>保存楼中楼</span><strong>${formatTaskNumber(task.replyCount)}</strong></div><div class="task-stat"><span>置顶评论</span><strong>${formatTaskNumber(task.pinnedComments)}</strong></div><div class="task-stat"><span>覆盖率</span><strong>${formatTaskCoverage(task.coverage)}</strong></div><div class="task-stat"><span>请求页数</span><strong>${formatTaskNumber(task.requestedPages)}</strong></div><div class="task-stat"><span>声明评论 / 回复</span><strong>${formatTaskNumber(task.declaredComments)} / ${formatTaskNumber(task.declaredReplies)}</strong></div></div><div class="task-failures"><h5>失败项</h5>${failedMarkup}</div>${task.error ? `<div class="task-error"><strong>任务错误${task.errorCode ? ` · ${escapeHtml(task.errorCode)}` : ""}</strong><p>${escapeHtml(task.error)}</p></div>` : ""}<div class="task-comments-section"><div class="section-heading"><div><p class="eyebrow">评论明细</p><h5>根评论与楼中楼</h5></div></div>${commentsMarkup}</div></section>`;
+}
+
+function renderTaskComment(comment: TaskComment): string {
+  const isReply = comment.parentId !== null || comment.level === "reply";
+  const relation = isReply ? "楼中楼回复" : "根评论";
+  const context = comment.context.length > 0 ? comment.context.join("\n") : "未提供";
+  return `<article class="task-comment ${isReply ? "task-comment-reply" : ""}"><div class="task-comment-heading"><div><strong>${relation}</strong><span class="mono">UID ${escapeHtml(comment.uid)}</span><span>${escapeHtml(comment.nickname || "无昵称")}</span></div><div class="row-actions">${comment.isPinned ? `<span class="status-pill" data-state="info">置顶</span>` : ""}<span class="status-pill" data-state="${isReply ? "info" : "ready"}">${isReply ? "回复" : "根评论"}</span></div></div><p class="task-comment-content">${escapeHtml(comment.content)}</p><dl><div><dt>上下文</dt><dd>${escapeHtml(context)}</dd></div><div><dt>评论 ID</dt><dd class="mono">${escapeHtml(comment.commentId)}</dd></div><div><dt>父评论</dt><dd class="mono">${escapeHtml(comment.parentId ?? "无")}</dd></div></dl></article>`;
+}
+
+function formatTaskNumber(value: number | undefined): string {
+  return value === undefined ? "未提供" : String(value);
+}
+
+function formatTaskCoverage(value: number | undefined): string {
+  if (value === undefined) return "未提供";
+  const percent = value >= 0 && value <= 1 ? value * 100 : value;
+  return `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%`;
 }
 
 function renderUidCollection(collection: Collection<UidRecord>, filter: string): string {

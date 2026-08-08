@@ -38,6 +38,78 @@ test("task creation maps the frontend DTO to backend video_url/title fields", as
   });
 });
 
+test("task comments request the task-scoped endpoint and normalize comment DTOs", async () => {
+  const calls = [];
+  const client = new ApiClient("http://127.0.0.1:8000", mockFetch({
+    "/api/tasks/task-1/comments": {
+      items: [
+        {
+          comment_id: "root-1",
+          uid: "1001",
+          nickname: "根评论用户",
+          content: "根评论正文",
+          video_id: "BV1abCdefGh1",
+          comment_url: "https://www.bilibili.com/./root-1",
+          root_id: "root-1",
+          parent_id: null,
+          level: "root",
+          created_at: 1700000000,
+          is_pinned: true,
+          context: ["视频标题", "根评论正文"],
+        },
+        {
+          comment_id: "reply-1",
+          uid: "1002",
+          nickname: "回复用户",
+          content: "楼中楼正文",
+          video_id: "BV1abCdefGh1",
+          comment_url: "https://www.bilibili.com/./reply-1",
+          root_id: "root-1",
+          parent_id: "root-1",
+          level: "reply",
+          created_at: 1700000001,
+          is_pinned: false,
+          context: ["根评论正文", "楼中楼正文"],
+        },
+      ],
+    },
+  }, calls));
+
+  const comments = await client.listTaskComments("task-1");
+
+  assert.equal(calls[0].input, "http://127.0.0.1:8000/api/tasks/task-1/comments");
+  assert.deepEqual(comments.items, [
+    {
+      commentId: "root-1",
+      uid: "1001",
+      nickname: "根评论用户",
+      content: "根评论正文",
+      videoId: "BV1abCdefGh1",
+      commentUrl: "https://www.bilibili.com/./root-1",
+      rootId: "root-1",
+      parentId: null,
+      level: "root",
+      createdAt: 1700000000,
+      isPinned: true,
+      context: ["视频标题", "根评论正文"],
+    },
+    {
+      commentId: "reply-1",
+      uid: "1002",
+      nickname: "回复用户",
+      content: "楼中楼正文",
+      videoId: "BV1abCdefGh1",
+      commentUrl: "https://www.bilibili.com/./reply-1",
+      rootId: "root-1",
+      parentId: "root-1",
+      level: "reply",
+      createdAt: 1700000001,
+      isPinned: false,
+      context: ["根评论正文", "楼中楼正文"],
+    },
+  ]);
+});
+
 test("UID sync maps backend state/nickname to the cache DTO and keeps the version query", async () => {
   const calls = [];
   const client = new ApiClient("http://127.0.0.1:8000", mockFetch({

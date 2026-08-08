@@ -98,6 +98,10 @@ class AnalyzerUnavailableError(RuntimeError):
         self.partial_results = tuple(partial_results)
 
 
+class AnalyzerContextLimitError(AnalyzerUnavailableError):
+    """The model endpoint rejected a request because its context is too large."""
+
+
 class AnalyzerInvalidResponseError(ValueError):
     def __init__(self, message: str, *, partial_results: tuple[AnalysisResult, ...] = ()) -> None:
         super().__init__(message)
@@ -206,7 +210,12 @@ class SampleInjector:
                 "selected samples by lexical relevance to the current accounts",
             )
         summary = " | ".join(item.content for item in samples.items)
-        compressed = SampleItem("compressed", "summary", "summary", summary[: max(16, budget * 4)])
+        compressed = SampleItem(
+            "compressed",
+            "summary",
+            "summary",
+            _truncate_text(summary, max(1, budget // 2)),
+        )
         return SampleContext(
             samples.version,
             (compressed,),
@@ -274,6 +283,10 @@ class OpenAICompatibleTransport:
                     ) from exc
             except httpx.HTTPStatusError as exc:
                 last_error = exc
+                if _is_context_limit_response(exc.response):
+                    raise AnalyzerContextLimitError(
+                        "Model endpoint rejected the batch because its context is too large"
+                    ) from exc
                 retryable = exc.response.status_code in {408, 409, 429} or (
                     exc.response.status_code >= 500
                 )
@@ -353,7 +366,10 @@ class OpenAICompatibleBatchAnalyzer:
 
         batches = self._split(unresolved, sample_context)
         model_results: list[AnalysisResult] = []
-        for batch in batches:
+        pending_batches = list(batches)
+        batch_count = 0
+        while pending_batches:
+            batch = pending_batches.pop(0)
             payload = {
                 "model": self.model,
                 "rule_version": self.rule_engine.catalog.version,
@@ -365,8 +381,25 @@ class OpenAICompatibleBatchAnalyzer:
             }
             completed_results = tuple(rule_results + model_results)
             try:
+                batch_count += 1
                 raw = self.transport.complete(payload)
                 parsed = self._parse_response(raw, batch, sample_context)
+            except AnalyzerContextLimitError:
+                if len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    pending_batches[0:0] = [batch[:midpoint], batch[midpoint:]]
+                    continue
+                model_results.append(
+                    self._context_overflow_result(
+                        batch[0],
+                        sample_context,
+                        _estimate_text(
+                            json.dumps(self._account_payload(batch[0]), ensure_ascii=False)
+                        ),
+                        server_rejected=True,
+                    )
+                )
+                continue
             except AnalyzerUnavailableError as exc:
                 raise AnalyzerUnavailableError(
                     str(exc), partial_results=completed_results
@@ -378,7 +411,7 @@ class OpenAICompatibleBatchAnalyzer:
             model_results.extend(parsed)
         return AnalysisBatchResult(
             results=tuple(rule_results + model_results),
-            batch_count=len(batches),
+            batch_count=batch_count,
             sample_context=sample_context,
         )
 
@@ -408,17 +441,29 @@ class OpenAICompatibleBatchAnalyzer:
         return max(1, self.context_budget - sample_tokens - 16)
 
     def _context_overflow_result(
-        self, account: AccountBundle, sample_context: SampleContext, account_tokens: int
+        self,
+        account: AccountBundle,
+        sample_context: SampleContext,
+        account_tokens: int,
+        *,
+        server_rejected: bool = False,
     ) -> AnalysisResult:
+        signal = "server_context_limit" if server_rejected else "context_overflow"
+        reason = (
+            "Model endpoint rejected this UID context after batch splitting; retained for "
+            "high-recall review"
+            if server_rejected
+            else (
+                f"UID context is larger than the configured model budget "
+                f"({account_tokens} estimated tokens); retained for high-recall review"
+            )
+        )
         return AnalysisResult(
             uid=account.uid,
             decision=AnalysisDecision.UNCERTAIN,
             evidence_comment_ids=tuple(comment.comment_id for comment in account.comments),
-            signals=("context_overflow",),
-            reason=(
-                f"UID context is larger than the configured model budget "
-                f"({account_tokens} estimated tokens); retained for high-recall review"
-            ),
+            signals=("context_overflow", signal) if server_rejected else (signal,),
+            reason=reason,
             confidence=0.5,
             model_version="context-guard",
             sample_version=sample_context.version,
@@ -527,7 +572,36 @@ def _parse_json_text(value: str) -> dict[str, Any]:
 
 
 def _estimate_text(value: str) -> int:
-    return max(1, (len(value) + 3) // 4)
+    ascii_characters = sum(character.isascii() for character in value)
+    non_ascii_characters = len(value) - ascii_characters
+    return max(1, non_ascii_characters + (ascii_characters + 3) // 4)
+
+
+def _truncate_text(value: str, token_budget: int) -> str:
+    ascii_characters = 0
+    non_ascii_characters = 0
+    end = 0
+    for index, character in enumerate(value, start=1):
+        if character.isascii():
+            ascii_characters += 1
+        else:
+            non_ascii_characters += 1
+        if non_ascii_characters + (ascii_characters + 3) // 4 > token_budget:
+            break
+        end = index
+    return value[:end]
+
+
+def _is_context_limit_response(response: httpx.Response) -> bool:
+    if response.status_code == 413:
+        return True
+    if response.status_code != 400:
+        return False
+    body = response.text.casefold()
+    return any(
+        marker in body
+        for marker in ("context length", "context window", "too many tokens", "max tokens")
+    )
 
 
 def _keywords(value: str) -> tuple[str, ...]:

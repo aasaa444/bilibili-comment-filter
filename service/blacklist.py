@@ -76,6 +76,8 @@ class RecordingBlacklistExecutor:
 class PlaywrightBlacklistExecutor:
     """Production browser boundary; selectors are deliberately configuration-driven."""
 
+    _LOCATOR_TIMEOUT_MS = 10_000
+
     _PLATFORM_INTERCEPTION_MARKERS = (
         "安全验证",
         "请求过频",
@@ -118,52 +120,32 @@ class PlaywrightBlacklistExecutor:
                         context.add_cookies(cookies)
                     page = context.new_page()
                     page.goto(f"{self.base_url}/{item.uid}", wait_until="domcontentloaded")
-                    if page.get_by_text("登录", exact=True).count() > 0:
-                        raise BlacklistExecutionError(
-                            ExecutionFailureKind.AUTH,
-                            "Bilibili session is no longer logged in",
-                        )
-                    page.wait_for_load_state("networkidle", timeout=10_000)
-                    if page.get_by_text("验证码", exact=False).count() > 0:
-                        raise BlacklistExecutionError(
-                            ExecutionFailureKind.CAPTCHA,
-                            "Bilibili requested a captcha; queue paused",
-                        )
-                    if self._platform_interception_detected(page):
-                        raise BlacklistExecutionError(
-                            ExecutionFailureKind.BLOCKED,
-                            "Bilibili blocked the native blacklist action; queue blocked",
-                        )
+                    self._raise_if_page_failure(page)
                     if page.get_by_text("已拉黑", exact=True).count() > 0:
                         return ExecutionResult(detail="UID is already blacklisted")
                     button = page.get_by_text("拉黑", exact=True)
-                    if button.count() == 0:
-                        raise BlacklistExecutionError(
-                            ExecutionFailureKind.INTERCEPTED,
-                            "Native blacklist control was not found",
-                        )
+                    self._wait_for_visible(
+                        page,
+                        button,
+                        kind=ExecutionFailureKind.INTERCEPTED,
+                        detail="Native blacklist control was not found",
+                    )
                     button.click()
                     confirm = page.get_by_text("确定", exact=True)
-                    if confirm.count() == 0:
-                        raise BlacklistExecutionError(
-                            ExecutionFailureKind.INTERCEPTED,
-                            "Native blacklist confirmation control was not found",
-                        )
+                    self._wait_for_visible(
+                        page,
+                        confirm,
+                        kind=ExecutionFailureKind.INTERCEPTED,
+                        detail="Native blacklist confirmation control was not found",
+                    )
                     confirm.click()
-                    page.wait_for_load_state("networkidle", timeout=10_000)
-                    if self._platform_interception_detected(page):
-                        raise BlacklistExecutionError(
-                            ExecutionFailureKind.BLOCKED,
-                            "Bilibili blocked the native blacklist action; queue blocked",
-                        )
                     success = page.get_by_text("已拉黑", exact=True)
-                    try:
-                        success.wait_for(state="visible", timeout=10_000)
-                    except Exception as exc:
-                        raise BlacklistExecutionError(
-                            ExecutionFailureKind.TEMPORARY,
-                            "Native blacklist success state was not confirmed",
-                        ) from exc
+                    self._wait_for_visible(
+                        page,
+                        success,
+                        kind=ExecutionFailureKind.TEMPORARY,
+                        detail="Native blacklist success state was not confirmed",
+                    )
                     if success.count() == 0:
                         raise BlacklistExecutionError(
                             ExecutionFailureKind.TEMPORARY,
@@ -186,6 +168,38 @@ class PlaywrightBlacklistExecutor:
                 ExecutionFailureKind.TEMPORARY,
                 f"Native blacklist action failed: {exc}",
             ) from exc
+
+    def _raise_if_page_failure(self, page: object) -> None:
+        if page.get_by_text("登录", exact=True).count() > 0:
+            raise BlacklistExecutionError(
+                ExecutionFailureKind.AUTH,
+                "Bilibili session is no longer logged in",
+            )
+        if page.get_by_text("验证码", exact=False).count() > 0:
+            raise BlacklistExecutionError(
+                ExecutionFailureKind.CAPTCHA,
+                "Bilibili requested a captcha; queue paused",
+            )
+        if self._platform_interception_detected(page):
+            raise BlacklistExecutionError(
+                ExecutionFailureKind.BLOCKED,
+                "Bilibili blocked the native blacklist action; queue paused",
+            )
+
+    def _wait_for_visible(
+        self,
+        page: object,
+        locator: object,
+        *,
+        kind: ExecutionFailureKind,
+        detail: str,
+    ) -> None:
+        try:
+            locator.wait_for(state="visible", timeout=self._LOCATOR_TIMEOUT_MS)
+        except Exception as exc:
+            self._raise_if_page_failure(page)
+            raise BlacklistExecutionError(kind, detail) from exc
+        self._raise_if_page_failure(page)
 
     def _platform_interception_detected(self, page: object) -> bool:
         return any(
@@ -317,26 +331,13 @@ class BlacklistQueueService:
         return item
 
     def process_next(self, executor: BlacklistExecutor) -> BlacklistItem | None:
-        row = self.database.execute(
-            "SELECT * FROM blacklist_queue WHERE status = ? ORDER BY created_at, item_id LIMIT 1",
-            (BlacklistQueueStatus.QUEUED.value,),
-        ).fetchone()
-        if row is None:
+        item = self._claim_next()
+        if item is None:
             return None
-        item = self._from_row(row)
-        timestamp = datetime.now(UTC).isoformat()
-        with self.database.transaction() as connection:
-            connection.execute(
-                """
-                UPDATE blacklist_queue
-                SET status = ?, attempts = attempts + 1, updated_at = ?, last_error = NULL
-                WHERE item_id = ?
-                """,
-                (BlacklistQueueStatus.PROCESSING.value, timestamp, item.item_id),
-            )
-        item = self.get(item.item_id)
         try:
             outcome = executor.execute(item)
+            if not outcome.success:
+                return self._finish(item.item_id, BlacklistQueueStatus.FAILED, outcome.detail)
         except BlacklistExecutionError as exc:
             status = (
                 BlacklistQueueStatus.FAILED
@@ -347,12 +348,18 @@ class BlacklistQueueService:
                     ExecutionFailureKind.AUTH,
                     ExecutionFailureKind.CAPTCHA,
                     ExecutionFailureKind.INTERCEPTED,
+                    ExecutionFailureKind.BLOCKED,
                 }
-                else BlacklistQueueStatus.BLOCKED
+                else BlacklistQueueStatus.FAILED
             )
             return self._finish(item.item_id, status, exc.detail)
-        if not outcome.success:
-            return self._finish(item.item_id, BlacklistQueueStatus.FAILED, outcome.detail)
+        except Exception as exc:
+            detail = str(exc) or exc.__class__.__name__
+            return self._finish(
+                item.item_id,
+                BlacklistQueueStatus.FAILED,
+                f"Blacklist executor failed: {detail}",
+            )
         completed = self._finish(item.item_id, BlacklistQueueStatus.COMPLETED, None)
         if self.registry is not None:
             try:
@@ -362,6 +369,32 @@ class BlacklistQueueService:
             except (LookupError, ValueError):
                 pass
         return completed
+
+    def _claim_next(self) -> BlacklistItem | None:
+        timestamp = datetime.now(UTC).isoformat()
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """
+                UPDATE blacklist_queue
+                SET status = ?, attempts = attempts + 1, updated_at = ?, last_error = NULL
+                WHERE item_id = (
+                    SELECT item_id
+                    FROM blacklist_queue
+                    WHERE status = ?
+                    ORDER BY created_at, item_id
+                    LIMIT 1
+                )
+                  AND status = ?
+                RETURNING *
+                """,
+                (
+                    BlacklistQueueStatus.PROCESSING.value,
+                    timestamp,
+                    BlacklistQueueStatus.QUEUED.value,
+                    BlacklistQueueStatus.QUEUED.value,
+                ),
+            ).fetchone()
+        return self._from_row(row) if row is not None else None
 
     def _finish(
         self, item_id: str, status: BlacklistQueueStatus, error: str | None

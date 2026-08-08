@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from datetime import UTC, datetime
 
@@ -7,9 +8,15 @@ import pytest
 from service.blacklist import (
     BlacklistExecutionError,
     BlacklistItem,
+    BlacklistQueueService,
+    BlacklistQueueStatus,
     ExecutionFailureKind,
+    ExecutionResult,
     PlaywrightBlacklistExecutor,
 )
+from service.db import Database
+from service.models import UidState
+from service.registry import UidRegistry
 
 
 class FakeLocator:
@@ -57,6 +64,7 @@ class FakePage:
         self.confirmed = False
         self.clicked: list[str] = []
         self.waited_for: list[tuple[str, str, int]] = []
+        self.load_states: list[str] = []
 
     def goto(self, *_args, **_kwargs) -> None:
         return None
@@ -77,7 +85,10 @@ class FakePage:
             visible = self.dialog_open
         return FakeLocator(self, text, int(visible))
 
-    def wait_for_load_state(self, *_args, **_kwargs) -> None:
+    def wait_for_load_state(self, state: str, *_args, **_kwargs) -> None:
+        self.load_states.append(state)
+        if state == "networkidle":
+            raise AssertionError("blacklist detection must not wait for networkidle")
         return None
 
 
@@ -179,7 +190,12 @@ def test_native_executor_confirms_blacklist_and_uses_configured_headless_mode(
 
     assert result.success is True
     assert page.clicked == ["拉黑", "确定"]
-    assert page.waited_for == [("已拉黑", "visible", 10_000)]
+    assert len(page.waited_for) == 3
+    assert all(
+        state == "visible" and timeout == 10_000
+        for _, state, timeout in page.waited_for
+    )
+    assert page.load_states == []
     assert browser.launch_kwargs["headless"] is expected_headless
     assert_resources_closed(browser)
 
@@ -248,3 +264,106 @@ def test_native_executor_classifies_platform_interception_as_blocked(
 
     assert raised.value.kind is ExecutionFailureKind.BLOCKED
     assert_resources_closed(browser)
+
+
+def test_blacklist_queue_pauses_blocked_action_and_can_resume() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    try:
+        registry = UidRegistry(database)
+        registry.add(uid="1001", nickname="blocked", state=UidState.QUEUED)
+        queue = BlacklistQueueService(database, registry)
+        item, _ = queue.enqueue(uid="1001")
+
+        class BlockedExecutor:
+            def execute(self, _item: BlacklistItem) -> ExecutionResult:
+                raise BlacklistExecutionError(
+                    ExecutionFailureKind.BLOCKED, "fixture platform interception"
+                )
+
+        result = queue.process_next(BlockedExecutor())
+
+        assert result is not None
+        assert result.status is BlacklistQueueStatus.PAUSED
+        assert queue.resume(item.item_id).status is BlacklistQueueStatus.QUEUED
+    finally:
+        database.close()
+
+
+def test_blacklist_queue_finishes_unexpected_executor_exception_as_failed() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    try:
+        queue = BlacklistQueueService(database)
+        item, _ = queue.enqueue(uid="1002")
+
+        class ExplodingExecutor:
+            def execute(self, _item: BlacklistItem) -> ExecutionResult:
+                raise RuntimeError("fixture executor failure")
+
+        result = queue.process_next(ExplodingExecutor())
+
+        assert result is not None
+        assert result.status is BlacklistQueueStatus.FAILED
+        assert result.last_error == "Blacklist executor failed: fixture executor failure"
+        assert queue.get(item.item_id).status is BlacklistQueueStatus.FAILED
+    finally:
+        database.close()
+
+
+def test_blacklist_queue_claim_is_atomic_across_concurrent_processors() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    try:
+        queue = BlacklistQueueService(database)
+        item, _ = queue.enqueue(uid="1003")
+        started = threading.Event()
+        release = threading.Event()
+        first_result: list[object] = []
+
+        class BlockingExecutor:
+            def execute(self, _item: BlacklistItem) -> ExecutionResult:
+                started.set()
+                assert release.wait(timeout=2)
+                return ExecutionResult(detail="fixture complete")
+
+        def process_first() -> None:
+            first_result.append(queue.process_next(BlockingExecutor()))
+
+        first = threading.Thread(target=process_first)
+        first.start()
+        assert started.wait(timeout=2)
+
+        second = queue.process_next(BlockingExecutor())
+        release.set()
+        first.join(timeout=2)
+
+        assert second is None
+        assert len(first_result) == 1
+        assert first_result[0].item_id == item.item_id
+        assert queue.get(item.item_id).status is BlacklistQueueStatus.COMPLETED
+    finally:
+        database.close()
+
+
+def test_database_recovers_processing_blacklist_items_after_restart(tmp_path) -> None:
+    db_path = tmp_path / "queue-recovery.sqlite3"
+    database = Database(db_path)
+    database.initialize()
+    queue = BlacklistQueueService(database)
+    item, _ = queue.enqueue(uid="1004")
+    claimed = queue._claim_next()
+    assert claimed is not None
+    assert claimed.status is BlacklistQueueStatus.PROCESSING
+    database.close()
+
+    restarted = Database(db_path)
+    restarted.initialize()
+    try:
+        recovered = BlacklistQueueService(restarted).get(item.item_id)
+        assert recovered.status is BlacklistQueueStatus.FAILED
+        assert recovered.last_error == (
+            "Recovered abandoned blacklist item after service restart"
+        )
+    finally:
+        restarted.close()

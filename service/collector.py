@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import httpx
 
 from .tasks import VideoTask
+
+DEFAULT_BILIBILI_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,10 @@ class CommentTransport(Protocol):
         """Fetch one reply page for a root comment."""
 
 
+class BilibiliAuthenticationError(RuntimeError):
+    """The comment endpoint rejected the current session as unauthenticated."""
+
+
 class BilibiliCommentTransport:
     """HTTP boundary for Bilibili's public comment read endpoints.
 
@@ -88,18 +97,17 @@ class BilibiliCommentTransport:
         min_interval: float = 0.5,
         max_retries: int = 3,
         client: httpx.Client | None = None,
+        user_agent: str = DEFAULT_BILIBILI_USER_AGENT,
     ) -> None:
         self.cookies_provider = cookies_provider
+        self.user_agent = user_agent
         self.client = client or httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=timeout,
             headers={
                 "Accept": "application/json, text/plain, */*",
                 "Referer": "https://www.bilibili.com/",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
-                ),
+                "User-Agent": self.user_agent,
             },
         )
         self._video_oid_cache: dict[str, str] = {}
@@ -138,11 +146,11 @@ class BilibiliCommentTransport:
 
     def _get(self, path: str, params: dict[str, object]) -> dict[str, Any]:
         cookies = self.cookies_provider() or {}
-        headers = (
-            {"Cookie": "; ".join(f"{name}={value}" for name, value in cookies.items())}
-            if cookies
-            else None
-        )
+        headers = {"User-Agent": self.user_agent}
+        if cookies:
+            headers["Cookie"] = "; ".join(
+                f"{name}={value}" for name, value in cookies.items()
+            )
         retryable_codes = {-352, -412, -509}
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
@@ -162,6 +170,10 @@ class BilibiliCommentTransport:
             code = payload.get("code")
             if code == 0:
                 return payload.get("data") or {}
+            if code == -101:
+                raise BilibiliAuthenticationError(
+                    payload.get("message") or "Bilibili session is no longer valid"
+                )
             if code in retryable_codes and attempt < self._max_retries:
                 last_error = RuntimeError(payload.get("message") or f"Bilibili code {code}")
                 time.sleep(0.5 * (attempt + 1))
@@ -177,6 +189,7 @@ class BilibiliCommentCollector:
     def collect(self, task: VideoTask, checkpoint: CollectionCheckpoint) -> CollectionResult:
         comments: list[CommentRecord] = []
         seen_ids: set[str] = set()
+        comment_indexes: dict[str, int] = {}
         failed_items: list[str] = []
         reply_pages = dict(checkpoint.reply_pages)
         declared_reply_by_root = dict(checkpoint.declared_reply_counts)
@@ -185,6 +198,12 @@ class BilibiliCommentCollector:
         requested_pages = checkpoint.requested_pages
         declared_comments = checkpoint.declared_comments
         pinned_comments = 0
+        fresh_checkpoint = (
+            checkpoint.root_page == 1
+            and checkpoint.root_cursor is None
+            and not checkpoint.reply_pages
+            and checkpoint.requested_pages == 0
+        )
 
         while True:
             requested_pages += 1
@@ -197,6 +216,8 @@ class BilibiliCommentCollector:
                     else root_page
                 )
                 payload = self.transport.fetch_root_page(task.video_id, request_page)
+            except BilibiliAuthenticationError:
+                raise
             except Exception:
                 failed_items.append(f"root_page:{root_page}")
                 return self._result(
@@ -250,8 +271,14 @@ class BilibiliCommentCollector:
                     level="root",
                 )
                 if comment.comment_id in seen_ids:
+                    index = comment_indexes[comment.comment_id]
+                    existing = comments[index]
+                    if comment.is_pinned and not existing.is_pinned:
+                        comments[index] = replace(existing, is_pinned=True)
+                        pinned_comments += 1
                     continue
                 seen_ids.add(comment.comment_id)
+                comment_indexes[comment.comment_id] = len(comments)
                 comments.append(comment)
                 pinned_comments += int(comment.is_pinned)
                 root_id = comment.comment_id
@@ -264,6 +291,8 @@ class BilibiliCommentCollector:
                         reply_payload = self.transport.fetch_replies(
                             task.video_id, root_id, reply_page
                         )
+                    except BilibiliAuthenticationError:
+                        raise
                     except Exception:
                         failed_items.append(f"reply:{root_id}:{reply_page}")
                         return self._result(
@@ -316,8 +345,14 @@ class BilibiliCommentCollector:
                             level="reply",
                         )
                         if parsed.comment_id in seen_ids:
+                            index = comment_indexes[parsed.comment_id]
+                            existing = comments[index]
+                            if parsed.is_pinned and not existing.is_pinned:
+                                comments[index] = replace(existing, is_pinned=True)
+                                pinned_comments += 1
                             continue
                         seen_ids.add(parsed.comment_id)
+                        comment_indexes[parsed.comment_id] = len(comments)
                         comments.append(parsed)
                     if _has_more(reply_payload, reply_page):
                         reply_page += 1
@@ -329,12 +364,18 @@ class BilibiliCommentCollector:
                 root_page += 1
                 root_cursor = _next_cursor(payload)
                 continue
+            total_declared = declared_comments + sum(declared_reply_by_root.values())
+            total_saved = len(comments)
             return self._result(
                 comments,
                 self._checkpoint(
                     root_page + 1,
                     reply_pages,
-                    True,
+                    (
+                        not fresh_checkpoint
+                        or not total_declared
+                        or total_saved >= total_declared
+                    ),
                     requested_pages,
                     declared_comments,
                     declared_reply_by_root,

@@ -28,6 +28,15 @@ def test_health_reports_database_worker_and_auth_state() -> None:
     }
 
 
+def test_health_requires_the_background_worker_when_configured_to_start() -> None:
+    with TestClient(create_app(db_path=":memory:", start_background_worker=True)) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+    assert response.json()["worker"]["status"] == "ready"
+
+
 def test_auth_session_reports_verified_state_without_echoing_cookies() -> None:
     verifier = FixedAuthVerifier(
         AuthVerification(status=AuthStatus.VALID, detail="Bilibili session is valid")
@@ -54,6 +63,20 @@ def test_auth_session_reports_missing_state_before_any_sync() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "missing"
     assert response.json()["detail"] == "No Bilibili session has been synchronized"
+
+
+def test_empty_auth_session_does_not_claim_cookie_presence() -> None:
+    client = TestClient(create_app(db_path=":memory:"))
+
+    response = client.post(
+        "/api/auth/session",
+        json={"cookies": {}, "source": "test"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "missing"
+    assert response.json()["cookie_present"] is False
+    assert client.get("/api/auth/session").json()["cookie_present"] is False
 
 
 def test_invalid_auth_pauses_task_through_public_api() -> None:

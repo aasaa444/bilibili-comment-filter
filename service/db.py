@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -168,6 +170,7 @@ class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._connection: sqlite3.Connection | None = None
+        self._transaction_lock = threading.RLock()
 
     def initialize(self) -> None:
         if self._connection is not None:
@@ -177,9 +180,11 @@ class Database:
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.executescript(SCHEMA)
         self._migrate_task_checkpoints()
         self._connection.commit()
+        self.recover_blacklist_processing()
 
     def _migrate_task_checkpoints(self) -> None:
         columns = {
@@ -206,13 +211,35 @@ class Database:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        connection = self.connection
-        try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+        with self._transaction_lock:
+            connection = self.connection
+            try:
+                yield connection
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    def recover_blacklist_processing(self) -> int:
+        """Make work interrupted by a previous service instance retryable."""
+
+        timestamp = datetime.now(UTC).isoformat()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE blacklist_queue
+                SET status = 'failed',
+                    updated_at = ?,
+                    last_error = COALESCE(
+                        last_error,
+                        'Recovered abandoned blacklist item after service restart'
+                    ),
+                    completed_at = NULL
+                WHERE status = 'processing'
+                """,
+                (timestamp,),
+            )
+        return cursor.rowcount
 
     def check(self) -> tuple[bool, str]:
         try:

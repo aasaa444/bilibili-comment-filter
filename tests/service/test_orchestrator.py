@@ -11,6 +11,7 @@ from service.analyzer import (
 from service.app import create_app
 from service.auth import AuthStatus, AuthVerification
 from service.collector import (
+    BilibiliAuthenticationError,
     CollectionCheckpoint,
     CollectionResult,
     CollectionStats,
@@ -121,9 +122,63 @@ class ExplodingCollector:
         raise TimeoutError("fixture collector timeout")
 
 
+class IncompleteButMarkedCompleteCollector:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def collect(self, task, _checkpoint: CollectionCheckpoint) -> CollectionResult:
+        self.calls += 1
+        comment = CommentRecord(
+            "c-incomplete",
+            "1004",
+            "incomplete-user",
+            "partial collection",
+            task.video_id,
+            "https://example.test/c-incomplete",
+            "c-incomplete",
+            None,
+            "root",
+            1700000003,
+            False,
+        )
+        return CollectionResult(
+            comments=(comment,),
+            checkpoint=CollectionCheckpoint(
+                root_page=2,
+                complete=True,
+                requested_pages=1,
+                declared_comments=2,
+            ),
+            stats=CollectionStats(
+                requested_pages=1,
+                saved_comments=1,
+                declared_comments=2,
+                coverage=0.5,
+            ),
+            complete=True,
+        )
+
+
+class ExpiredSessionCollector:
+    def collect(self, _task, _checkpoint: CollectionCheckpoint) -> CollectionResult:
+        raise BilibiliAuthenticationError("fixture session expired")
+
+
 class ExplodingAnalyzer:
     def analyze(self, _accounts, _samples):
         raise TimeoutError("fixture model timeout")
+
+
+class RecoveringAnalyzer:
+    def __init__(self) -> None:
+        self.calls = 0
+        self._fallback = FixedAnalyzer()
+
+    def analyze(self, accounts, samples):
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError("fixture model timeout")
+        return self._fallback.analyze(accounts, samples)
 
 
 def test_orchestrator_applies_three_states_and_repeats_idempotently() -> None:
@@ -183,6 +238,54 @@ def test_orchestrator_turns_unexpected_collection_errors_into_partial_tasks() ->
     assert "fixture collector timeout" in detail["error_message"]
 
 
+def test_orchestrator_does_not_persist_complete_checkpoint_below_coverage() -> None:
+    collector = IncompleteButMarkedCompleteCollector()
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=collector,
+        analyzer=FixedAnalyzer(),
+    )
+    from fastapi.testclient import TestClient
+
+    http = TestClient(app)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1checkpointguard"}
+    ).json()
+
+    summary = app.state.orchestrator.run(task["task_id"])
+
+    assert summary.status.value == "partial"
+    assert app.state.task_store.checkpoint(task["task_id"])["complete"] is False
+    app.state.task_store.retry(task["task_id"])
+    app.state.orchestrator.run(task["task_id"])
+    assert collector.calls == 2
+
+
+def test_orchestrator_pauses_when_collection_session_expires() -> None:
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=ExpiredSessionCollector(),
+        analyzer=FixedAnalyzer(),
+    )
+    from fastapi.testclient import TestClient
+
+    http = TestClient(app)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1sessionexpired"}
+    ).json()
+
+    summary = app.state.orchestrator.run(task["task_id"])
+
+    assert summary.status.value == "paused"
+    detail = http.get(f"/api/tasks/{task['task_id']}").json()
+    assert detail["error_code"] == "auth_unavailable"
+    assert "fixture session expired" in detail["error_message"]
+
+
 def test_orchestrator_turns_unexpected_analysis_errors_into_failed_tasks() -> None:
     app = create_app(
         db_path=":memory:",
@@ -205,3 +308,31 @@ def test_orchestrator_turns_unexpected_analysis_errors_into_failed_tasks() -> No
     assert detail["status"] == "failed"
     assert detail["error_code"] == "analysis_failed"
     assert "fixture model timeout" in detail["error_message"]
+
+
+def test_orchestrator_reuses_completed_collection_when_analysis_is_retried() -> None:
+    collector = FixedCollector()
+    analyzer = RecoveringAnalyzer()
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=collector,
+        analyzer=analyzer,
+    )
+    from fastapi.testclient import TestClient
+
+    http = TestClient(app)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1analysisretry"}
+    ).json()
+
+    first = app.state.orchestrator.run(task["task_id"])
+    assert first.status.value == "failed"
+    app.state.task_store.retry(task["task_id"])
+
+    second = app.state.orchestrator.run(task["task_id"])
+
+    assert second.status.value == "completed"
+    assert collector.calls == 1
+    assert analyzer.calls == 2

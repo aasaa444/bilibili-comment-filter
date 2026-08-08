@@ -54,8 +54,16 @@ class BackgroundWorker:
         self._queue_retry_after: dict[str, float] = {}
 
     @property
+    def running(self) -> bool:
+        """Whether the background thread is currently alive."""
+
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
     def available(self) -> bool:
-        return self._thread is None or self._thread.is_alive()
+        """Whether this worker is available to execute work right now."""
+
+        return self.running
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -68,9 +76,11 @@ class BackgroundWorker:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=timeout)
-        self._thread = None
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+        if thread is None or not thread.is_alive():
+            self._thread = None
 
     def run_once(self) -> bool:
         return self._run_once(process_queue=True)
