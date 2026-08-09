@@ -424,6 +424,170 @@ def test_collector_follows_cursor_and_declared_all_count() -> None:
     assert result.stats.coverage == 1.0
 
 
+def test_collector_treats_zero_cursor_as_end_without_refetching_page() -> None:
+    class ZeroCursorTransport:
+        root_cursor_mode = True
+
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            self.pages.append(page)
+            if len(self.pages) > 1:
+                raise AssertionError("a zero cursor must not be requested again")
+            return {
+                "replies": [
+                    {
+                        "rpid": 300,
+                        "member": {"mid": 3000, "uname": "zero-cursor-user"},
+                        "content": {"message": "one root comment"},
+                    }
+                ],
+                "cursor": {"all_count": 1, "next": 0, "is_end": False},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            return {"replies": []}
+
+    transport = ZeroCursorTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert transport.pages == [0]
+    assert result.stats.saved_comments == 1
+
+
+def test_collector_keeps_explicit_cursor_continuation_after_empty_root_page() -> None:
+    class EmptyRootTransport:
+        root_cursor_mode = True
+
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            self.pages.append(page)
+            if page == 0:
+                return {
+                    "replies": [],
+                    "cursor": {"all_count": 2, "next": 2, "is_end": False},
+                }
+            return {
+                "replies": [
+                    {
+                        "rpid": 350,
+                        "member": {"mid": 3500, "uname": "after-empty-user"},
+                        "content": {"message": "comment after empty page"},
+                    }
+                ],
+                "cursor": {"all_count": 2, "next": 0, "is_end": False},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("empty root page must not start reply collection")
+
+    transport = EmptyRootTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert transport.pages == [0, 2]
+    assert result.stats.saved_comments == 1
+    assert "empty_root_page:1" in result.failed_items
+
+
+def test_collector_keeps_explicit_has_more_after_empty_root_page() -> None:
+    class EmptyHasMoreTransport:
+        root_cursor_mode = False
+
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            self.pages.append(page)
+            if page == 1:
+                return {
+                    "replies": [],
+                    "page": {"count": 2, "page_count": 2},
+                    "has_more": True,
+                }
+            return {
+                "replies": [
+                    {
+                        "rpid": 360,
+                        "member": {"mid": 3600, "uname": "after-has-more-user"},
+                        "content": {"message": "comment after explicit continuation"},
+                    }
+                ],
+                "page": {"count": 2, "page_count": 2},
+                "has_more": False,
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            return {"replies": []}
+
+    transport = EmptyHasMoreTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert transport.pages == [1, 2]
+    assert result.stats.saved_comments == 1
+
+
+def test_collector_treats_zero_reply_cursor_as_end_without_refetching_page() -> None:
+    class ZeroReplyCursorTransport:
+        root_cursor_mode = False
+
+        def __init__(self) -> None:
+            self.reply_pages: list[int] = []
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page == 1
+            return {
+                "replies": [
+                    {
+                        "rpid": 400,
+                        "member": {"mid": 4000, "uname": "root-user"},
+                        "content": {"message": "root"},
+                        "rcount": 1,
+                    }
+                ],
+                "page": {"count": 1, "page_count": 1},
+            }
+
+        def fetch_replies(self, _video_id: str, root_id: str, page: int) -> dict:
+            assert root_id == "400"
+            self.reply_pages.append(page)
+            if len(self.reply_pages) > 1:
+                raise AssertionError("a zero reply cursor must not be requested again")
+            return {
+                "replies": [
+                    {
+                        "rpid": 401,
+                        "mid": 4001,
+                        "member": {"mid": 4001, "uname": "reply-user"},
+                        "content": {"message": "reply"},
+                        "root": 400,
+                        "parent": 400,
+                    }
+                ],
+                "cursor": {"all_count": 1, "next": 0, "is_end": False},
+            }
+
+    transport = ZeroReplyCursorTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert transport.reply_pages == [1]
+    assert result.stats.saved_replies == 1
+
+
 def test_cursor_total_count_is_not_added_to_declared_reply_counts() -> None:
     class CursorWithRepliesTransport:
         root_cursor_mode = True

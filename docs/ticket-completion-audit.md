@@ -9,7 +9,7 @@ actions are not substituted with fake success in the production adapters.
 
 ## Verification evidence
 
-- `python -m pytest -q`: 118 passed.
+- `python -m pytest -q`: 122 passed.
 - `npm test`: 34 passed.
 - `npm run build`: passed.
 - `npm run typecheck`: passed.
@@ -31,6 +31,18 @@ actions are not substituted with fake success in the production adapters.
 
 Issue #1 is the parent specification and can be closed after the child tickets above are
 closed.
+
+## Current open-ticket boundary
+
+- #6 remains open until the complete Chrome-session-to-background-Chromium handoff is
+  demonstrated in a real logged-in session.
+- #7/#8 remain open: the current Bilibili response ended at an empty `is_end=true` page
+  after 199 first-level comments while declaring `all_count=811`; the service correctly
+  keeps the task `partial` instead of treating that response as complete.
+- #9 remains open until a real OpenAI-compatible endpoint is configured and exercised.
+- #15 remains open until an explicitly authorized small-scale native blacklist test updates
+  a real UID to `blocked`; the test executor does not perform that mutation.
+- #16 and parent #1 remain dependent on those external acceptance boundaries.
 
 ## Explicit boundaries
 

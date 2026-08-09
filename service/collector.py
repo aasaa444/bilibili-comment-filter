@@ -636,7 +636,7 @@ class BilibiliCommentCollector:
                         continue
                     reply_pages.pop(root_id, None)
                     break
-            if _has_more(payload, root_page):
+            if _has_more(payload, root_page, item_count=len(raw_root_items)):
                 root_page += 1
                 root_cursor = _next_cursor(payload)
                 continue
@@ -902,7 +902,8 @@ def _has_more(payload: dict[str, Any], page: int, *, item_count: int | None = No
     cursor = payload.get("cursor")
     cursor = cursor if isinstance(cursor, dict) else {}
     if "is_end" in cursor:
-        return not bool(cursor.get("is_end")) and cursor.get("next") is not None
+        next_cursor = _coerce_integer(cursor.get("next"), None)
+        return not bool(cursor.get("is_end")) and (next_cursor is not None and next_cursor > 0)
     page_info = payload.get("page")
     page_info = page_info if isinstance(page_info, dict) else {}
     page_count = _coerce_integer(page_info.get("page_count"), 0) or 0
