@@ -107,12 +107,6 @@ class TaskStore:
 
     def create(self, *, video_url: str, title: str | None = None) -> tuple[VideoTask, bool]:
         video_id = self.video_id_from_url(video_url)
-        existing = self.database.execute(
-            "SELECT * FROM video_tasks WHERE video_id = ?", (video_id,)
-        ).fetchone()
-        if existing is not None:
-            return self._from_row(existing), False
-
         task_id = uuid4().hex
         timestamp = datetime.now(UTC).isoformat()
         with self.database.transaction() as connection:
@@ -121,6 +115,7 @@ class TaskStore:
                 INSERT INTO video_tasks
                     (task_id, video_id, video_url, title, status, submitted_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id) DO NOTHING
                 """,
                 (
                     task_id,
@@ -132,17 +127,19 @@ class TaskStore:
                     timestamp,
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO task_checkpoints (task_id, updated_at)
-                VALUES (?, ?)
-                """,
-                (task_id, timestamp),
-            )
+            created = connection.execute("SELECT changes()").fetchone()[0] == 1
+            if created:
+                connection.execute(
+                    """
+                    INSERT INTO task_checkpoints (task_id, updated_at)
+                    VALUES (?, ?)
+                    """,
+                    (task_id, timestamp),
+                )
             row = connection.execute(
-                "SELECT * FROM video_tasks WHERE task_id = ?", (task_id,)
+                "SELECT * FROM video_tasks WHERE video_id = ?", (video_id,)
             ).fetchone()
-        return self._from_row(row), True
+        return self._from_row(row), created
 
     def get(self, task_id: str) -> VideoTask:
         row = self.database.execute(

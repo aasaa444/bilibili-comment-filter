@@ -1,4 +1,7 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from threading import Barrier
 
 from fastapi.testclient import TestClient
 
@@ -21,6 +24,44 @@ def test_task_creation_is_idempotent_for_the_same_video() -> None:
     assert duplicate.json()["video_id"] == "BV1task123"
     assert duplicate.json()["status"] == "queued"
     assert len(client.get("/api/tasks").json()["items"]) == 1
+
+
+def test_concurrent_task_creation_returns_one_shared_task(tmp_path) -> None:
+    db_path = tmp_path / "concurrent-tasks.sqlite3"
+    barrier = Barrier(2)
+
+    class CoordinatedDatabase(Database):
+        def __init__(self, path):
+            super().__init__(path)
+            self.coordinate_next_transaction = False
+
+        @contextmanager
+        def transaction(self):
+            with super().transaction() as connection:
+                if self.coordinate_next_transaction:
+                    self.coordinate_next_transaction = False
+                    barrier.wait(timeout=5)
+                yield connection
+
+    databases = [CoordinatedDatabase(db_path) for _ in range(2)]
+    for database in databases:
+        database.initialize()
+        database.coordinate_next_transaction = True
+
+    try:
+        stores = [TaskStore(database) for database in databases]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(store.create, video_url=VIDEO_URL)
+                for store in stores
+            ]
+            results = [future.result() for future in futures]
+    finally:
+        for database in databases:
+            database.close()
+
+    assert len({task.task_id for task, _ in results}) == 1
+    assert sorted(created for _, created in results) == [False, True]
 
 
 def test_task_detail_exposes_lifecycle_progress_and_retry_contract() -> None:

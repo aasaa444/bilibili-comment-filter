@@ -9,7 +9,7 @@ actions are not substituted with fake success in the production adapters.
 
 ## Verification evidence
 
-- `python -m pytest -q`: 114 passed.
+- `python -m pytest -q`: 115 passed.
 - `npm test`: 32 passed.
 - `npm run build`: passed.
 - `npm run typecheck`: passed.
