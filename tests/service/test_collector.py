@@ -9,8 +9,10 @@ from service.collector import (
     BilibiliCommentTransport,
     BilibiliRateLimitError,
     CollectionCheckpoint,
+    CommentRecord,
 )
 from service.db import Database
+from service.persistence import CommentStore
 from service.tasks import TaskStore
 
 COMPATIBLE_USER_AGENT = (
@@ -23,6 +25,15 @@ def make_task():
     database = Database(":memory:")
     database.initialize()
     return TaskStore(database).create(video_url="https://www.bilibili.com/video/BV1collector1")[0]
+
+
+def make_database_and_task(video_id: str):
+    database = Database(":memory:")
+    database.initialize()
+    task, _ = TaskStore(database).create(
+        video_url=f"https://www.bilibili.com/video/{video_id}"
+    )
+    return database, task
 
 
 @dataclass
@@ -76,6 +87,135 @@ def test_collector_returns_roots_pinned_comments_and_replies() -> None:
     assert result.stats.saved_replies == 1
     assert result.stats.pinned_comments == 1
     assert result.stats.coverage == 1.0
+
+
+def test_collector_persists_first_level_fields_and_save_many_retry_is_idempotent() -> None:
+    class FirstLevelTransport:
+        def fetch_root_page(self, video_id: str, page: int) -> dict:
+            assert (video_id, page) == ("BV1collectorfields", 1)
+            return {
+                "replies": [
+                    {
+                        "rpid": 601,
+                        "member": {"mid": 6001, "uname": "field-user"},
+                        "content": {"message": "first-level fixture content"},
+                        "ctime": 1700000601,
+                        "rcount": 0,
+                        "is_top": True,
+                    }
+                ],
+                "page": {"count": 1, "page_count": 1},
+                "has_more": False,
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("first-level field fixture has no replies")
+
+    database, task = make_database_and_task("BV1collectorfields")
+    expected = CommentRecord(
+        comment_id="601",
+        uid="6001",
+        nickname="field-user",
+        content="first-level fixture content",
+        created_at=1700000601,
+        video_id="BV1collectorfields",
+        comment_url="https://www.bilibili.com/video/BV1collectorfields#reply601",
+        root_id="601",
+        parent_id=None,
+        level="root",
+        is_pinned=True,
+    )
+    try:
+        result = BilibiliCommentCollector(FirstLevelTransport()).collect(
+            task, CollectionCheckpoint()
+        )
+        assert result.complete is True
+        assert result.failed_items == ()
+        assert result.comments == (expected,)
+
+        store = CommentStore(database)
+        assert store.save_many(task.task_id, result.comments) == 1
+        assert store.save_many(task.task_id, result.comments) == 1
+        assert store.stats_for_task(task.task_id) == (1, 0, 1)
+        assert store.list_for_task(task.task_id) == (expected,)
+    finally:
+        database.close()
+
+
+def test_collector_records_empty_root_page_as_explainable_terminal_page() -> None:
+    class EmptyRootTransport:
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            self.pages.append(page)
+            return {
+                "replies": [],
+                "page": {"count": 0, "page_count": 1},
+                "has_more": False,
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("empty root fixture must not request replies")
+
+    transport = EmptyRootTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert result.checkpoint.complete is True
+    assert result.comments == ()
+    assert result.stats.requested_pages == 1
+    assert result.stats.saved_comments == 0
+    assert result.failed_items == ("empty_root_page:1",)
+    assert transport.pages == [1]
+
+
+def test_collector_records_empty_reply_page_without_duplicate() -> None:
+    class EmptyReplyTransport:
+        def __init__(self) -> None:
+            self.root_pages: list[int] = []
+            self.reply_pages: list[tuple[str, int]] = []
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            self.root_pages.append(page)
+            return {
+                "replies": [
+                    {
+                        "rpid": 602,
+                        "member": {"mid": 6002, "uname": "reply-root"},
+                        "content": {"message": "root with empty reply page"},
+                        "ctime": 1700000602,
+                        "rcount": 1,
+                    }
+                ],
+                "page": {"count": 1, "page_count": 1},
+                "has_more": False,
+            }
+
+        def fetch_replies(self, _video_id: str, root_id: str, page: int) -> dict:
+            self.reply_pages.append((root_id, page))
+            return {
+                "replies": [],
+                "page": {"count": 0, "page_count": 1},
+                "has_more": False,
+            }
+
+    transport = EmptyReplyTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert result.checkpoint.complete is True
+    assert [comment.comment_id for comment in result.comments] == ["602"]
+    assert result.stats.requested_pages == 2
+    assert result.stats.saved_comments == 1
+    assert result.stats.saved_replies == 0
+    assert result.failed_items == ("empty_reply_page:602:1",)
+    assert transport.root_pages == [1]
+    assert transport.reply_pages == [("602", 1)]
 
 
 class ResumableTransport:

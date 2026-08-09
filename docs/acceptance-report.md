@@ -8,21 +8,21 @@
 
 ## 已验证
 
-- Python 服务单元与 API 测试：`python -m pytest -q` 全量通过（115 passed）。
+- Python 服务单元与 API 测试：`python -m pytest -q` 全量通过（118 passed）。
 - AI 批处理：按 UID 聚合后分批调用；上下文超限会拆批；单 UID 仍被拒绝时保留为 `uncertain`；支持字符串和分段文本响应；超时按配置重试。
 - 采集断点：root cursor、评论/回复声明数量、`declared_total` 和 SQLite 重启恢复测试通过。
 - 风控边界：API `-352/-412` 与 HTTP `403/412/429` 保留结构化分类并立即暂停采集，不进入普通
   任务自动重试；分页容器、数量、cursor 和结束标记的 malformed 元数据会写入 `failed_items`
   并保留当前 root/reply checkpoint。
 - 旧 SQLite 兼容：启动时为缺少的新列执行增量迁移，旧任务仍可读取。
-- 前端：TypeScript 类型检查、构建、Node fixture 测试通过（32 passed）；公开 Shadow DOM fixture 覆盖根评论、楼中楼、
+- 前端：TypeScript 类型检查、构建、Node fixture 测试通过（34 passed）；公开 Shadow DOM fixture 覆盖根评论、楼中楼、
   异步新挂载的嵌套 shadow root 和弹幕不处理。
 - 任务详情：API 与管理页展示保存数量、声明评论/回复、声明总量、覆盖率和失败项。
 - 复核闭环：复核动作可通过 `GET /api/review-actions` 按 UID/证据查询，并在管理页展示历史、操作者和状态变化。
 - 真实协议探针：在 `BV1rBuM6QEfe` 上，一级评论接口返回 20 条、声明总量 536、仍有下一页；楼中楼接口在未同步会话的探针中返回 `-352`，已被 transport 分类为 `api_rate_limit` 并保留脱敏失败原因。
 - 启停脚本：PowerShell 语法解析通过；后台启动使用隐藏窗口；停止前校验 PID 对应的 Python 可执行文件、模块和端口参数。
 - 启动契约：新增测试覆盖 CLI 默认值/环境变量、Windows 启停参数、健康检查、持久化路径和不写入开机启动。
-- Compose 配置：`docker compose config --quiet` 通过；Rancher Desktop Moby daemon 上真实执行 `docker compose build`、`docker compose up -d`，容器健康检查为 `healthy`，`/api/health` 返回 `ready`，认证状态为脱敏的 `missing`。
+- Compose 配置：`docker compose config --quiet` 通过；Rancher Desktop Moby daemon 上真实执行 `docker compose build`、`docker compose up -d`，容器健康检查为 `healthy`，`/api/health` 返回 `ready`；认证只返回脱敏诊断状态，具体值随当前同步会话变化，测试不依赖 Cookie 内容。
 
 ## 仅 fixture 或静态验证
 

@@ -9,8 +9,8 @@ actions are not substituted with fake success in the production adapters.
 
 ## Verification evidence
 
-- `python -m pytest -q`: 115 passed.
-- `npm test`: 32 passed.
+- `python -m pytest -q`: 118 passed.
+- `npm test`: 34 passed.
 - `npm run build`: passed.
 - `npm run typecheck`: passed.
 - `docker compose config --quiet`: passed.
@@ -22,8 +22,8 @@ actions are not substituted with fake success in the production adapters.
 
 | Ticket | Scope | Implementation evidence | Test evidence |
 | --- | --- | --- | --- |
-| #6 / T05 | Login-session synchronization and diagnostics | `extension/src/service-worker.ts`, `service/auth.py`, `service/app.py`, `web/src/main.ts` | `tests/frontend/service-worker.test.mjs`, `tests/service/test_auth.py`, `tests/service/test_health_auth.py` |
-| #7 / T06 | First-level comment collection | `service/collector.py`, `service/orchestrator.py`, task/comment persistence and API routes | `tests/service/test_collector.py`, `tests/service/test_orchestrator.py`, `tests/e2e/test_comment_filter_flow.py` |
+| #6 / T05 | Login-session synchronization and diagnostics | `extension/src/service-worker.ts`, `service/auth.py`, `service/app.py`, `web/src/main.ts` | `tests/frontend/service-worker.test.mjs`, `tests/frontend/auth-diagnostic.test.mjs`, `tests/service/test_auth.py`, `tests/service/test_health_auth.py` |
+| #7 / T06 | First-level comment collection | `service/collector.py`, `service/orchestrator.py`, task/comment persistence and API routes | `tests/service/test_collector.py` (fields, retry idempotency, empty-page records), `tests/service/test_orchestrator.py`, `tests/e2e/test_comment_filter_flow.py` |
 | #8 / T07 | Replies, pinned comments, coverage, and resume | `CollectionCheckpoint`, cursor/page handling, reply relation persistence, task progress rendering | collector checkpoint/reply/cursor cases and restart-resume cases in `tests/service/test_collector.py`, `tests/service/test_tasks.py`, and `tests/service/test_orchestrator.py` |
 | #9 / T08 | Batch AI analysis and structured results | `service/analyzer.py`, `service/samples.py`, `service/orchestrator.py` | `tests/service/test_analyzer.py`, `tests/service/test_orchestrator.py` |
 | #15 / T14 | Native headless blacklist executor | `service/blacklist.py`, `service/worker.py`, configurable headless Chromium, explicit pause/error classification | `tests/service/test_blacklist.py`, `tests/service/test_worker.py`, `tests/service/test_management_api.py` |
