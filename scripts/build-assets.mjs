@@ -21,3 +21,23 @@ await cp(path.join(root, "web", "styles.css"), path.join(webDist, "styles.css"))
 await cp(path.join(root, "extension", "manifest.json"), path.join(extensionDist, "manifest.json"));
 await cp(path.join(root, "extension", "popup.html"), path.join(extensionDist, "popup.html"));
 await cp(path.join(root, "extension", "popup.css"), path.join(extensionDist, "popup.css"));
+
+const contentScriptModules = [
+  path.join(dist, "shared", "uid-cache.js"),
+  path.join(dist, "extension", "src", "comment-filter.js"),
+  path.join(dist, "extension", "src", "video.js"),
+  path.join(dist, "extension", "src", "content-script.js"),
+];
+const contentScriptSources = await Promise.all(
+  contentScriptModules.map(async (modulePath) => {
+    const source = await readFile(modulePath, "utf8");
+    return source
+      .replace(/^import\s[^;]+;\s*$/gm, "")
+      .replace(/^export\s+/gm, "");
+  }),
+);
+await writeFile(
+  path.join(extensionDist, "src", "content-script.js"),
+  `(() => {\n${contentScriptSources.join("\n\n")}\n})();\n`,
+  "utf8",
+);
