@@ -333,6 +333,25 @@ def test_blacklist_queue_pauses_blocked_action_and_can_resume() -> None:
         database.close()
 
 
+def test_cancelled_blacklist_item_is_not_requeued_by_later_detection() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    try:
+        queue = BlacklistQueueService(database)
+        item, created = queue.enqueue(uid="1001")
+        assert created is True
+        assert queue.cancel_for_uid("1001") is not None
+
+        retried, recreated = queue.enqueue(uid="1001", evidence_id="evidence-2")
+
+        assert recreated is False
+        assert retried.item_id == item.item_id
+        assert retried.status is BlacklistQueueStatus.CANCELLED
+        assert retried.evidence_id is None
+    finally:
+        database.close()
+
+
 def test_blacklist_queue_finishes_unexpected_executor_exception_as_failed() -> None:
     database = Database(":memory:")
     database.initialize()
