@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,6 +35,11 @@ class TaskStatus(StrEnum):
     FAILED = "failed"
     PAUSED = "paused"
 
+
+class EvidenceReviewStatus(StrEnum):
+    PENDING = "pending"
+    HISTORY = "history"
+    ALL = "all"
 
 class ComponentHealth(BaseModel):
     status: str
@@ -193,7 +199,7 @@ class ReviewActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     evidence_id: str | None = None
-    action: str = Field(pattern=r"^(keep|revoke|hide_only|exception|confirm|highlight)$")
+    action: str = Field(pattern=r"^(revoke|hide_only|exception|confirm|highlight)$")
     actor: str = Field(default="local-user", min_length=1, max_length=128)
 
 
@@ -273,3 +279,15 @@ class BlacklistResponse(BaseModel):
 
 class BlacklistListResponse(BaseModel):
     items: list[BlacklistResponse]
+
+
+class BlacklistSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class BlacklistSettingsResponse(BaseModel):
+    enabled: bool
+    mode: Literal["local_only", "local_and_official_queue"]
+    updated_at: datetime

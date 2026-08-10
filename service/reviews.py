@@ -10,6 +10,12 @@ from .models import UidState
 from .persistence import EvidenceStore
 from .registry import UidNotFoundError, UidRegistry
 from .samples import SampleStore
+from .settings import SettingsStore
+
+def normalize_review_action(action: str) -> str:
+    """Keep historical action names readable without changing their meaning."""
+
+    return action
 
 
 @dataclass(frozen=True)
@@ -32,19 +38,20 @@ class ReviewService:
         uid_registry: UidRegistry,
         queue: BlacklistQueueService,
         sample_store: SampleStore,
+        settings_store: SettingsStore,
     ) -> None:
         self.database = database
         self.evidence_store = evidence_store
         self.uid_registry = uid_registry
         self.queue = queue
         self.sample_store = sample_store
+        self.settings_store = settings_store
 
     def apply(self, *, evidence_id: str, action: str, actor: str) -> ReviewRecord:
         evidence = self.evidence_store.get(evidence_id)
-        normalized_action = {
-            "hide-only": "hide_only",
-            "positive-sample": "highlight",
-        }.get(action, action)
+        normalized_action = normalize_review_action(
+            {"hide-only": "hide_only", "positive-sample": "highlight"}.get(action, action)
+        )
         try:
             current = self.uid_registry.get(evidence.uid)
             before_state = current.state
@@ -53,7 +60,11 @@ class ReviewService:
             before_state = None
 
         after_state = before_state
-        if normalized_action in {"revoke", "exception"}:
+        if normalized_action == "revoke":
+            after_state = None
+            self.queue.cancel_for_uid(evidence.uid)
+            self.uid_registry.remove(evidence.uid)
+        elif normalized_action == "exception":
             after_state = UidState.EXCEPTION
             self.queue.cancel_for_uid(evidence.uid)
             self._update_or_create(evidence.uid, evidence.nickname, after_state)
@@ -61,14 +72,15 @@ class ReviewService:
             after_state = UidState.HIDDEN
             self.queue.cancel_for_uid(evidence.uid)
             self._update_or_create(evidence.uid, evidence.nickname, after_state)
-        elif normalized_action in {"confirm", "keep"}:
-            if normalized_action == "confirm":
-                after_state = UidState.QUEUED
-                record = self._update_or_create(evidence.uid, evidence.nickname, after_state)
+        elif normalized_action == "confirm":
+            if not self.settings_store.is_blacklist_automation_enabled():
+                raise ValueError(
+                    "自动执行官方拉黑已关闭；请先开启总开关，或选择“仅本地隐藏”"
+                )
+            after_state = UidState.QUEUED
+            record = self._update_or_create(evidence.uid, evidence.nickname, after_state)
+            if after_state is UidState.QUEUED:
                 self.queue.enqueue(uid=record.uid, evidence_id=evidence_id)
-            elif current is None:
-                after_state = UidState.REVIEW
-                self._update_or_create(evidence.uid, evidence.nickname, after_state)
         elif normalized_action == "highlight":
             content = _first_comment_content(evidence.comments)
             if content:
@@ -154,7 +166,7 @@ class ReviewService:
             action_id=row["action_id"],
             evidence_id=row["evidence_id"],
             uid=row["uid"],
-            action=row["action"],
+            action=normalize_review_action(row["action"]),
             before_state=UidState(row["before_state"]) if row["before_state"] else None,
             after_state=UidState(row["after_state"]) if row["after_state"] else None,
             actor=row["actor"],

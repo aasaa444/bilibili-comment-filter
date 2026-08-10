@@ -57,13 +57,13 @@ _FAILURE_DIAGNOSTICS: dict[ExecutionFailureKind, BlacklistFailureDiagnostic] = {
         error_category=BlacklistErrorCategory.NETWORK,
         failure_type=ExecutionFailureKind.TEMPORARY,
         user_message="临时网络错误，拉黑操作失败",
-        recovery_action="稍后自动重试，或点击“重试”",
+        recovery_action="网络恢复后请点击“重试”",
     ),
     ExecutionFailureKind.NETWORK: BlacklistFailureDiagnostic(
         error_category=BlacklistErrorCategory.NETWORK,
         failure_type=ExecutionFailureKind.NETWORK,
         user_message="临时网络错误，拉黑操作失败",
-        recovery_action="稍后自动重试，或点击“重试”",
+        recovery_action="网络恢复后请点击“重试”",
     ),
     ExecutionFailureKind.AUTH: BlacklistFailureDiagnostic(
         error_category=BlacklistErrorCategory.AUTHENTICATION,
@@ -368,7 +368,26 @@ class BlacklistQueueService:
             "SELECT * FROM blacklist_queue WHERE uid = ?", (uid,)
         ).fetchone()
         if existing is not None:
-            return self._from_row(existing), False
+            item = self._from_row(existing)
+            if item.status is not BlacklistQueueStatus.CANCELLED:
+                return item, False
+            timestamp = datetime.now(UTC).isoformat()
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE blacklist_queue
+                    SET evidence_id = ?, status = ?, updated_at = ?,
+                        last_error = NULL, completed_at = NULL
+                    WHERE item_id = ?
+                    """,
+                    (
+                        evidence_id,
+                        BlacklistQueueStatus.QUEUED.value,
+                        timestamp,
+                        item.item_id,
+                    ),
+                )
+            return self.get(item.item_id), True
         timestamp = datetime.now(UTC).isoformat()
         item_id = uuid4().hex
         with self.database.transaction() as connection:

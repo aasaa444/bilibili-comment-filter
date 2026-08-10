@@ -82,21 +82,26 @@ export interface TaskComment {
 
 export interface Evidence {
   evidenceId: string;
+  taskId: string;
   uid: string;
   nicknameSnapshot: string;
   result: "hit" | "uncertain";
+  videoId: string;
+  comments: TaskComment[];
   commentText: string;
   threadContext?: string;
   sourceVideo?: string;
   commentUrl?: string;
   signal?: string;
+  signals: string[];
   modelReason?: string;
   confidence?: number;
   modelVersion?: string;
+  sampleVersion?: string;
+  ruleVersion?: string;
   createdAt: string;
 }
-
-export type ReviewAction = "keep" | "revoke" | "hide-only" | "exception" | "positive-sample";
+export type ReviewAction = "keep" | "confirm" | "revoke" | "hide-only" | "exception" | "positive-sample";
 
 export interface ReviewRecord {
   reviewId: string;
@@ -183,4 +188,9 @@ export interface AuthSessionRequest {
   source: "extension";
   origin: string;
   cookies: AuthCookie[];
+}
+export interface BlacklistSettings {
+  enabled: boolean;
+  mode: "local_only" | "local_and_official_queue";
+  updatedAt: string;
 }

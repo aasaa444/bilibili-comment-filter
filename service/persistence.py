@@ -8,6 +8,7 @@ from uuid import uuid4
 from .analyzer import AnalysisDecision, AnalysisResult
 from .collector import CommentRecord
 from .db import Database
+from .models import EvidenceReviewStatus
 
 
 class EvidenceNotFoundError(LookupError):
@@ -172,21 +173,44 @@ class EvidenceStore:
         task_id: str | None = None,
         uid: str | None = None,
         decision: AnalysisDecision | None = None,
+        review_status: EvidenceReviewStatus = EvidenceReviewStatus.PENDING,
     ) -> tuple[EvidenceRecord, ...]:
+        try:
+            review_status = EvidenceReviewStatus(review_status)
+        except ValueError as exc:
+            raise ValueError("review_status must be pending, history, or all") from exc
         clauses: list[str] = []
         parameters: list[str] = []
         if task_id is not None:
-            clauses.append("task_id = ?")
+            clauses.append("evidence.task_id = ?")
             parameters.append(task_id)
         if uid is not None:
-            clauses.append("uid = ?")
+            clauses.append("evidence.uid = ?")
             parameters.append(uid)
         if decision is not None:
-            clauses.append("decision = ?")
+            clauses.append("evidence.decision = ?")
             parameters.append(decision.value)
+        if review_status is EvidenceReviewStatus.PENDING:
+            clauses.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM review_actions AS review "
+                "WHERE review.evidence_id = evidence.evidence_id"
+                ")"
+            )
+        elif review_status is EvidenceReviewStatus.HISTORY:
+            clauses.append(
+                "EXISTS ("
+                "SELECT 1 FROM review_actions AS review "
+                "WHERE review.evidence_id = evidence.evidence_id"
+                ")"
+            )
+        elif review_status is not EvidenceReviewStatus.ALL:
+            raise ValueError("review_status must be pending, history, or all")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.database.execute(
-            f"SELECT * FROM evidence{where} ORDER BY created_at DESC", tuple(parameters)
+            f"SELECT evidence.* FROM evidence AS evidence{where} "
+            "ORDER BY evidence.created_at DESC",
+            tuple(parameters),
         ).fetchall()
         return tuple(self._from_row(row) for row in rows)
 

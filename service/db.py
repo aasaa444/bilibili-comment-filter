@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS sync_versions (
 
 INSERT OR IGNORE INTO sync_versions (id, current_version) VALUES (1, 0);
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS video_tasks (
     task_id TEXT PRIMARY KEY,
     video_id TEXT NOT NULL UNIQUE,

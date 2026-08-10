@@ -1,5 +1,6 @@
 import threading
 
+import service.worker as worker_module
 from service.blacklist import (
     BlacklistExecutionError,
     BlacklistQueueService,
@@ -81,6 +82,58 @@ def test_background_worker_throttles_blacklist_processing() -> None:
     assert process_queue_flags == [True, False, False]
 
 
+def test_background_worker_adds_randomized_delay_after_blacklist_processing(
+    monkeypatch,
+) -> None:
+    worker = BackgroundWorker(
+        task_store=object(),
+        orchestrator=object(),
+        queue=object(),
+        executor=object(),
+        config=WorkerConfig(queue_interval=60.0, queue_jitter=30.0),
+    )
+    monkeypatch.setattr(worker_module.random, "uniform", lambda _lower, _upper: 30.0)
+
+    assert worker._next_queue_deadline(100.0) == 190.0
+
+
+def test_background_worker_processes_blacklist_queue_at_next_deadline(monkeypatch) -> None:
+    worker = BackgroundWorker(
+        task_store=object(),
+        orchestrator=object(),
+        queue=object(),
+        executor=object(),
+        config=WorkerConfig(poll_interval=0.0, queue_interval=60.0, queue_jitter=30.0),
+    )
+    monotonic_values = iter((100.0, 100.0, 100.0, 150.0, 189.0, 190.0, 190.0))
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(worker_module.random, "uniform", lambda _lower, _upper: 30.0)
+    process_queue_flags: list[bool] = []
+
+    def fake_run_once(*, process_queue: bool) -> bool:
+        process_queue_flags.append(process_queue)
+        if len(process_queue_flags) == 4:
+            worker._stop.set()
+        return False
+
+    worker._run_once = fake_run_once
+    worker.run_forever()
+
+    assert process_queue_flags == [True, False, False, True]
+
+
+def test_background_worker_can_disable_blacklist_delay_jitter() -> None:
+    worker = BackgroundWorker(
+        task_store=object(),
+        orchestrator=object(),
+        queue=object(),
+        executor=object(),
+        config=WorkerConfig(queue_interval=0.0, queue_jitter=30.0),
+    )
+
+    assert worker._next_queue_deadline(100.0) == 100.0
+
+
 def test_background_worker_retries_transient_partial_task_before_processing_queue() -> None:
     database = Database(":memory:")
     database.initialize()
@@ -146,7 +199,7 @@ def test_background_worker_does_not_retry_paused_collection_task() -> None:
     assert task_store.get(task.task_id).attempt == 0
 
 
-def test_background_worker_retries_temporary_blacklist_failure_without_manual_action() -> None:
+def test_background_worker_leaves_failed_blacklist_item_until_explicit_retry() -> None:
     database = Database(":memory:")
     database.initialize()
     task_store = TaskStore(database)
@@ -171,17 +224,47 @@ def test_background_worker_retries_temporary_blacklist_failure_without_manual_ac
         orchestrator=object(),
         queue=queue,
         executor=executor,
-        config=WorkerConfig(queue_retry_delay=0, max_queue_retries=3),
+        config=WorkerConfig(queue_interval=0),
+        auto_blacklist_enabled=lambda: True,
     )
 
     assert worker.run_once() is True
     assert queue.get(item.item_id).status.value == "failed"
+    assert worker.run_once() is False
+    assert queue.get(item.item_id).status.value == "failed"
+    queue.retry(item.item_id)
     assert worker.run_once() is True
     assert queue.get(item.item_id).status.value == "completed"
     assert executor.calls == 2
 
 
-def test_background_worker_stops_retrying_failed_blacklist_item_at_limit() -> None:
+def test_background_worker_does_not_consume_queue_when_switch_is_closed() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    task_store = TaskStore(database)
+    registry = UidRegistry(database)
+    queue = BlacklistQueueService(database, registry)
+    registry.add(uid="9007", nickname="paused", state=UidState.QUEUED)
+    item, _ = queue.enqueue(uid="9007")
+
+    class UnexpectedExecutor:
+        def execute(self, _item):
+            raise AssertionError("closed switch must not consume the official queue")
+
+    worker = BackgroundWorker(
+        task_store=task_store,
+        orchestrator=object(),
+        queue=queue,
+        executor=UnexpectedExecutor(),
+        config=WorkerConfig(queue_interval=0),
+        auto_blacklist_enabled=lambda: False,
+    )
+
+    assert worker.run_once() is False
+    assert queue.get(item.item_id).status is BlacklistQueueStatus.QUEUED
+
+
+def test_background_worker_does_not_retry_failed_blacklist_item_when_switch_is_reopened() -> None:
     database = Database(":memory:")
     database.initialize()
     task_store = TaskStore(database)
@@ -204,14 +287,15 @@ def test_background_worker_stops_retrying_failed_blacklist_item_at_limit() -> No
         orchestrator=object(),
         queue=queue,
         executor=executor,
-        config=WorkerConfig(queue_retry_delay=0, max_queue_retries=1),
+        config=WorkerConfig(queue_interval=0),
+        auto_blacklist_enabled=lambda: False,
     )
 
-    assert worker.run_once() is True
-    assert worker.run_once() is True
+    queue.process_next(executor)
+    assert worker.run_once() is False
     assert worker.run_once() is False
     assert queue.get(item.item_id).status.value == "failed"
-    assert executor.calls == 2
+    assert executor.calls == 1
 
 
 def test_blacklist_queue_claim_is_atomic_for_concurrent_processors() -> None:

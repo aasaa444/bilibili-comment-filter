@@ -36,12 +36,15 @@ from .models import (
     ComponentHealth,
     EvidenceListResponse,
     EvidenceResponse,
+    EvidenceReviewStatus,
     HealthResponse,
     ReviewActionRequest,
     ReviewActionResponse,
     SampleImportRequest,
     SampleListResponse,
     SampleResponse,
+    BlacklistSettingsRequest,
+    BlacklistSettingsResponse,
     TaskCreateRequest,
     TaskListResponse,
     TaskProgressResponse,
@@ -74,6 +77,7 @@ DEFAULT_DB_PATH = Path(
     )
 )
 
+from .settings import BlacklistAutomationSettings, SettingsStore
 
 def create_app(
     *,
@@ -94,6 +98,8 @@ def create_app(
     comment_store = CommentStore(database)
     evidence_store = EvidenceStore(database)
     sample_store = SampleStore(database)
+    settings_store = SettingsStore(database)
+    settings_store.get_blacklist_automation()
     queue = BlacklistQueueService(database, uid_registry)
     collector = collector or BilibiliCommentCollector(
         BilibiliCommentTransport(database.latest_auth_cookies)
@@ -131,6 +137,7 @@ def create_app(
         evidence_store=evidence_store,
         auth_service=auth_service,
         sample_provider=sample_store.current,
+        auto_blacklist_enabled=settings_store.is_blacklist_automation_enabled,
     )
     executor = blacklist_executor or PlaywrightBlacklistExecutor(
         cookies_provider=database.latest_auth_cookies
@@ -140,6 +147,7 @@ def create_app(
         orchestrator=orchestrator,
         queue=queue,
         executor=executor,
+        auto_blacklist_enabled=settings_store.is_blacklist_automation_enabled,
     )
     review_service = ReviewService(
         database=database,
@@ -147,6 +155,7 @@ def create_app(
         uid_registry=uid_registry,
         queue=queue,
         sample_store=sample_store,
+        settings_store=settings_store,
     )
 
     app = FastAPI(title="Bilibili Comment Filter Service", version="0.1.0")
@@ -157,6 +166,8 @@ def create_app(
     app.state.comment_store = comment_store
     app.state.evidence_store = evidence_store
     app.state.sample_store = sample_store
+    app.state.settings_store = settings_store
+    app.state.blacklist_settings = settings_store
     app.state.review_service = review_service
     app.state.blacklist_queue = queue
     app.state.orchestrator = orchestrator
@@ -326,6 +337,7 @@ def create_app(
         task_id: str | None = None,
         uid: str | None = None,
         result: str | None = None,
+        review_status: EvidenceReviewStatus = EvidenceReviewStatus.PENDING,
     ) -> EvidenceListResponse:
         from .analyzer import AnalysisDecision
 
@@ -340,7 +352,12 @@ def create_app(
         return EvidenceListResponse(
             items=[
                 evidence_response(item)
-                for item in evidence_store.list(task_id=task_id, uid=uid, decision=decision)
+                for item in evidence_store.list(
+                    task_id=task_id,
+                    uid=uid,
+                    decision=decision,
+                    review_status=review_status,
+                )
             ]
         )
 
@@ -397,8 +414,6 @@ def create_app(
     @app.post("/api/samples", response_model=SampleResponse)
     def create_sample(request: SampleImportRequest) -> object:
         kind = "nickname" if request.kind == "nickname" else "comment"
-        try:
-            sample = sample_store.create(kind=kind, label=request.label, items=items)
         items = [
             NewSampleItem(
                 content=item.content,
@@ -413,6 +428,8 @@ def create_app(
                 NewSampleItem(line, request.label, kind, "manual")
                 for line in request.text.splitlines()
             )
+        try:
+            sample = sample_store.create(kind=kind, label=request.label, items=items)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse(status_code=201, content=sample_response(sample))
@@ -433,8 +450,21 @@ def create_app(
     def list_blacklist() -> object:
         return JSONResponse(content={"items": [blacklist_response(item) for item in queue.list()]})
 
+    @app.get("/api/blacklist/settings", response_model=BlacklistSettingsResponse)
+    def get_blacklist_settings() -> BlacklistSettingsResponse:
+        return blacklist_settings_response(settings_store.get_blacklist_automation())
+
+    @app.patch("/api/blacklist/settings", response_model=BlacklistSettingsResponse)
+    def patch_blacklist_settings(request: BlacklistSettingsRequest) -> BlacklistSettingsResponse:
+        return blacklist_settings_response(settings_store.set_blacklist_automation(request.enabled))
+
     @app.post("/api/blacklist/process", response_model=BlacklistResponse | None)
     def process_blacklist() -> object:
+        if not settings_store.is_blacklist_automation_enabled():
+            raise HTTPException(
+                status_code=409,
+                detail="自动执行官方拉黑已关闭；当前模式为仅本地隐藏",
+            )
         item = queue.process_next(app.state.blacklist_executor)
         return JSONResponse(content=blacklist_response(item) if item is not None else None)
 
@@ -625,5 +655,12 @@ def task_response(task: VideoTask) -> TaskResponse:
         ),
     )
 
+
+def blacklist_settings_response(settings: BlacklistAutomationSettings) -> BlacklistSettingsResponse:
+    return BlacklistSettingsResponse(
+        enabled=settings.enabled,
+        mode=settings.mode,
+        updated_at=settings.updated_at,
+    )
 
 app = create_app()

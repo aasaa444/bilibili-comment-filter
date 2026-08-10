@@ -54,6 +54,7 @@ class TaskOrchestrator:
         evidence_store: EvidenceStore,
         auth_service: AuthService | None = None,
         sample_provider: Callable[[], SampleSet] | None = None,
+        auto_blacklist_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.task_store = task_store
         self.uid_registry = uid_registry
@@ -64,6 +65,7 @@ class TaskOrchestrator:
         self.evidence_store = evidence_store
         self.auth_service = auth_service
         self.sample_provider = sample_provider or (lambda: SampleSet("samples-empty", ()))
+        self.auto_blacklist_enabled = auto_blacklist_enabled or (lambda: False)
 
     def run(self, task_id: str) -> TaskRunSummary:
         task = self.task_store.get(task_id)
@@ -277,7 +279,13 @@ class TaskOrchestrator:
                 ),
                 result=result,
             )
-            target_state = "queued" if result.decision is AnalysisDecision.HIT else "review"
+            target_state = (
+                "queued"
+                if result.decision is AnalysisDecision.HIT and self.auto_blacklist_enabled()
+                else "hidden"
+                if result.decision is AnalysisDecision.HIT
+                else "review"
+            )
             self._apply_uid_result(
                 uid=result.uid,
                 nickname=account.nickname,

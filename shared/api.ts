@@ -3,6 +3,7 @@ import type {
   AuthSession,
   AuthSessionRequest,
   BlacklistItem,
+  BlacklistSettings,
   CreateTaskRequest,
   CreateUidRequest,
   Evidence,
@@ -71,6 +72,11 @@ export class ApiClient {
     }).then(requireUidRecord);
   }
 
+  removeUid(uid: string): Promise<void> {
+    return this.request<unknown>(`/api/uids/${encodeURIComponent(uid)}`, {
+      method: "DELETE",
+    }).then(() => undefined);
+  }
   async syncUids(since?: number): Promise<UidSyncResponse> {
     const query = since === undefined ? "" : `?since=${encodeURIComponent(String(since))}`;
     return normalizeUidSync(await this.request<unknown>(`/api/uids/sync${query}`));
@@ -101,14 +107,19 @@ export class ApiClient {
     return this.request<unknown>(`/api/tasks/${encodeURIComponent(taskId)}/retry`, { method: "POST" }).then(requireVideoTask);
   }
 
-  listEvidence(params: { taskId?: string; uidStatus?: string; result?: string } = {}): Promise<ApiList<Evidence>> {
+  listEvidence(params: {
+    taskId?: string;
+    uidStatus?: string;
+    result?: string;
+    reviewStatus?: "pending" | "history" | "all";
+  } = {}): Promise<ApiList<Evidence>> {
     const query = new URLSearchParams();
     if (params.taskId) query.set("task_id", params.taskId);
     if (params.uidStatus) query.set("uid_status", params.uidStatus);
     if (params.result) query.set("result", params.result);
+    if (params.reviewStatus) query.set("review_status", params.reviewStatus);
     return this.requestList(`/api/reviews${query.size ? `?${query}` : ""}`, "evidence", normalizeEvidence);
   }
-
   listReviewActions(params: { evidenceId?: string; uid?: string } = {}): Promise<ApiList<ReviewRecord>> {
     const query = new URLSearchParams();
     if (params.evidenceId) query.set("evidence_id", params.evidenceId);
@@ -176,6 +187,16 @@ export class ApiClient {
     return this.request<unknown>(`/api/blacklist/${encodeURIComponent(itemId)}/retry`, { method: "POST" }).then(requireBlacklistItem);
   }
 
+  getBlacklistSettings(): Promise<BlacklistSettings> {
+    return this.request<unknown>("/api/blacklist/settings").then(requireBlacklistSettings);
+  }
+
+  updateBlacklistSettings(enabled: boolean): Promise<BlacklistSettings> {
+    return this.request<unknown>("/api/blacklist/settings", {
+      method: "PATCH",
+      body: { enabled },
+    }).then(requireBlacklistSettings);
+  }
   private async request<T>(path: string, options: { method?: string; body?: unknown } = {}): Promise<T> {
     let response: Response;
     try {
@@ -189,6 +210,7 @@ export class ApiClient {
     }
 
     const payload: unknown = await readResponsePayload(response);
+
     if (!response.ok) {
       const envelope = asApiErrorEnvelope(payload);
       throw new ApiRequestError(
@@ -351,32 +373,67 @@ function normalizeEvidence(value: unknown): Evidence | null {
   const rawResult = stringValue(candidate.result) ?? stringValue(candidate.decision);
   const result = rawResult === "hit" || rawResult === "uncertain" ? rawResult : null;
   if (!evidenceId || !uid || !result) return null;
-  const comments = arrayValue(candidate.comments) ?? [];
-  const firstComment = comments.length > 0 ? asRecord(comments[0]) : {};
+  const comments = (arrayValue(candidate.comments) ?? [])
+    .map(normalizeEvidenceComment)
+    .filter((item): item is TaskComment => item !== null);
+  const rawComments = arrayValue(candidate.comments) ?? [];
+  const firstComment = rawComments.length > 0 ? asRecord(rawComments[0]) : {};
+  const firstNormalizedComment = comments[0];
+  const signals = stringArray(candidate.signals);
   return {
     evidenceId,
+    taskId: stringValue(candidate.task_id) ?? stringValue(candidate.taskId) ?? "",
     uid,
     nicknameSnapshot: stringValue(candidate.nickname_snapshot) ?? stringValue(candidate.nicknameSnapshot) ?? stringValue(candidate.nickname) ?? "",
     result,
-    commentText: stringValue(candidate.comment_text) ?? stringValue(candidate.commentText) ?? stringValue(firstComment.content) ?? "",
-    threadContext: stringValue(candidate.thread_context) ?? stringValue(candidate.threadContext) ?? (stringArray(firstComment.context).join("\n") || undefined),
+    videoId: stringValue(candidate.video_id) ?? stringValue(candidate.videoId) ?? firstNormalizedComment?.videoId ?? "",
+    comments,
+    commentText: stringValue(candidate.comment_text) ?? stringValue(candidate.commentText) ?? firstNormalizedComment?.content ?? stringValue(firstComment.content) ?? "",
+    threadContext: stringValue(candidate.thread_context) ?? stringValue(candidate.threadContext) ?? (firstNormalizedComment?.context.join("\n") || stringArray(firstComment.context).join("\n") || undefined),
     sourceVideo: stringValue(candidate.source_video) ?? stringValue(candidate.sourceVideo) ?? (stringValue(candidate.video_id) ? `https://www.bilibili.com/video/${candidate.video_id}` : undefined),
-    commentUrl: stringValue(candidate.comment_url) ?? stringValue(candidate.commentUrl) ?? stringValue(firstComment.comment_url),
-    signal: stringValue(candidate.signal) ?? (stringArray(candidate.signals).join(", ") || undefined),
+    commentUrl: stringValue(candidate.comment_url) ?? stringValue(candidate.commentUrl) ?? firstNormalizedComment?.commentUrl ?? stringValue(firstComment.comment_url),
+    signal: stringValue(candidate.signal) ?? (signals.join(", ") || undefined),
+    signals,
     modelReason: stringValue(candidate.model_reason) ?? stringValue(candidate.modelReason) ?? stringValue(candidate.reason),
     confidence: numberValue(candidate.confidence) ?? undefined,
     modelVersion: stringValue(candidate.model_version) ?? stringValue(candidate.modelVersion),
+    sampleVersion: stringValue(candidate.sample_version) ?? stringValue(candidate.sampleVersion),
+    ruleVersion: stringValue(candidate.rule_version) ?? stringValue(candidate.ruleVersion),
     createdAt: stringValue(candidate.created_at) ?? stringValue(candidate.createdAt) ?? "",
   };
 }
 
+function normalizeEvidenceComment(value: unknown): TaskComment | null {
+  const candidate = asRecord(value);
+  const commentId = stringValue(candidate.comment_id) ?? stringValue(candidate.commentId) ?? stringValue(candidate.id);
+  if (!commentId) return null;
+  const parentId = stringValue(candidate.parent_id) ?? stringValue(candidate.parentId) ?? null;
+  return {
+    commentId,
+    uid: stringValue(candidate.uid) ?? "",
+    nickname: stringValue(candidate.nickname) ?? stringValue(candidate.nickname_snapshot) ?? stringValue(candidate.nicknameSnapshot) ?? "",
+    content: stringValue(candidate.content) ?? stringValue(candidate.comment_text) ?? "",
+    videoId: stringValue(candidate.video_id) ?? stringValue(candidate.videoId) ?? "",
+    commentUrl: stringValue(candidate.comment_url) ?? stringValue(candidate.commentUrl) ?? "",
+    rootId: stringValue(candidate.root_id) ?? stringValue(candidate.rootId) ?? commentId,
+    parentId,
+    level: stringValue(candidate.level) ?? (parentId ? "reply" : "root"),
+    createdAt: numberValue(candidate.created_at) ?? numberValue(candidate.createdAt),
+    isPinned: booleanValue(candidate.is_pinned) ?? booleanValue(candidate.isPinned) ?? false,
+    context: stringArray(candidate.context),
+  };
+}
 function normalizeReviewRecord(value: unknown): ReviewRecord | null {
   const candidate = asRecord(value);
   const reviewId = stringValue(candidate.review_id) ?? stringValue(candidate.reviewId) ?? stringValue(candidate.action_id) ?? stringValue(candidate.id);
   const evidenceId = stringValue(candidate.evidence_id) ?? stringValue(candidate.evidenceId);
   const uid = stringValue(candidate.uid);
   const rawAction = stringValue(candidate.action);
-  const action = rawAction === "hide_only" ? "hide-only" : rawAction === "highlight" ? "positive-sample" : rawAction;
+  const action = rawAction === "hide_only"
+    ? "hide-only"
+    : rawAction === "highlight"
+      ? "positive-sample"
+      : rawAction;
   if (!reviewId || !evidenceId || !uid || !isReviewAction(action)) return null;
   return {
     reviewId,
@@ -462,6 +519,19 @@ function normalizeBlacklistItem(value: unknown): BlacklistItem | null {
   };
 }
 
+function normalizeBlacklistSettings(value: unknown): BlacklistSettings | null {
+  const candidate = asRecord(value);
+  const enabled = booleanValue(candidate.enabled);
+  const mode = candidate.mode === "local_and_official_queue" || candidate.mode === "local_only"
+    ? candidate.mode
+    : null;
+  if (enabled === null || mode === null) return null;
+  return {
+    enabled,
+    mode,
+    updatedAt: stringValue(candidate.updated_at) ?? stringValue(candidate.updatedAt) ?? "",
+  };
+}
 function requireNormalized<T>(value: T | null, label: string): T {
   if (value === null) throw new ApiRequestError(502, `${label}响应格式无效`);
   return value;
@@ -472,6 +542,7 @@ const requireVideoTask = (value: unknown): VideoTask => requireNormalized(normal
 const requireReviewRecord = (value: unknown): ReviewRecord => requireNormalized(normalizeReviewRecord(value), "复核");
 const requireSampleSet = (value: unknown): SampleSet => requireNormalized(normalizeSampleSet(value), "样本");
 const requireBlacklistItem = (value: unknown): BlacklistItem => requireNormalized(normalizeBlacklistItem(value), "队列");
+const requireBlacklistSettings = (value: unknown): BlacklistSettings => requireNormalized(normalizeBlacklistSettings(value), "Blacklist settings");
 
 function toCreateUidPayload(payload: CreateUidRequest): Record<string, unknown> {
   return {
@@ -552,7 +623,7 @@ function normalizeTaskStatus(value: unknown): TaskStatus | undefined {
 }
 
 function isReviewAction(value: unknown): value is ReviewRecord["action"] {
-  return ["keep", "revoke", "hide-only", "exception", "positive-sample"].includes(value as string);
+  return ["keep", "confirm", "revoke", "hide-only", "exception", "positive-sample"].includes(value as string);
 }
 
 function isSampleKind(value: unknown): value is SampleSet["items"][number]["kind"] {
