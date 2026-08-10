@@ -585,7 +585,21 @@ function renderBlacklistCollection(collection: Collection<BlacklistItem>, filter
   if (collection.items === null) return collection.error ? renderState("error", "拉黑队列加载失败", collection.error) : renderState("loading", "正在载入队列", "");
   const items = collection.items.filter((item) => `${item.uid} ${item.itemId}`.toLowerCase().includes(filter.toLowerCase()));
   if (items.length === 0) return renderState(filter ? "filtered-empty" : "empty", filter ? "当前筛选没有匹配队列项" : "拉黑队列为空", filter ? "清除筛选或回到完整集合" : "明确命中后才会生成官方拉黑任务");
-  return `<div class="list">${items.map((item) => `<article class="list-row"><div class="row-main"><strong class="mono">${escapeHtml(item.uid)}</strong><span class="mono">${escapeHtml(item.itemId)}</span><small>${item.attempts} 次尝试${item.lastError ? ` · ${escapeHtml(item.lastError)}` : ""}</small></div><div class="row-actions"><span class="status-pill" data-state="${item.status === "completed" ? "ready" : item.status === "failed" || item.status === "blocked" ? "error" : item.status === "processing" ? "processing" : item.status}">${blacklistStatusLabel(item.status)}</span>${item.status === "queued" || item.status === "processing" ? `<button class="button button-ghost" data-queue-action="pause" data-item-id="${escapeHtml(item.itemId)}" type="button">暂停</button>` : ""}${item.status === "paused" ? `<button class="button button-ghost" data-queue-action="resume" data-item-id="${escapeHtml(item.itemId)}" type="button">恢复</button>` : ""}${item.status === "failed" ? `<button class="button button-ghost" data-queue-action="retry" data-item-id="${escapeHtml(item.itemId)}" type="button">重试</button>` : ""}</div></article>`).join("")}</div>`;
+  return `<div class="list">${items.map((item) => {
+    const statusState = item.status === "completed"
+      ? "ready"
+      : item.status === "failed" || item.status === "blocked"
+        ? "error"
+        : item.status === "processing" ? "processing" : item.status;
+    const action = item.status === "queued" || item.status === "processing"
+      ? `<button class="button button-ghost" data-queue-action="pause" data-item-id="${escapeHtml(item.itemId)}" type="button">暂停</button>`
+      : item.status === "paused"
+        ? `<button class="button button-ghost" data-queue-action="resume" data-item-id="${escapeHtml(item.itemId)}" type="button">恢复</button>`
+        : item.status === "failed" || item.status === "blocked"
+          ? `<button class="button button-ghost" data-queue-action="retry" data-item-id="${escapeHtml(item.itemId)}" type="button">重试</button>`
+          : "";
+    return `<article class="list-row blacklist-row"><div class="row-main"><strong class="mono">${escapeHtml(item.uid)}</strong><span class="mono">${escapeHtml(item.itemId)}</span><small>${item.attempts} 次尝试</small>${renderBlacklistDiagnostic(item)}</div><div class="row-actions"><span class="status-pill" data-state="${statusState}">${blacklistStatusLabel(item.status)}</span>${action}</div></article>`;
+  }).join("")}</div>`;
 }
 
 function renderSamplePreview(state: ManagementState): string {
@@ -616,6 +630,39 @@ function uidStatusLabel(status: UidRecord["status"]): string {
 
 function blacklistStatusLabel(status: BlacklistItem["status"]): string {
   return ({ queued: "已排队", processing: "处理中", blocked: "平台拦截", failed: "失败", completed: "已完成", paused: "已暂停", cancelled: "已取消" })[status];
+}
+
+function renderBlacklistDiagnostic(item: BlacklistItem): string {
+  const hasFailure = item.status === "failed" || item.status === "paused" || item.status === "blocked";
+  if (!hasFailure && !item.userMessage && !item.lastError) return "";
+  const userMessage = item.userMessage ?? blacklistFallbackMessage(item.status);
+  const recoveryAction = item.recoveryAction ?? blacklistFallbackRecovery(item.status);
+  const category = item.errorCategory ?? "unknown";
+  return `<div class="blacklist-diagnostic"><strong>${escapeHtml(userMessage)}</strong><p>${escapeHtml(recoveryAction)}</p><details class="blacklist-technical-details"><summary>查看技术详情</summary><dl><div><dt>错误类别</dt><dd>${escapeHtml(blacklistErrorCategoryLabel(category))} <span class="mono">(${escapeHtml(category)})</span></dd></div><div><dt>失败类型</dt><dd class="mono">${escapeHtml(item.failureType ?? "未提供")}</dd></div><div><dt>尝试次数</dt><dd>${escapeHtml(item.attempts)}</dd></div><div><dt>失败时间</dt><dd>${escapeHtml((item.errorAt ?? item.updatedAt) || "未提供")}</dd></div><div><dt>原始错误</dt><dd class="mono">${escapeHtml(item.lastError ?? "未提供")}</dd></div></dl></details></div>`;
+}
+
+function blacklistFallbackMessage(status: BlacklistItem["status"]): string {
+  return status === "paused"
+    ? "拉黑操作已暂停，请查看技术详情"
+    : status === "blocked"
+      ? "B 站平台拦截了拉黑操作，请查看技术详情"
+      : "拉黑操作失败，请查看技术详情";
+}
+
+function blacklistFallbackRecovery(status: BlacklistItem["status"]): string {
+  return status === "paused" ? "确认环境恢复后点击“恢复”" : "检查技术详情后点击“重试”";
+}
+
+function blacklistErrorCategoryLabel(category: string): string {
+  return ({
+    authentication: "登录态失效",
+    captcha_or_risk: "验证码或风控",
+    page_structure: "页面结构变化",
+    platform_interception: "平台拦截",
+    network: "临时网络",
+    browser_environment: "浏览器环境",
+    unknown: "未知错误",
+  } as Record<string, string>)[category] ?? "未分类错误";
 }
 
 function sampleStatusLabel(sample: SampleSet): string {

@@ -5,7 +5,12 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .blacklist import BlacklistExecutor, BlacklistQueueService, BlacklistQueueStatus
+from .blacklist import (
+    BlacklistErrorCategory,
+    BlacklistExecutor,
+    BlacklistQueueService,
+    BlacklistQueueStatus,
+)
 from .orchestrator import TaskOrchestrator
 from .tasks import TaskStatus, TaskStore
 
@@ -149,6 +154,11 @@ class BackgroundWorker:
         max_retries = max(0, self.config.max_queue_retries)
         for item in self.queue.list():
             if item.status is not BlacklistQueueStatus.FAILED:
+                continue
+            if item.error_category not in {
+                BlacklistErrorCategory.NETWORK,
+                BlacklistErrorCategory.BROWSER_ENVIRONMENT,
+            }:
                 continue
             if item.attempts > max_retries:
                 self._queue_retry_after.pop(item.item_id, None)

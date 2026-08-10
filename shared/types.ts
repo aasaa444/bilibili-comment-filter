@@ -136,6 +136,11 @@ export interface BlacklistItem {
   status: "queued" | "processing" | "blocked" | "failed" | "completed" | "paused" | "cancelled";
   attempts: number;
   lastError?: string;
+  errorCategory?: string;
+  failureType?: string;
+  userMessage?: string;
+  recoveryAction?: string;
+  errorAt?: string;
   updatedAt: string;
 }
 

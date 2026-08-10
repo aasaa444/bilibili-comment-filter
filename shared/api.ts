@@ -453,6 +453,11 @@ function normalizeBlacklistItem(value: unknown): BlacklistItem | null {
     status,
     attempts: numberValue(candidate.attempts) ?? 0,
     lastError: stringValue(candidate.last_error) ?? stringValue(candidate.lastError),
+    errorCategory: stringValue(candidate.error_category) ?? stringValue(candidate.errorCategory),
+    failureType: stringValue(candidate.failure_type) ?? stringValue(candidate.failureType),
+    userMessage: stringValue(candidate.user_message) ?? stringValue(candidate.userMessage),
+    recoveryAction: stringValue(candidate.recovery_action) ?? stringValue(candidate.recoveryAction),
+    errorAt: stringValue(candidate.error_at) ?? stringValue(candidate.errorAt),
     updatedAt: stringValue(candidate.updated_at) ?? stringValue(candidate.updatedAt) ?? "",
   };
 }

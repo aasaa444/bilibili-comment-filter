@@ -25,10 +25,117 @@ class BlacklistQueueStatus(StrEnum):
 
 class ExecutionFailureKind(StrEnum):
     TEMPORARY = "temporary"
+    NETWORK = "network"
     AUTH = "auth"
     CAPTCHA = "captcha"
     INTERCEPTED = "intercepted"
     BLOCKED = "blocked"
+    ENVIRONMENT = "environment"
+    UNKNOWN = "unknown"
+
+
+class BlacklistErrorCategory(StrEnum):
+    AUTHENTICATION = "authentication"
+    CAPTCHA_OR_RISK = "captcha_or_risk"
+    PAGE_STRUCTURE = "page_structure"
+    PLATFORM_INTERCEPTION = "platform_interception"
+    NETWORK = "network"
+    BROWSER_ENVIRONMENT = "browser_environment"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class BlacklistFailureDiagnostic:
+    error_category: BlacklistErrorCategory
+    failure_type: ExecutionFailureKind
+    user_message: str
+    recovery_action: str
+
+
+_FAILURE_DIAGNOSTICS: dict[ExecutionFailureKind, BlacklistFailureDiagnostic] = {
+    ExecutionFailureKind.TEMPORARY: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.NETWORK,
+        failure_type=ExecutionFailureKind.TEMPORARY,
+        user_message="临时网络错误，拉黑操作失败",
+        recovery_action="稍后自动重试，或点击“重试”",
+    ),
+    ExecutionFailureKind.NETWORK: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.NETWORK,
+        failure_type=ExecutionFailureKind.NETWORK,
+        user_message="临时网络错误，拉黑操作失败",
+        recovery_action="稍后自动重试，或点击“重试”",
+    ),
+    ExecutionFailureKind.AUTH: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.AUTHENTICATION,
+        failure_type=ExecutionFailureKind.AUTH,
+        user_message="B 站登录状态失效，队列已暂停",
+        recovery_action="请重新同步 B 站登录状态后点击“恢复”",
+    ),
+    ExecutionFailureKind.CAPTCHA: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.CAPTCHA_OR_RISK,
+        failure_type=ExecutionFailureKind.CAPTCHA,
+        user_message="检测到验证码或风控验证，队列已暂停",
+        recovery_action="请完成验证码或风控验证后点击“恢复”",
+    ),
+    ExecutionFailureKind.INTERCEPTED: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.PAGE_STRUCTURE,
+        failure_type=ExecutionFailureKind.INTERCEPTED,
+        user_message="确认窗口结构未识别，队列已暂停",
+        recovery_action="请检查 B 站页面结构后点击“恢复”",
+    ),
+    ExecutionFailureKind.BLOCKED: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.PLATFORM_INTERCEPTION,
+        failure_type=ExecutionFailureKind.BLOCKED,
+        user_message="检测到 B 站平台拦截，队列已暂停",
+        recovery_action="请等待平台限制解除后点击“恢复”",
+    ),
+    ExecutionFailureKind.ENVIRONMENT: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.BROWSER_ENVIRONMENT,
+        failure_type=ExecutionFailureKind.ENVIRONMENT,
+        user_message="浏览器执行环境故障，拉黑操作失败",
+        recovery_action="请检查后台 Chromium 运行环境后点击“重试”",
+    ),
+    ExecutionFailureKind.UNKNOWN: BlacklistFailureDiagnostic(
+        error_category=BlacklistErrorCategory.UNKNOWN,
+        failure_type=ExecutionFailureKind.UNKNOWN,
+        user_message="拉黑操作遇到未识别错误，队列项已保留",
+        recovery_action="请查看技术详情后点击“重试”",
+    ),
+}
+
+
+def failure_diagnostic(kind: ExecutionFailureKind) -> BlacklistFailureDiagnostic:
+    return _FAILURE_DIAGNOSTICS.get(kind, _FAILURE_DIAGNOSTICS[ExecutionFailureKind.UNKNOWN])
+
+
+def failure_status(kind: ExecutionFailureKind) -> BlacklistQueueStatus:
+    if kind in {
+        ExecutionFailureKind.AUTH,
+        ExecutionFailureKind.CAPTCHA,
+        ExecutionFailureKind.INTERCEPTED,
+        ExecutionFailureKind.BLOCKED,
+    }:
+        return BlacklistQueueStatus.PAUSED
+    return BlacklistQueueStatus.FAILED
+
+
+def classify_unexpected_failure(error: BaseException) -> ExecutionFailureKind:
+    text = f"{error.__class__.__name__}: {error}".lower()
+    if any(marker in text for marker in ("timeout", "timed out", "connection", "network", "dns")):
+        return ExecutionFailureKind.NETWORK
+    if any(
+        marker in text
+        for marker in (
+            "playwright",
+            "browser",
+            "chromium",
+            "executable",
+            "target closed",
+            "context closed",
+        )
+    ):
+        return ExecutionFailureKind.ENVIRONMENT
+    return ExecutionFailureKind.UNKNOWN
 
 
 class BlacklistExecutionError(RuntimeError):
@@ -49,12 +156,18 @@ class BlacklistItem:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    error_category: BlacklistErrorCategory | None = None
+    failure_type: ExecutionFailureKind | None = None
+    user_message: str | None = None
+    recovery_action: str | None = None
+    error_at: datetime | None = None
 
 
 @dataclass(frozen=True)
 class ExecutionResult:
     success: bool = True
     detail: str = "Blacklist action completed"
+    failure_kind: ExecutionFailureKind | None = None
 
 
 class BlacklistExecutor(Protocol):
@@ -78,13 +191,19 @@ class PlaywrightBlacklistExecutor:
 
     _LOCATOR_TIMEOUT_MS = 10_000
 
+    _RISK_VERIFICATION_MARKERS = (
+        "验证码",
+        "人机验证",
+        "风险验证",
+        "风控",
+    )
+
     _PLATFORM_INTERCEPTION_MARKERS = (
         "安全验证",
         "请求过频",
         "请求过于频繁",
         "操作频繁",
         "访问受限",
-        "风控",
         "平台拦截",
     )
 
@@ -102,7 +221,7 @@ class PlaywrightBlacklistExecutor:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise BlacklistExecutionError(
-                ExecutionFailureKind.TEMPORARY,
+                ExecutionFailureKind.ENVIRONMENT,
                 "Playwright is not installed for the native blacklist executor",
             ) from exc
         try:
@@ -143,12 +262,12 @@ class PlaywrightBlacklistExecutor:
                     self._wait_for_visible(
                         page,
                         success,
-                        kind=ExecutionFailureKind.TEMPORARY,
+                        kind=ExecutionFailureKind.INTERCEPTED,
                         detail="Native blacklist success state was not confirmed",
                     )
                     if success.count() == 0:
                         raise BlacklistExecutionError(
-                            ExecutionFailureKind.TEMPORARY,
+                            ExecutionFailureKind.INTERCEPTED,
                             "Native blacklist success state was not confirmed",
                         )
                     return ExecutionResult(detail="UID is blacklisted")
@@ -164,8 +283,9 @@ class PlaywrightBlacklistExecutor:
         except BlacklistExecutionError:
             raise
         except Exception as exc:
+            kind = classify_unexpected_failure(exc)
             raise BlacklistExecutionError(
-                ExecutionFailureKind.TEMPORARY,
+                kind,
                 f"Native blacklist action failed: {exc}",
             ) from exc
 
@@ -175,7 +295,7 @@ class PlaywrightBlacklistExecutor:
                 ExecutionFailureKind.AUTH,
                 "Bilibili session is no longer logged in",
             )
-        if page.get_by_text("验证码", exact=False).count() > 0:
+        if self._risk_verification_detected(page):
             raise BlacklistExecutionError(
                 ExecutionFailureKind.CAPTCHA,
                 "Bilibili requested a captcha; queue paused",
@@ -200,6 +320,12 @@ class PlaywrightBlacklistExecutor:
             self._raise_if_page_failure(page)
             raise BlacklistExecutionError(kind, detail) from exc
         self._raise_if_page_failure(page)
+
+    def _risk_verification_detected(self, page: object) -> bool:
+        return any(
+            page.get_by_text(marker, exact=False).count() > 0
+            for marker in self._RISK_VERIFICATION_MARKERS
+        )
 
     def _platform_interception_detected(self, page: object) -> bool:
         return any(
@@ -337,27 +463,15 @@ class BlacklistQueueService:
         try:
             outcome = executor.execute(item)
             if not outcome.success:
-                return self._finish(item.item_id, BlacklistQueueStatus.FAILED, outcome.detail)
+                kind = outcome.failure_kind or ExecutionFailureKind.UNKNOWN
+                return self._finish_failure(item.item_id, kind, outcome.detail)
         except BlacklistExecutionError as exc:
-            status = (
-                BlacklistQueueStatus.FAILED
-                if exc.kind is ExecutionFailureKind.TEMPORARY
-                else BlacklistQueueStatus.PAUSED
-                if exc.kind
-                in {
-                    ExecutionFailureKind.AUTH,
-                    ExecutionFailureKind.CAPTCHA,
-                    ExecutionFailureKind.INTERCEPTED,
-                    ExecutionFailureKind.BLOCKED,
-                }
-                else BlacklistQueueStatus.FAILED
-            )
-            return self._finish(item.item_id, status, exc.detail)
+            return self._finish_failure(item.item_id, exc.kind, exc.detail)
         except Exception as exc:
             detail = str(exc) or exc.__class__.__name__
-            return self._finish(
+            return self._finish_failure(
                 item.item_id,
-                BlacklistQueueStatus.FAILED,
+                classify_unexpected_failure(exc),
                 f"Blacklist executor failed: {detail}",
             )
         completed = self._finish(item.item_id, BlacklistQueueStatus.COMPLETED, None)
@@ -376,7 +490,9 @@ class BlacklistQueueService:
             row = connection.execute(
                 """
                 UPDATE blacklist_queue
-                SET status = ?, attempts = attempts + 1, updated_at = ?, last_error = NULL
+                SET status = ?, attempts = attempts + 1, updated_at = ?, last_error = NULL,
+                    error_category = NULL, failure_type = NULL,
+                    user_message = NULL, recovery_action = NULL, error_at = NULL
                 WHERE item_id = (
                     SELECT item_id
                     FROM blacklist_queue
@@ -397,20 +513,48 @@ class BlacklistQueueService:
         return self._from_row(row) if row is not None else None
 
     def _finish(
-        self, item_id: str, status: BlacklistQueueStatus, error: str | None
+        self,
+        item_id: str,
+        status: BlacklistQueueStatus,
+        error: str | None,
+        diagnostic: BlacklistFailureDiagnostic | None = None,
     ) -> BlacklistItem:
         timestamp = datetime.now(UTC).isoformat()
         completed_at = timestamp if status is BlacklistQueueStatus.COMPLETED else None
+        error_at = timestamp if diagnostic is not None else None
         with self.database.transaction() as connection:
             connection.execute(
                 """
                 UPDATE blacklist_queue
-                SET status = ?, updated_at = ?, last_error = ?, completed_at = ?
+                SET status = ?, updated_at = ?, last_error = ?,
+                    error_category = ?, failure_type = ?, user_message = ?,
+                    recovery_action = ?, error_at = ?, completed_at = ?
                 WHERE item_id = ?
                 """,
-                (status.value, timestamp, error, completed_at, item_id),
+                (
+                    status.value,
+                    timestamp,
+                    error,
+                    diagnostic.error_category.value if diagnostic else None,
+                    diagnostic.failure_type.value if diagnostic else None,
+                    diagnostic.user_message if diagnostic else None,
+                    diagnostic.recovery_action if diagnostic else None,
+                    error_at,
+                    completed_at,
+                    item_id,
+                ),
             )
         return self.get(item_id)
+
+    def _finish_failure(
+        self, item_id: str, kind: ExecutionFailureKind, error: str
+    ) -> BlacklistItem:
+        return self._finish(
+            item_id,
+            failure_status(kind),
+            error,
+            failure_diagnostic(kind),
+        )
 
     def _transition(
         self,
@@ -425,10 +569,22 @@ class BlacklistQueueService:
             )
         timestamp = datetime.now(UTC).isoformat()
         with self.database.transaction() as connection:
-            connection.execute(
-                "UPDATE blacklist_queue SET status = ?, updated_at = ? WHERE item_id = ?",
-                (target.value, timestamp, item_id),
-            )
+            if target is BlacklistQueueStatus.QUEUED:
+                connection.execute(
+                    """
+                    UPDATE blacklist_queue
+                    SET status = ?, updated_at = ?, last_error = NULL,
+                        error_category = NULL, failure_type = NULL,
+                        user_message = NULL, recovery_action = NULL, error_at = NULL
+                    WHERE item_id = ?
+                    """,
+                    (target.value, timestamp, item_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE blacklist_queue SET status = ?, updated_at = ? WHERE item_id = ?",
+                    (target.value, timestamp, item_id),
+                )
         return self.get(item_id)
 
     @staticmethod
@@ -445,4 +601,17 @@ class BlacklistQueueService:
             completed_at=(
                 datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None
             ),
+            error_category=(
+                BlacklistErrorCategory(row["error_category"])
+                if row["error_category"]
+                else None
+            ),
+            failure_type=(
+                ExecutionFailureKind(row["failure_type"])
+                if row["failure_type"]
+                else None
+            ),
+            user_message=row["user_message"],
+            recovery_action=row["recovery_action"],
+            error_at=(datetime.fromisoformat(row["error_at"]) if row["error_at"] else None),
         )

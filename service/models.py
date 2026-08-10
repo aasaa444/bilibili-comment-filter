@@ -261,6 +261,11 @@ class BlacklistResponse(BaseModel):
     status: str
     attempts: int
     last_error: str | None
+    error_category: str | None
+    failure_type: str | None
+    user_message: str | None
+    recovery_action: str | None
+    error_at: datetime | None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None

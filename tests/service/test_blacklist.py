@@ -238,7 +238,7 @@ def test_native_executor_does_not_report_success_without_blacklist_confirmation(
     with pytest.raises(BlacklistExecutionError) as raised:
         PlaywrightBlacklistExecutor().execute(make_item())
 
-    assert raised.value.kind is ExecutionFailureKind.TEMPORARY
+    assert raised.value.kind is ExecutionFailureKind.INTERCEPTED
     assert_resources_closed(browser)
 
 
@@ -257,6 +257,21 @@ def test_native_executor_closes_browser_when_auth_check_fails(
 
 def test_native_executor_pauses_for_captcha(monkeypatch: pytest.MonkeyPatch) -> None:
     browser = FakeBrowser(FakePage(captcha=True))
+    install_fake_playwright(monkeypatch, browser)
+
+    with pytest.raises(BlacklistExecutionError) as raised:
+        PlaywrightBlacklistExecutor().execute(make_item())
+
+    assert raised.value.kind is ExecutionFailureKind.CAPTCHA
+    assert_resources_closed(browser)
+
+
+@pytest.mark.parametrize("marker", ["风控"])
+def test_native_executor_classifies_risk_verification_as_captcha(
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    browser = FakeBrowser(FakePage(platform_intercepted=marker))
     install_fake_playwright(monkeypatch, browser)
 
     with pytest.raises(BlacklistExecutionError) as raised:

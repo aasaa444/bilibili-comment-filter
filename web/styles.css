@@ -437,6 +437,55 @@ textarea {
   gap: 8px;
 }
 
+.blacklist-row .row-main {
+  flex: 1 1 420px;
+}
+
+.blacklist-diagnostic {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+  padding: 9px 10px;
+  border-left: 2px solid var(--warning);
+  background: rgba(255, 159, 14, 0.08);
+}
+
+.blacklist-diagnostic > strong {
+  overflow-wrap: anywhere;
+  color: var(--warning);
+  white-space: normal;
+}
+
+.blacklist-diagnostic > p {
+  margin: 0;
+  color: var(--secondary);
+  white-space: normal;
+}
+
+.blacklist-technical-details {
+  margin-top: 3px;
+  border-top: 1px solid var(--border);
+}
+
+.blacklist-technical-details summary {
+  padding-top: 7px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.blacklist-technical-details summary:hover {
+  color: var(--secondary);
+}
+
+.blacklist-technical-details dl {
+  margin-top: 8px;
+}
+
+.blacklist-technical-details dd {
+  overflow-wrap: anywhere;
+}
+
 .task-detail {
   margin: 0 0 12px;
   padding: 16px;

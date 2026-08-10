@@ -162,6 +162,11 @@ CREATE TABLE IF NOT EXISTS blacklist_queue (
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    error_category TEXT,
+    failure_type TEXT,
+    user_message TEXT,
+    recovery_action TEXT,
+    error_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -189,6 +194,7 @@ class Database:
         self._migrate_video_tasks()
         self._migrate_task_checkpoints()
         self._migrate_sample_items()
+        self._migrate_blacklist_queue()
         self._connection.commit()
         self.recover_blacklist_processing()
 
@@ -269,6 +275,23 @@ class Database:
                 """
             )
 
+    def _migrate_blacklist_queue(self) -> None:
+        columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(blacklist_queue)")
+        }
+        additions = {
+            "error_category": "TEXT",
+            "failure_type": "TEXT",
+            "user_message": "TEXT",
+            "recovery_action": "TEXT",
+            "error_at": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE blacklist_queue ADD COLUMN {name} {definition}"
+                )
+
     def _sample_items_have_legacy_unique_constraint(self) -> bool:
         indexes = self.connection.execute("PRAGMA index_list(sample_items)").fetchall()
         for index in indexes:
@@ -317,10 +340,21 @@ class Database:
                         last_error,
                         'Recovered abandoned blacklist item after service restart'
                     ),
+                    error_category = COALESCE(error_category, 'browser_environment'),
+                    failure_type = COALESCE(failure_type, 'environment'),
+                    user_message = COALESCE(
+                        user_message,
+                        '服务重启时发现上次拉黑中断，队列项已保留'
+                    ),
+                    recovery_action = COALESCE(
+                        recovery_action,
+                        '请确认后台 Chromium 运行环境正常后点击“重试”'
+                    ),
+                    error_at = COALESCE(error_at, ?),
                     completed_at = NULL
                 WHERE status = 'processing'
                 """,
-                (timestamp,),
+                (timestamp, timestamp),
             )
         return cursor.rowcount
 
