@@ -51,6 +51,7 @@ interface ManagementState {
   taskDetails: Record<string, TaskDetailState>;
   uids: Collection<UidRecord>;
   evidence: Collection<Evidence>;
+  dashboardEvidence: Collection<Evidence>;
   reviewActions: Collection<ReviewRecord>;
   samples: Collection<SampleSet>;
   sampleDetails: Record<string, boolean>;
@@ -88,6 +89,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     taskDetails: {},
     uids: { items: null },
     evidence: { items: null },
+    dashboardEvidence: { items: null },
     reviewActions: { items: null },
     samples: { items: null },
     sampleDetails: {},
@@ -140,11 +142,14 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       return;
     }
 
-    const [auth, tasks, uids, evidence, reviewActions, samples, blacklist, blacklistSettings] = await Promise.all([
+    const [auth, tasks, uids, evidence, dashboardEvidence, reviewActions, samples, blacklist, blacklistSettings] = await Promise.all([
       api.getAuthSession().catch(() => null),
       loadCollection(() => api.listTasks()),
       loadCollection(() => api.listUids()),
       loadCollection(() => api.listEvidence({ reviewStatus: state.reviewStatus })),
+      state.reviewStatus === "pending"
+        ? Promise.resolve(null)
+        : loadCollection(() => api.listEvidence({ reviewStatus: "pending" })),
       loadCollection(() => api.listReviewActions()),
       loadCollection(() => api.listSamples()),
       loadCollection(() => api.listBlacklist()),
@@ -154,6 +159,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     state.tasks = tasks;
     state.uids = uids;
     state.evidence = evidence;
+    state.dashboardEvidence = dashboardEvidence ?? evidence;
     const pendingEvidenceIds = new Set(evidence.items?.map((item) => item.evidenceId) ?? []);
     state.selectedEvidenceIds = state.selectedEvidenceIds.filter((id) => pendingEvidenceIds.has(id));
     if (state.selectedEvidenceId && !pendingEvidenceIds.has(state.selectedEvidenceId)) {
@@ -661,7 +667,7 @@ function renderConnectionBlock(connection: ConnectionState): string {
 function renderDashboard(state: ManagementState): string {
   const taskItems = state.tasks.items;
   const uidItems = state.uids.items;
-  const evidenceItems = state.evidence.items;
+  const evidenceItems = state.dashboardEvidence.items;
   const queueItems = state.blacklist.items;
   return `
     <section class="hero-strip">
@@ -812,11 +818,12 @@ function renderUidCollection(collection: Collection<UidRecord>, filter: string):
 }
 
 function renderEvidenceCollection(state: ManagementState, view: "dashboard" | "reviews", filter = ""): string {
-  const items = filteredEvidenceItems(state.evidence, filter);
+  const evidenceCollection = view === "dashboard" ? state.dashboardEvidence : state.evidence;
+  const items = filteredEvidenceItems(evidenceCollection, filter);
   const isInbox = view === "reviews" && state.reviewStatus === "pending";
   if (items === null) {
-    return state.evidence.error
-      ? renderState("error", "证据加载失败", state.evidence.error)
+    return evidenceCollection.error
+      ? renderState("error", "证据加载失败", evidenceCollection.error)
       : renderState("loading", "正在载入证据", "");
   }
   if (items.length === 0) {

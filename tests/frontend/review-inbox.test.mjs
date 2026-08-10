@@ -246,9 +246,34 @@ test("review inbox can switch between pending, history, and all evidence without
     });
     await flush();
 
-    assert.deepEqual(api.reviewQueries, ["pending", "history"]);
+    assert.deepEqual(api.reviewQueries, ["pending", "history", "pending"]);
     assert.match(root.content.innerHTML, /复核历史证据/);
     assert.doesNotMatch(root.content.innerHTML, /data-review-action=/);
+  });
+});
+
+test("dashboard keeps its pending evidence when the review inbox is browsing history", async () => {
+  await withFakeDom(async () => {
+    const root = new TestRoot();
+    const api = createApi();
+    const historyEvidence = { ...evidence, evidenceId: "history-1", uid: "2002", nicknameSnapshot: "history-user" };
+    api.listEvidence = async (params = {}) => {
+      api.reviewQueries.push(params.reviewStatus);
+      return { items: params.reviewStatus === "pending" ? [evidence] : [historyEvidence] };
+    };
+    mountManagementPage(root, api);
+    await flush();
+    await openReviews(root);
+    await root.listeners.get("change")({
+      target: new TestHTMLElement({}, { name: "reviewStatus", value: "history" }),
+    });
+    await flush();
+
+    assert.match(root.content.innerHTML, /history-1/);
+    await root.listeners.get("click")({ target: new TestHTMLElement({ view: "dashboard" }) });
+
+    assert.match(root.content.innerHTML, /data-evidence-row="evidence-1"/);
+    assert.doesNotMatch(root.content.innerHTML, /data-evidence-row="history-1"/);
   });
 });
 
