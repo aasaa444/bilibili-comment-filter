@@ -8,6 +8,7 @@ import {
 import type {
   AuthSession,
   BlacklistItem,
+  BlacklistSettings,
   Evidence,
   ReviewAction,
   ReviewRecord,
@@ -30,6 +31,17 @@ interface TaskDetailState {
   error?: string;
 }
 
+interface ReviewFeedback {
+  action: ReviewAction;
+  status: "busy" | "success" | "error";
+  message?: string;
+}
+
+interface ReviewBatchFeedback {
+  status: "success" | "error";
+  message: string;
+}
+
 interface ManagementState {
   activeView: ViewName;
   loading: boolean;
@@ -43,7 +55,14 @@ interface ManagementState {
   samples: Collection<SampleSet>;
   sampleDetails: Record<string, boolean>;
   blacklist: Collection<BlacklistItem>;
+  blacklistSettings: BlacklistSettings | null;
+  blacklistSettingsError?: string;
   filters: Partial<Record<ViewName, string>>;
+  reviewStatus: "pending" | "history" | "all";
+  selectedEvidenceId?: string;
+  selectedEvidenceIds: string[];
+  evidenceFeedback: Record<string, ReviewFeedback>;
+  reviewBatchFeedback?: ReviewBatchFeedback;
   sampleText: string;
   sampleKind: SampleKind;
   sampleFileItems: SampleItem[];
@@ -73,18 +92,33 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     samples: { items: null },
     sampleDetails: {},
     blacklist: { items: null },
+    blacklistSettings: null,
     filters: {},
+    reviewStatus: "pending",
+    selectedEvidenceIds: [],
+    evidenceFeedback: {},
     sampleText: "",
     sampleKind: "comment-positive",
     sampleFileItems: [],
   };
 
   root.innerHTML = renderFrame(state);
-  root.addEventListener("click", (event) => void handleClick(event));
+  root.addEventListener("click", (event) => {
+    closeMoreMenus(event);
+    void handleClick(event);
+  });
   root.addEventListener("submit", (event) => void handleSubmit(event));
   root.addEventListener("input", handleInput);
   root.addEventListener("change", (event) => void handleChange(event));
+  if (typeof document !== "undefined") document.addEventListener("click", closeMoreMenus);
   void loadAll();
+
+  function closeMoreMenus(event: Event): void {
+    const target = event.target;
+    if (target instanceof HTMLElement && target.closest(".more-menu")) return;
+    if (typeof root.querySelectorAll !== "function") return;
+    root.querySelectorAll<HTMLDetailsElement>("details.more-menu[open]").forEach((menu) => menu.removeAttribute("open"));
+  }
 
   async function loadAll(preserveNotice = false): Promise<void> {
     state.loading = true;
@@ -106,22 +140,30 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       return;
     }
 
-    const [auth, tasks, uids, evidence, reviewActions, samples, blacklist] = await Promise.all([
+    const [auth, tasks, uids, evidence, reviewActions, samples, blacklist, blacklistSettings] = await Promise.all([
       api.getAuthSession().catch(() => null),
       loadCollection(() => api.listTasks()),
       loadCollection(() => api.listUids()),
-      loadCollection(() => api.listEvidence()),
+      loadCollection(() => api.listEvidence({ reviewStatus: state.reviewStatus })),
       loadCollection(() => api.listReviewActions()),
       loadCollection(() => api.listSamples()),
       loadCollection(() => api.listBlacklist()),
+      loadBlacklistSettings(api),
     ]);
     state.auth = auth;
     state.tasks = tasks;
     state.uids = uids;
     state.evidence = evidence;
+    const pendingEvidenceIds = new Set(evidence.items?.map((item) => item.evidenceId) ?? []);
+    state.selectedEvidenceIds = state.selectedEvidenceIds.filter((id) => pendingEvidenceIds.has(id));
+    if (state.selectedEvidenceId && !pendingEvidenceIds.has(state.selectedEvidenceId)) {
+      state.selectedEvidenceId = undefined;
+    }
     state.reviewActions = reviewActions;
     state.samples = samples;
     state.blacklist = blacklist;
+    state.blacklistSettings = blacklistSettings.value;
+    state.blacklistSettingsError = blacklistSettings.error;
     state.loading = false;
     root.innerHTML = renderFrame(state);
   }
@@ -143,7 +185,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
 
     const revokeUid = target.closest<HTMLElement>("[data-revoke-uid]");
     if (revokeUid) {
-      await runAction(() => api.updateUid(revokeUid.dataset.revokeUid ?? "", { hidden: false, status: "exception" }), "本地隐藏已撤销");
+      await runAction(() => api.removeUid(revokeUid.dataset.revokeUid ?? ""), "本地隐藏已撤销");
       return;
     }
     const retryTask = target.closest<HTMLElement>("[data-retry-task]");
@@ -171,7 +213,24 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     if (reviewButton) {
       const evidenceId = reviewButton.dataset.evidenceId ?? "";
       const action = reviewButton.dataset.reviewAction as ReviewAction;
-      await runAction(() => api.reviewEvidence(evidenceId, action), "复核操作已记录");
+      await runReviewAction(evidenceId, action);
+      return;
+    }
+    const batchReviewButton = target.closest<HTMLElement>("[data-review-batch-action]");
+    if (batchReviewButton) {
+      await runBatchReview(batchReviewButton.dataset.reviewBatchAction as ReviewAction);
+      return;
+    }
+    const evidenceSelect = target.closest<HTMLElement>("[data-evidence-select]");
+    if (evidenceSelect) {
+      state.selectedEvidenceId = evidenceSelect.dataset.evidenceSelect;
+      renderContent();
+      return;
+    }
+    const evidenceClose = target.closest<HTMLElement>("[data-evidence-close]");
+    if (evidenceClose) {
+      state.selectedEvidenceId = undefined;
+      renderContent();
       return;
     }
     const sampleDetails = target.closest<HTMLElement>("[data-sample-details]");
@@ -253,7 +312,12 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
     if (target.dataset.filter) {
       state.filters[target.dataset.filter as ViewName] = target.value;
-      root.querySelector("[data-content]")!.innerHTML = renderView(state);
+      if (target.dataset.filter === "reviews") {
+        const visible = filteredEvidenceItems(state.evidence, target.value) ?? [];
+        const visibleIds = new Set(visible.map((item) => item.evidenceId));
+        state.selectedEvidenceIds = state.selectedEvidenceIds.filter((evidenceId) => visibleIds.has(evidenceId));
+      }
+      renderContent();
       return;
     }
     if (target.name === "sampleText") {
@@ -266,6 +330,25 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
   async function handleChange(event: Event): Promise<void> {
     const target = event.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
+    if (target instanceof HTMLInputElement && target.dataset.evidenceSelectToggle) {
+      toggleEvidenceSelection(target.dataset.evidenceSelectToggle, target.checked);
+      return;
+    }
+    if (target instanceof HTMLInputElement && target.dataset.evidenceSelectAll) {
+      selectVisibleEvidence(target.checked);
+      return;
+    }
+    if (target instanceof HTMLInputElement && target.name === "autoBlacklistEnabled") {
+      await toggleBlacklistSettings(target.checked);
+      return;
+    }
+    if (target instanceof HTMLSelectElement && target.name === "reviewStatus") {
+      state.reviewStatus = target.value as ManagementState["reviewStatus"];
+      state.selectedEvidenceId = undefined;
+      state.selectedEvidenceIds = [];
+      await loadAll(true);
+      return;
+    }
     if (target.name === "sampleKind") {
       state.sampleKind = target.value as SampleKind;
       const preview = root.querySelector<HTMLElement>("[data-sample-preview]");
@@ -279,6 +362,34 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     }
   }
 
+  async function toggleBlacklistSettings(enabled: boolean): Promise<void> {
+    const method = (api as unknown as {
+      updateBlacklistSettings?: (value: boolean) => Promise<BlacklistSettings>;
+    }).updateBlacklistSettings;
+    if (!method) {
+      setNotice("error", "当前本机服务不支持自动拉黑开关");
+      return;
+    }
+    const previous = state.blacklistSettings;
+    state.blacklistSettings = {
+      enabled,
+      mode: enabled ? "local_and_official_queue" : "local_only",
+      updatedAt: previous?.updatedAt ?? "",
+    };
+    renderContent();
+    try {
+      state.blacklistSettings = await method.call(api, enabled);
+      state.notice = {
+        kind: "success",
+        message: enabled ? "自动官方拉黑已开启；新命中将排入队列" : "自动官方拉黑已关闭；仅执行本地隐藏",
+      };
+      root.innerHTML = renderFrame(state);
+    } catch (error) {
+      state.blacklistSettings = previous;
+      setNotice("error", messageFromError(error));
+    }
+  }
+
   async function runAction<T>(operation: () => Promise<T>, successMessage: string): Promise<T | undefined> {
     try {
       const result = await operation();
@@ -289,6 +400,135 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       setNotice("error", messageFromError(error));
       return undefined;
     }
+  }
+
+  async function runReviewAction(
+    evidenceId: string,
+    action: ReviewAction,
+    options: { skipConfirmation?: boolean } = {},
+  ): Promise<boolean> {
+    if (!evidenceId || state.evidenceFeedback[evidenceId]?.status === "busy") return false;
+    if (action === "confirm" && state.blacklistSettings?.enabled !== true) {
+      state.evidenceFeedback[evidenceId] = {
+        action,
+        status: "error",
+        message: "自动执行官方拉黑已关闭；请先开启总开关，或选择“仅本地隐藏”",
+      };
+      renderContent();
+      return false;
+    }
+    if (!options.skipConfirmation && !confirmReviewAction(action, 1, 1)) {
+      state.evidenceFeedback[evidenceId] = {
+        action,
+        status: "error",
+        message: "已取消本次操作",
+      };
+      renderContent();
+      return false;
+    }
+    state.evidenceFeedback[evidenceId] = { action, status: "busy" };
+    renderContent();
+    try {
+      const record = await api.reviewEvidence(evidenceId, action);
+      const actions = state.reviewActions.items ?? [];
+      state.reviewActions = {
+        items: [record, ...actions.filter((item) => item.reviewId !== record.reviewId)],
+      };
+      state.evidence = {
+        items: (state.evidence.items ?? []).filter((item) => item.evidenceId !== evidenceId),
+      };
+      state.selectedEvidenceIds = state.selectedEvidenceIds.filter((id) => id !== evidenceId);
+      if (state.selectedEvidenceId === evidenceId) state.selectedEvidenceId = undefined;
+      state.evidenceFeedback[evidenceId] = {
+        action,
+        status: "success",
+        message: "已移入复核历史",
+      };
+      renderContent();
+      return true;
+    } catch (error) {
+      state.evidenceFeedback[evidenceId] = { action, status: "error", message: messageFromError(error) };
+      renderContent();
+      return false;
+    }
+  }
+
+  async function runBatchReview(action: ReviewAction): Promise<void> {
+    const visibleItems = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "") ?? [];
+    const visibleIds = new Set(visibleItems.map((item) => item.evidenceId));
+    const ids = state.selectedEvidenceIds.filter((evidenceId) => visibleIds.has(evidenceId));
+    if (ids.length === 0) {
+      state.reviewBatchFeedback = { status: "error", message: "请先选择至少一条证据" };
+      renderContent();
+      return;
+    }
+    if (action === "confirm" && state.blacklistSettings?.enabled !== true) {
+      state.reviewBatchFeedback = {
+        status: "error",
+        message: "自动执行官方拉黑已关闭；请先开启总开关，或选择批量仅本地隐藏",
+      };
+      renderContent();
+      return;
+    }
+    const uidCount = new Set(
+      ids
+        .map((evidenceId) => state.evidence.items?.find((item) => item.evidenceId === evidenceId)?.uid)
+        .filter(Boolean),
+    ).size;
+    if (!confirmReviewAction(action, ids.length, uidCount)) {
+      state.reviewBatchFeedback = { status: "error", message: "已取消本次批量操作" };
+      renderContent();
+      return;
+    }
+    let successCount = 0;
+    for (const evidenceId of ids) {
+      if (await runReviewAction(evidenceId, action, { skipConfirmation: true })) successCount += 1;
+    }
+    state.reviewBatchFeedback = {
+      status: successCount === ids.length ? "success" : "error",
+      message: `批量操作已完成：${successCount}/${ids.length} 条证据，影响 ${uidCount} 个 UID`,
+    };
+    renderContent();
+  }
+
+  function confirmReviewAction(action: ReviewAction, evidenceCount: number, uidCount: number): boolean {
+    const confirmDialog = (globalThis as typeof globalThis & {
+      confirm?: (message?: string) => boolean;
+    }).confirm;
+    if (typeof confirmDialog !== "function") return true;
+    const actionLabel = reviewActionLabel(action);
+    const scope = evidenceCount === 1
+      ? "这条证据"
+      : `${evidenceCount} 条证据（${uidCount} 个 UID）`;
+    const effect = action === "confirm"
+      ? "进入官方拉黑队列"
+      : action === "hide-only"
+        ? "仅保留本地隐藏，不进入官方队列"
+        : action === "revoke"
+          ? "撤销本地隐藏"
+          : actionLabel;
+    return confirmDialog(`即将对${scope}执行“${effect}”，是否继续？`);
+  }
+
+  function toggleEvidenceSelection(evidenceId: string | undefined, checked: boolean): void {
+    if (!evidenceId) return;
+    const selected = new Set(state.selectedEvidenceIds);
+    if (checked) selected.add(evidenceId);
+    else selected.delete(evidenceId);
+    state.selectedEvidenceIds = [...selected];
+    renderContent();
+  }
+
+  function selectVisibleEvidence(checked: boolean): void {
+    const items = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "");
+    if (items === null) return;
+    const selected = new Set(state.selectedEvidenceIds);
+    for (const item of items) {
+      if (checked) selected.add(item.evidenceId);
+      else selected.delete(item.evidenceId);
+    }
+    state.selectedEvidenceIds = [...selected];
+    renderContent();
   }
 
   async function loadTaskComments(taskId: string): Promise<void> {
@@ -311,7 +551,12 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
 
   function renderContent(): void {
     const content = root.querySelector<HTMLElement>("[data-content]");
-    if (content) content.innerHTML = renderView(state);
+    if (!content) return;
+    const previousInbox = root.querySelector<HTMLElement>("[data-evidence-inbox]");
+    const scrollTop = previousInbox?.scrollTop ?? 0;
+    content.innerHTML = renderView(state);
+    const nextInbox = root.querySelector<HTMLElement>("[data-evidence-inbox]");
+    if (nextInbox && scrollTop > 0) nextInbox.scrollTop = scrollTop;
   }
 
   function replaceTask(task: VideoTask): void {
@@ -339,6 +584,16 @@ async function loadCollection<T>(load: () => Promise<ApiList<T>>): Promise<Colle
     return { items: (await load()).items };
   } catch (error) {
     return { items: null, error: messageFromError(error) };
+  }
+}
+
+async function loadBlacklistSettings(api: ApiClient): Promise<{ value: BlacklistSettings | null; error?: string }> {
+  const method = (api as unknown as { getBlacklistSettings?: () => Promise<BlacklistSettings> }).getBlacklistSettings;
+  if (!method) return { value: null };
+  try {
+    return { value: await method.call(api) };
+  } catch (error) {
+    return { value: null, error: messageFromError(error) };
   }
 }
 
@@ -391,7 +646,7 @@ function renderView(state: ManagementState): string {
     case "samples":
       return renderSamples(state);
     case "blacklist":
-      return renderBlacklist(state);
+      return `${renderBlacklistControlStatus(state.blacklistSettings, state.blacklistSettingsError, false)}${renderBlacklist(state)}`;
   }
 }
 
@@ -414,6 +669,7 @@ function renderDashboard(state: ManagementState): string {
       ${renderTaskForm()}
     </section>
     ${renderAuthDiagnostic(state.auth)}
+    ${renderBlacklistControlStatus(state.blacklistSettings, state.blacklistSettingsError, true)}
     <section class="stat-grid" aria-label="工作区统计">
       ${renderStat("视频任务", taskItems ? String(taskItems.length) : "未加载", "任务列表")}
       ${renderStat("本地 UID", uidItems ? String(uidItems.length) : "未加载", "名单权威在本机服务")}
@@ -422,8 +678,23 @@ function renderDashboard(state: ManagementState): string {
     </section>
     <div class="dashboard-columns">
       <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">任务阶段</p><h3>最近视频任务</h3></div><button class="button button-ghost" data-view="tasks" type="button">查看全部</button></div>${renderTaskCollection(state.tasks, "dashboard", "", state.taskDetails)}</section>
-      <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">需要判断</p><h3>待复核 UID</h3></div><button class="button button-ghost" data-view="reviews" type="button">打开证据</button></div>${renderEvidenceCollection(state.evidence, "dashboard")}</section>
+      <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">需要判断</p><h3>待复核 UID</h3></div><button class="button button-ghost" data-view="reviews" type="button">打开证据</button></div>${renderEvidenceCollection(state, "dashboard")}</section>
     </div>`;
+}
+
+function renderBlacklistControlStatus(
+  settings: BlacklistSettings | null,
+  error: string | undefined,
+  readonly: boolean,
+): string {
+  if (!settings) {
+    return `<section class="workspace-section blacklist-control" data-control-readonly="${readonly}"><div class="section-heading"><div><p class="eyebrow">官方动作总开关</p><h3>自动执行官方拉黑</h3></div><span class="status-pill" data-state="error">暂不可读取</span></div><p class="muted">${escapeHtml(error ?? "本机服务尚未返回开关状态")}</p></section>`;
+  }
+  const enabledLabel = settings.enabled ? "已开启 · 命中后排入官方拉黑队列" : "已关闭 · 仅本地隐藏";
+  const control = readonly
+    ? `<span class="status-pill" data-state="${settings.enabled ? "ready" : "paused"}">${settings.enabled ? "已开启" : "已关闭"}</span>`
+    : `<label class="switch-control"><input type="checkbox" name="autoBlacklistEnabled" ${settings.enabled ? "checked" : ""} /><span class="switch-track" aria-hidden="true"></span><span>${settings.enabled ? "开启" : "关闭"}</span></label>`;
+  return `<section class="workspace-section blacklist-control" data-control-readonly="${readonly}"><div class="section-heading"><div><p class="eyebrow">官方动作总开关</p><h3>自动执行官方拉黑</h3></div>${control}</div><p class="blacklist-control-mode">${enabledLabel}</p><p class="muted">本地隐藏始终立即生效；${settings.enabled ? "新命中会进入官方队列，已有 queued 项继续消费。" : "不会创建或消费新的官方拉黑任务。已有队列项会保留。"}</p></section>`;
 }
 
 function renderAuthDiagnostic(session: AuthSession | null): string {
@@ -455,7 +726,17 @@ function renderUids(state: ManagementState): string {
 
 function renderReviews(state: ManagementState): string {
   const filter = state.filters.reviews ?? "";
-  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">完整证据</p><h3>判定复核</h3></div>${renderFilter("reviews", "搜索 UID、评论或来源视频", filter)}</div>${renderEvidenceCollection(state.evidence, "reviews", filter)}<div class="list-heading"><h3>复核历史</h3></div>${renderReviewHistory(state.reviewActions, filter)}</section>`;
+  const selected = state.evidence.items?.find((item) => item.evidenceId === state.selectedEvidenceId);
+  const reviewStatusLabels = {
+    pending: "待复核收件箱",
+    history: "复核历史证据",
+    all: "全部证据",
+  } as const;
+  const statusSelector = `<label class="review-status-filter">证据范围<select name="reviewStatus">${Object.entries(reviewStatusLabels).map(([value, label]) => `<option value="${value}" ${state.reviewStatus === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>`;
+  const description = state.reviewStatus === "pending"
+    ? "完成一项复核后，证据会从收件箱移出，并保留在下方复核历史。"
+    : "历史与全部视图用于回看已处理证据；主要动作只在待复核收件箱提供。";
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">${reviewStatusLabels[state.reviewStatus]}</p><h3>判定复核</h3><p class="muted">${description}</p></div><div class="review-heading-controls">${statusSelector}${renderFilter("reviews", "搜索 UID、评论或来源视频", filter)}</div></div><div class="review-workbench">${renderEvidenceCollection(state, "reviews", filter)}${renderEvidenceInspector(selected, state)}</div><div class="list-heading"><h3>复核历史</h3></div>${renderReviewHistory(state.reviewActions, filter, state.evidenceFeedback)}</section>`;
 }
 
 function renderSamples(state: ManagementState): string {
@@ -470,7 +751,7 @@ function renderBlacklist(state: ManagementState): string {
 }
 
 function renderTaskForm(): string {
-  return `<form class="task-form" data-form="task"><label>视频 URL<input name="videoUrl" type="url" placeholder="https://www.bilibili.com/video/BV..." required /></label><label>BVID<input name="bvid" placeholder="可从 URL 自动提取" /></label><label>标题快照<input name="title" placeholder="可选" /></label><button class="button button-primary" type="submit">创建视频任务</button></form>`;
+  return `<form class="task-form" data-form="task"><label>视频 URL<input name="videoUrl" type="url" placeholder="https://www.bilibili.com/video/BV..." required /></label><label>BVID<input name="bvid" placeholder="可从 URL 自动提取" /></label><p class="muted">任务名称将从 B 站视频元数据读取，浏览器页签标题不会作为原标题保存。</p><button class="button button-primary" type="submit">创建视频任务</button></form>`;
 }
 
 function renderTaskCollection(collection: Collection<VideoTask>, view: "dashboard" | "tasks", filter = "", taskDetails: Record<string, TaskDetailState> = {}): string {
@@ -530,18 +811,146 @@ function renderUidCollection(collection: Collection<UidRecord>, filter: string):
   return `<div class="list">${items.map((item) => `<article class="list-row"><div class="row-main"><strong class="mono">${escapeHtml(item.uid)}</strong><span>${escapeHtml(item.nicknameSnapshot || "无昵称快照")}</span><small>更新于 ${escapeHtml(item.updatedAt || "未提供")}</small></div><div class="row-actions"><span class="status-pill" data-state="${item.status}">${uidStatusLabel(item.status)}${item.hidden ? " · 本地隐藏" : ""}</span>${item.hidden ? `<button class="button button-ghost" data-revoke-uid="${escapeHtml(item.uid)}" type="button">撤销隐藏</button>` : ""}</div></article>`).join("")}</div>`;
 }
 
-function renderEvidenceCollection(collection: Collection<Evidence>, view: "dashboard" | "reviews", filter = ""): string {
-  if (collection.items === null) return collection.error ? renderState("error", "证据加载失败", collection.error) : renderState("loading", "正在载入证据", "");
-  const items = collection.items.filter((item) => `${item.uid} ${item.commentText} ${item.sourceVideo ?? ""}`.toLowerCase().includes(filter.toLowerCase()));
-  if (items.length === 0) return renderState(filter ? "filtered-empty" : "empty", filter ? "当前筛选没有匹配证据" : "还没有待复核 UID", filter ? "清除筛选或回到完整集合" : "不确定结果会在这里等待判断");
-  return `<div class="evidence-list">${items.slice(0, view === "dashboard" ? 4 : undefined).map(renderEvidenceRow).join("")}</div>`;
+function renderEvidenceCollection(state: ManagementState, view: "dashboard" | "reviews", filter = ""): string {
+  const items = filteredEvidenceItems(state.evidence, filter);
+  const isInbox = view === "reviews" && state.reviewStatus === "pending";
+  if (items === null) {
+    return state.evidence.error
+      ? renderState("error", "证据加载失败", state.evidence.error)
+      : renderState("loading", "正在载入证据", "");
+  }
+  if (items.length === 0) {
+    const emptyState = renderState(
+      filter ? "filtered-empty" : "empty",
+      filter ? "当前筛选没有匹配证据" : "待复核收件箱为空",
+      filter ? "清除筛选或回到完整集合" : "已处理证据会保留在下方复核历史",
+    );
+    if (!isInbox) return emptyState;
+    return `<div class="evidence-inbox" data-evidence-inbox><div class="evidence-inbox-heading"><span>待处理收件箱 · 0 条证据</span></div>${renderEvidenceInboxToolbar(state, items)}${emptyState}</div>`;
+  }
+  const visibleItems = view === "dashboard" ? items.slice(0, 4) : items;
+  const toolbar = isInbox ? renderEvidenceInboxToolbar(state, items) : "";
+  return `<div class="evidence-inbox" data-evidence-inbox><div class="evidence-inbox-heading"><span>${view === "reviews" ? `当前筛选 ${items.length} 条证据` : `最近 ${visibleItems.length} 条证据`}</span>${view === "dashboard" ? `<span class="muted">主要字段已直接显示</span>` : ""}</div>${toolbar}<div class="evidence-list">${visibleItems.map((item) => renderEvidenceRow(item, state, view)).join("")}</div></div>`;
 }
 
-function renderEvidenceRow(evidence: Evidence): string {
-  return `<details class="evidence-row"><summary><span><strong class="mono">${escapeHtml(evidence.uid)}</strong> ${escapeHtml(evidence.nicknameSnapshot || "无昵称快照")}</span><span class="status-pill" data-state="${evidence.result === "hit" ? "ready" : "processing"}">${evidence.result === "hit" ? "命中" : "不确定"}</span></summary><div class="evidence-body"><p class="evidence-comment">${escapeHtml(evidence.commentText)}</p><dl><div><dt>楼层上下文</dt><dd>${escapeHtml(evidence.threadContext ?? "未提供")}</dd></div><div><dt>来源视频</dt><dd>${evidence.sourceVideo ? `<a href="${escapeAttribute(evidence.sourceVideo)}" target="_blank" rel="noreferrer">${escapeHtml(evidence.sourceVideo)}</a>` : "未提供"}</dd></div><div><dt>评论链接</dt><dd>${evidence.commentUrl ? `<a href="${escapeAttribute(evidence.commentUrl)}" target="_blank" rel="noreferrer">打开来源</a>` : "未提供"}</dd></div><div><dt>命中信号</dt><dd>${escapeHtml(evidence.signal ?? "未提供")}</dd></div><div><dt>模型理由</dt><dd>${escapeHtml(evidence.modelReason ?? "未提供")}</dd></div><div><dt>模型版本</dt><dd class="mono">${escapeHtml(evidence.modelVersion ?? "未提供")}</dd></div></dl><div class="action-row"><button class="button button-quiet" data-review-action="keep" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">保留判定</button><button class="button button-quiet" data-review-action="revoke" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">撤销隐藏</button><button class="button button-quiet" data-review-action="hide-only" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">仅保留隐藏</button><button class="button button-danger" data-review-action="exception" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">加入例外</button><button class="button button-ghost" data-review-action="positive-sample" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button">标记显著样例</button></div></div></details>`;
+function filteredEvidenceItems(collection: Collection<Evidence>, filter: string): Evidence[] | null {
+  if (collection.items === null) return null;
+  const normalizedFilter = filter.toLowerCase();
+  return collection.items.filter((item) => (
+    `${item.uid} ${item.nicknameSnapshot} ${item.commentText} ${item.sourceVideo ?? ""} ${item.videoId} ${item.signals.join(" ")}`
+      .toLowerCase()
+      .includes(normalizedFilter)
+  ));
 }
 
-function renderReviewHistory(collection: Collection<ReviewRecord>, filter: string): string {
+function renderEvidenceInboxToolbar(state: ManagementState, items: Evidence[]): string {
+  const visibleIds = new Set(items.map((item) => item.evidenceId));
+  const selectedIds = state.selectedEvidenceIds.filter((evidenceId) => visibleIds.has(evidenceId));
+  const selectedCount = selectedIds.length;
+  const uidCount = selectedEvidenceUidCount(state, selectedIds);
+  const allSelected = items.length > 0 && items.every((item) => selectedIds.includes(item.evidenceId));
+  const hasBusySelection = selectedIds.some((evidenceId) => state.evidenceFeedback[evidenceId]?.status === "busy");
+  const feedback = state.reviewBatchFeedback
+    ? `<span class="evidence-batch-feedback" data-state="${state.reviewBatchFeedback.status}">${escapeHtml(state.reviewBatchFeedback.message)}</span>`
+    : "";
+  const blacklistDisabled = state.blacklistSettings?.enabled !== true;
+  const action = (value: ReviewAction, label: string, className = "button button-quiet", requiresBlacklist = false) => `<button class="${className}" data-review-batch-action="${value}" type="button" ${selectedCount === 0 || hasBusySelection || (requiresBlacklist && blacklistDisabled) ? "disabled" : ""}${requiresBlacklist && blacklistDisabled ? " title=\"请先在拉黑队列页面开启总开关\"" : ""}>${label}</button>`;
+  return `<div class="evidence-inbox-toolbar"><label class="evidence-select-all"><input type="checkbox" data-evidence-select-all="true" ${allSelected ? "checked" : ""} ${items.length === 0 ? "disabled" : ""} /><span>全选当前筛选（${items.length}）</span></label><span class="evidence-selection-summary">已选 ${selectedCount} 条证据 · ${uidCount} 个 UID</span><div class="evidence-batch-actions">${action("confirm", blacklistDisabled ? "批量确认官方拉黑（先开启总开关）" : "批量确认官方拉黑", "button button-primary", true)}${action("hide-only", "批量仅本地隐藏")}${action("revoke", "批量撤销隐藏", "button button-danger")}</div>${feedback}</div>`;
+}
+
+function selectedEvidenceUidCount(state: ManagementState, evidenceIds: string[]): number {
+  return new Set(
+    evidenceIds
+      .map((evidenceId) => state.evidence.items?.find((item) => item.evidenceId === evidenceId)?.uid)
+      .filter((uid): uid is string => Boolean(uid)),
+  ).size;
+}
+
+function renderEvidenceRow(evidence: Evidence, state: ManagementState, view: "dashboard" | "reviews"): string {
+  const selected = state.selectedEvidenceIds.includes(evidence.evidenceId);
+  const human = evidenceHumanState(evidence, state);
+  const feedback = state.evidenceFeedback[evidence.evidenceId];
+  const isInbox = view === "reviews" && state.reviewStatus === "pending";
+  const selection = isInbox
+    ? `<label class="evidence-row-checkbox"><span class="sr-only">选择 ${escapeHtml(evidence.uid)}</span><input type="checkbox" data-evidence-select-toggle="${escapeHtml(evidence.evidenceId)}" ${selected ? "checked" : ""} ${feedback?.status === "busy" ? "disabled" : ""} /></label>`
+    : "";
+  const inspectButton = view === "reviews"
+    ? `<button class="button button-ghost evidence-inspect-button" data-evidence-select="${escapeHtml(evidence.evidenceId)}" type="button">${state.selectedEvidenceId === evidence.evidenceId ? "已选中详情" : "查看详情"}</button>`
+    : `<button class="button button-ghost evidence-inspect-button" data-view="reviews" type="button">去复核</button>`;
+  const actions = isInbox ? renderEvidenceActionControls(evidence, state) : "";
+  return `<article class="evidence-row ${selected ? "is-selected" : ""}" data-evidence-row="${escapeHtml(evidence.evidenceId)}"><div class="evidence-row-layout">${selection}<div class="evidence-row-content"><div class="evidence-row-heading"><div class="evidence-identity"><strong class="mono">${escapeHtml(evidence.uid)}</strong><span>${escapeHtml(evidence.nicknameSnapshot || "无昵称快照")}</span></div><div class="evidence-statuses"><span class="status-pill" data-state="${evidence.result === "hit" ? "ready" : "processing"}">AI · ${evidence.result === "hit" ? "命中" : "不确定"}</span><span class="status-pill" data-state="${human.state}">人工 · ${escapeHtml(human.label)}</span></div></div><div class="evidence-row-meta"><span class="mono">置信度 ${formatEvidenceConfidence(evidence.confidence)}</span><span>${escapeHtml(evidence.videoId || "来源视频未提供")}</span><span>${escapeHtml(evidence.createdAt || "时间未提供")}</span></div><p class="evidence-summary">${escapeHtml(evidence.commentText || "未提供评论摘要")}</p><div class="evidence-signal-line"><span class="muted">命中信号</span><span>${escapeHtml(evidence.signals.length > 0 ? evidence.signals.join(" · ") : evidence.signal ?? "未提供")}</span></div><div class="evidence-row-footer"><span class="muted">${escapeHtml(human.detail)}</span><div class="row-actions">${inspectButton}${actions}</div></div>${feedbackMarkup(evidence, feedback)}</div></div></article>`;
+}
+
+function renderEvidenceActionControls(evidence: Evidence, state: ManagementState): string {
+  const feedback = state.evidenceFeedback[evidence.evidenceId];
+  const disabled = feedback?.status === "busy" ? "disabled" : "";
+  const blacklistDisabled = state.blacklistSettings?.enabled !== true;
+  const button = (action: ReviewAction, label: string, className = "button button-quiet", requiresBlacklist = false) => `<button class="${className}" data-review-action="${action}" data-evidence-id="${escapeHtml(evidence.evidenceId)}" type="button" ${disabled || (requiresBlacklist && blacklistDisabled) ? "disabled" : ""}${requiresBlacklist && blacklistDisabled ? " title=\"请先在拉黑队列页面开启总开关\"" : ""}>${label}</button>`;
+  return `${button("confirm", blacklistDisabled ? "确认官方拉黑（先开启总开关）" : "确认官方拉黑", "button button-primary", true)}${button("hide-only", "仅本地隐藏")}${button("revoke", "撤销本地隐藏", "button button-quiet")}<details class="more-menu"><summary>更多操作</summary><div class="more-menu-items">${button("exception", "加入例外", "button button-danger")}${button("positive-sample", "标记显著样例", "button button-ghost")}</div></details>`;
+}
+
+function feedbackMarkup(evidence: Evidence, feedback: ReviewFeedback | undefined): string {
+  if (!feedback) return "";
+  if (feedback.status === "busy") {
+    return `<span class="evidence-feedback" data-state="processing" data-evidence-busy="${escapeHtml(evidence.evidenceId)}">处理中 · ${escapeHtml(reviewActionLabel(feedback.action))}</span>`;
+  }
+  return `<span class="evidence-feedback" data-state="${feedback.status === "success" ? "ready" : "error"}">${escapeHtml(feedback.message ?? (feedback.status === "success" ? "已记录" : "操作失败"))}</span>`;
+}
+
+function evidenceHumanState(evidence: Evidence, state: ManagementState): { label: string; detail: string; state: string } {
+  const latest = (state.reviewActions.items ?? [])
+    .filter((item) => item.evidenceId === evidence.evidenceId)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+  if (latest) {
+    const mapped = {
+      keep: { label: "历史保留判定", detail: "历史记录中的保留判定，不会触发官方拉黑", state: "info" },
+      confirm: { label: "已确认拉黑", detail: "人工已确认该 UID 进入官方拉黑流程", state: "ready" },
+      revoke: { label: "已撤销", detail: "人工已撤销本地隐藏", state: "error" },
+      "hide-only": { label: "仅隐藏", detail: "人工保留本地隐藏，不进入官方动作", state: "info" },
+      exception: { label: "例外", detail: "人工已加入例外名单", state: "info" },
+      "positive-sample": { label: "已标记样例", detail: "人工已沉淀为显著样例", state: "info" },
+    } as Record<ReviewAction, { label: string; detail: string; state: string }>;
+    return mapped[latest.action];
+  }
+  const uid = state.uids.items?.find((item) => item.uid === evidence.uid);
+  if (!uid) return { label: "未复核", detail: "等待人工复核", state: "info" };
+  if (uid.status === "queued") return { label: "未复核", detail: "本地隐藏已生效 · 官方拉黑已排队", state: "info" };
+  if (uid.status === "blocked") return { label: "未复核", detail: "本地隐藏已生效 · 官方拉黑已完成", state: "ready" };
+  return { label: "未复核", detail: "本地隐藏已生效 · 等待人工复核", state: "info" };
+}
+
+function formatEvidenceConfidence(value: number | undefined): string {
+  if (value === undefined) return "未提供";
+  const percent = value >= 0 && value <= 1 ? value * 100 : value;
+  return `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%`;
+}
+
+function renderEvidenceInspector(evidence: Evidence | undefined, state: ManagementState): string {
+  if (!evidence) {
+    return `<aside class="evidence-inspector evidence-inspector-empty" data-evidence-inspector><p class="eyebrow">详情检查器</p><h4>选择一条证据</h4><p class="muted">列表直接承担主要复核；选中后，这里显示完整评论、楼层上下文和模型证据。</p></aside>`;
+  }
+  const human = evidenceHumanState(evidence, state);
+  const comments = evidence.comments.length > 0
+    ? evidence.comments.map(renderEvidenceComment).join("")
+    : `<li class="evidence-thread-item"><p>${escapeHtml(evidence.commentText || "未提供评论正文")}</p><span class="muted">未提供完整评论数组</span></li>`;
+  return `<aside class="evidence-inspector" data-evidence-inspector><div class="evidence-inspector-heading"><div><p class="eyebrow">详情检查器</p><h4>${escapeHtml(evidence.uid)} · ${escapeHtml(evidence.nicknameSnapshot || "无昵称快照")}</h4></div><button class="button button-ghost" data-evidence-close="true" type="button">关闭详情</button></div><div class="evidence-inspector-status"><span class="status-pill" data-state="${evidence.result === "hit" ? "ready" : "processing"}">AI · ${evidence.result === "hit" ? "命中" : "不确定"} · ${formatEvidenceConfidence(evidence.confidence)}</span><span class="status-pill" data-state="${human.state}">人工 · ${escapeHtml(human.label)}</span></div><section class="evidence-inspector-section"><h5>完整评论与楼层上下文</h5><ol class="evidence-thread">${comments}</ol></section><section class="evidence-inspector-section"><h5>判定证据</h5><dl><div><dt>来源视频</dt><dd>${evidence.sourceVideo ? `<a href="${escapeAttribute(evidence.sourceVideo)}" target="_blank" rel="noreferrer">${escapeHtml(evidence.videoId || evidence.sourceVideo)}</a>` : escapeHtml(evidence.videoId || "未提供")}</dd></div><div><dt>评论链接</dt><dd>${evidence.commentUrl ? `<a href="${escapeAttribute(evidence.commentUrl)}" target="_blank" rel="noreferrer">打开评论原址</a>` : "未提供"}</dd></div><div><dt>命中信号</dt><dd>${escapeHtml(evidence.signals.length > 0 ? evidence.signals.join(" · ") : evidence.signal ?? "未提供")}</dd></div><div><dt>模型理由</dt><dd>${escapeHtml(evidence.modelReason ?? "未提供")}</dd></div><div><dt>模型版本</dt><dd class="mono">${escapeHtml(evidence.modelVersion ?? "未提供")}</dd></div><div><dt>样本版本</dt><dd class="mono">${escapeHtml(evidence.sampleVersion ?? "未使用")}</dd></div><div><dt>规则版本</dt><dd class="mono">${escapeHtml(evidence.ruleVersion ?? "未提供")}</dd></div><div><dt>判定时间</dt><dd>${escapeHtml(evidence.createdAt || "未提供")}</dd></div></dl></section><div class="action-row evidence-inspector-actions">${renderEvidenceActionControls(evidence, state)}</div>${feedbackMarkup(evidence, state.evidenceFeedback[evidence.evidenceId])}</aside>`;
+}
+
+function renderEvidenceComment(comment: TaskComment): string {
+  const context = comment.context.length > 0
+    ? `<div class="evidence-comment-context"><span>楼层上下文</span><p>${escapeHtml(comment.context.join("\n"))}</p></div>`
+    : "";
+  const source = comment.commentUrl
+    ? `<a href="${escapeAttribute(comment.commentUrl)}" target="_blank" rel="noreferrer">打开评论原址</a>`
+    : "评论链接未提供";
+  return `<li class="evidence-thread-item" data-level="${escapeAttribute(comment.level)}"><div class="evidence-comment-meta"><strong>${escapeHtml(comment.nickname || "无昵称")}</strong><span class="mono">${escapeHtml(comment.uid || "未知 UID")}</span><span class="status-pill" data-state="info">${comment.parentId ? "楼中楼" : "根评论"}</span></div><p class="evidence-comment-full">${escapeHtml(comment.content || "未提供评论正文")}</p>${context}<small>${source}</small></li>`;
+}
+
+function renderReviewHistory(
+  collection: Collection<ReviewRecord>,
+  filter: string,
+  feedbackByEvidence: Record<string, ReviewFeedback> = {},
+): string {
   if (collection.items === null) {
     return collection.error
       ? renderState("error", "复核历史加载失败", collection.error)
@@ -559,7 +968,7 @@ function renderReviewHistory(collection: Collection<ReviewRecord>, filter: strin
       filter ? "清除筛选或查看完整历史" : "对证据执行操作后会在这里留下历史",
     );
   }
-  return `<div class="list">${items.map((item) => `<article class="list-row"><div class="row-main"><strong class="mono">${escapeHtml(item.uid)}</strong><span>${reviewActionLabel(item.action)} · ${escapeHtml(item.actor ?? "local-user")}</span><small>${escapeHtml(item.createdAt || "未提供")} · 证据 ${escapeHtml(item.evidenceId)}</small></div><div class="row-actions"><span class="status-pill" data-state="info">${escapeHtml(item.previousStatus ?? "无")} → ${escapeHtml(item.nextStatus ?? "无")}</span></div></article>`).join("")}</div>`;
+  return `<div class="list">${items.map((item) => { const feedback = feedbackByEvidence[item.evidenceId]; const feedbackMarkup = feedback?.status === "success" ? `<span class="evidence-feedback" data-state="ready" data-evidence-feedback="${escapeHtml(item.evidenceId)}">${escapeHtml(feedback.message ?? "已移入复核历史")}</span>` : ""; return `<article class="list-row"><div class="row-main"><strong class="mono">${escapeHtml(item.uid)}</strong><span>${reviewActionLabel(item.action)} · ${escapeHtml(item.actor ?? "local-user")}</span><small>${escapeHtml(item.createdAt || "未提供")} · 证据 ${escapeHtml(item.evidenceId)}</small>${feedbackMarkup}</div><div class="row-actions"><span class="status-pill" data-state="info">${escapeHtml(item.previousStatus ?? "无")} → ${escapeHtml(item.nextStatus ?? "无")}</span></div></article>`; }).join("")}</div>`;
 }
 
 function renderSampleCollection(collection: Collection<SampleSet>, expanded: Record<string, boolean> = {}): string {
@@ -695,7 +1104,8 @@ function sampleSourceLabel(source: SampleItem["source"]): string {
 
 function reviewActionLabel(action: ReviewAction): string {
   return ({
-    keep: "保留判定",
+    keep: "历史保留判定",
+    confirm: "确认官方拉黑",
     revoke: "撤销隐藏",
     "hide-only": "仅保留隐藏",
     exception: "加入例外",
