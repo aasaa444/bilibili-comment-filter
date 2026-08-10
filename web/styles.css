@@ -680,6 +680,47 @@ a { color: var(--primary); }
 
 .preview-count { color: var(--secondary); font-size: 12px; }
 
+.sample-current {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin: 20px 0 12px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--success) 45%, var(--border));
+  background: color-mix(in srgb, var(--success) 8%, transparent);
+}
+
+.sample-current span { color: var(--secondary); font-size: 12px; }
+.sample-current-empty { border-color: var(--border); background: transparent; }
+.sample-current-empty strong { color: var(--secondary); }
+
+.sample-row { align-items: flex-start; flex-wrap: wrap; }
+.sample-row .row-main { flex: 1 1 460px; }
+.sample-row-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.sample-preview-list,
+.sample-details ol {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--secondary);
+  font-size: 12px;
+}
+
+.sample-preview-list li { display: flex; gap: 6px; align-items: baseline; }
+.sample-preview-list .status-pill { flex: 0 0 auto; }
+.sample-details {
+  flex: 1 1 100%;
+  padding: 12px 0 2px 24px;
+  border-top: 1px solid var(--border);
+}
+
+.sample-detail-item { display: flex; gap: 10px; }
+.sample-detail-index { color: var(--muted); font-family: "Cascadia Mono", Consolas, monospace; }
+.sample-detail-item p { margin: 0; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.sample-detail-item small { color: var(--muted); }
+
 .state-block {
   display: grid;
   gap: 4px;

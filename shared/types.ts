@@ -110,17 +110,21 @@ export interface ReviewRecord {
 }
 
 export type SampleKind = "comment-positive" | "comment-negative" | "nickname-positive";
+export type SampleSetKind = "comment" | "nickname" | "mixed";
 
 export interface SampleItem {
   text: string;
   kind: SampleKind;
+  label?: string;
   source?: "manual" | "file" | "review";
 }
 
 export interface SampleSet {
   sampleId: string;
+  kind: SampleSetKind;
   version: number;
   status: "draft" | "published" | "disabled";
+  isCurrent: boolean;
   items: SampleItem[];
   createdAt: string;
   publishedAt?: string;

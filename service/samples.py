@@ -9,6 +9,14 @@ from .db import Database
 
 
 @dataclass(frozen=True)
+class NewSampleItem:
+    content: str
+    label: str | None = None
+    kind: str | None = None
+    source: str = "manual"
+
+
+@dataclass(frozen=True)
 class SampleRecord:
     sample_id: str
     kind: str
@@ -19,6 +27,7 @@ class SampleRecord:
     duplicate_count: int
     created_at: datetime
     published_at: datetime | None
+    is_current: bool
 
 
 class SampleStore:
@@ -32,44 +41,115 @@ class SampleStore:
         *,
         kind: str,
         label: str,
-        items: list[tuple[str, str | None]],
+        items: list[NewSampleItem | tuple[str, str | None]],
+        source: str = "manual",
     ) -> SampleRecord:
-        normalized: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        duplicate_count = 0
-        for content, item_label in items:
+        candidates: list[tuple[str, str, str, str]] = []
+        has_non_empty_input = False
+        default_kind = self._storage_kind(kind)
+        default_source = self._storage_source(source)
+        normalized_label = label.strip() or "positive"
+        for item in items:
+            if isinstance(item, NewSampleItem):
+                content = item.content
+                item_label = item.label
+                item_kind = item.kind or default_kind
+                item_source = item.source
+            else:
+                content, item_label = item
+                item_kind = default_kind
+                item_source = default_source
             value = content.strip()
-            effective_label = (item_label or label).strip() or label
-            key = (effective_label, value)
             if not value:
                 continue
-            if key in seen:
-                duplicate_count += 1
-                continue
-            seen.add(key)
-            normalized.append(key)
-        if not normalized:
+            has_non_empty_input = True
+            candidates.append(
+                (
+                    value,
+                    (item_label or normalized_label).strip() or normalized_label,
+                    self._storage_kind(item_kind),
+                    self._storage_source(item_source),
+                )
+            )
+        if not has_non_empty_input:
             raise ValueError("At least one non-empty sample is required")
 
+        normalized: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        duplicate_count = 0
         timestamp = datetime.now(UTC)
         sample_id = uuid4().hex
-        version = f"samples-v{self._next_version()}"
         with self.database.transaction() as connection:
+            current_row = connection.execute(
+                """
+                SELECT * FROM sample_sets
+                WHERE status = 'published'
+                ORDER BY published_at DESC, sample_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if current_row is not None:
+                inherited_rows = connection.execute(
+                    """
+                    SELECT * FROM sample_items
+                    WHERE sample_id = ?
+                    ORDER BY rowid
+                    """,
+                    (current_row["sample_id"],),
+                ).fetchall()
+                for item_row in inherited_rows:
+                    value = str(item_row["content"]).strip()
+                    if not value:
+                        continue
+                    self._append_unique(
+                        normalized,
+                        seen,
+                        (
+                            value,
+                            str(item_row["label"]).strip() or normalized_label,
+                            self._storage_kind(item_row["kind"] or current_row["kind"]),
+                            self._storage_source(item_row["source"]),
+                        ),
+                    )
+            for candidate in candidates:
+                value, effective_label, candidate_kind, candidate_source = candidate
+                key = self._dedupe_key(value, effective_label, candidate_kind)
+                if key in seen:
+                    duplicate_count += 1
+                    continue
+                self._append_unique(
+                    normalized,
+                    seen,
+                    (value, effective_label, candidate_kind, candidate_source),
+                )
+            if not normalized:
+                raise ValueError("At least one non-empty sample is required")
+
+            version = f"samples-v{self._next_version()}"
+            sample_kind = self._record_kind(item[2] for item in normalized)
             connection.execute(
                 """
                 INSERT INTO sample_sets
                     (sample_id, kind, version, status, created_at)
                 VALUES (?, ?, ?, 'draft', ?)
                 """,
-                (sample_id, kind, version, timestamp.isoformat()),
+                (sample_id, sample_kind, version, timestamp.isoformat()),
             )
-            for content_label, value in normalized:
+            for value, content_label, item_kind, item_source in normalized:
                 connection.execute(
                     """
-                    INSERT INTO sample_items (item_id, sample_id, label, content)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO sample_items
+                        (item_id, sample_id, kind, label, content, source)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (uuid4().hex, sample_id, content_label, value),
+                    (
+                        uuid4().hex,
+                        sample_id,
+                        item_kind,
+                        content_label,
+                        value,
+                        item_source,
+                    ),
                 )
         return self.get(sample_id, duplicate_count=duplicate_count)
 
@@ -95,8 +175,15 @@ class SampleStore:
             ).fetchone()
             if row is None:
                 raise KeyError(sample_id)
+            if row["status"] != "draft":
+                raise ValueError("Only draft sample versions can be published")
             connection.execute(
-                "UPDATE sample_sets SET status = 'disabled' WHERE status = 'published'"
+                """
+                UPDATE sample_sets
+                SET status = 'disabled', retired_at = ?
+                WHERE status = 'published'
+                """,
+                (timestamp,),
             )
             connection.execute(
                 """
@@ -123,7 +210,11 @@ class SampleStore:
         return SampleSet(record.version, record.items)
 
     def add_review_sample(self, *, content: str, kind: str = "comment") -> SampleRecord:
-        draft = self.create(kind=kind, label="positive", items=[(content, "positive")])
+        draft = self.create(
+            kind=kind,
+            label="positive",
+            items=[NewSampleItem(content, "positive", kind, "review")],
+        )
         return self.publish(draft.sample_id)
 
     def _next_version(self) -> int:
@@ -143,22 +234,63 @@ class SampleStore:
         items = tuple(
             SampleItem(
                 sample_id=item_row["item_id"],
-                kind="nickname" if row["kind"] == "nickname" else "comment",
+                kind=self._storage_kind(item_row["kind"] or row["kind"]),
                 label=item_row["label"],
                 content=item_row["content"],
+                source=self._storage_source(item_row["source"]),
             )
             for item_row in item_rows
         )
         return SampleRecord(
             sample_id=row["sample_id"],
-            kind=row["kind"],
+            kind=self._record_kind(item.kind for item in items),
             version=str(row["version"]),
             status=row["status"],
-            label=items[0].label if items else "positive",
+            label=self._record_label(item.label for item in items),
             items=items,
             duplicate_count=duplicate_count,
             created_at=datetime.fromisoformat(row["created_at"]),
             published_at=(
                 datetime.fromisoformat(row["published_at"]) if row["published_at"] else None
             ),
+            is_current=row["status"] == "published",
         )
+
+    @staticmethod
+    def _append_unique(
+        normalized: list[tuple[str, str, str, str]],
+        seen: set[tuple[str, str, str]],
+        item: tuple[str, str, str, str],
+    ) -> None:
+        value, item_label, item_kind, _ = item
+        key = SampleStore._dedupe_key(value, item_label, item_kind)
+        if key in seen:
+            return
+        seen.add(key)
+        normalized.append(item)
+
+    @staticmethod
+    def _dedupe_key(value: str, label: str, item_kind: str) -> tuple[str, str, str]:
+        return item_kind, label, value
+
+    @staticmethod
+    def _storage_kind(value: object) -> str:
+        return "nickname" if str(value) in {"nickname", "nickname-positive"} else "comment"
+
+    @staticmethod
+    def _storage_source(value: object) -> str:
+        return str(value) if str(value) in {"manual", "file", "review"} else "manual"
+
+    @staticmethod
+    def _record_kind(kinds: object) -> str:
+        values = set(str(kind) for kind in kinds)
+        if len(values) == 1:
+            return next(iter(values))
+        return "mixed" if values else "comment"
+
+    @staticmethod
+    def _record_label(labels: object) -> str:
+        values = set(str(label) for label in labels)
+        if len(values) == 1:
+            return next(iter(values))
+        return "mixed" if values else "positive"

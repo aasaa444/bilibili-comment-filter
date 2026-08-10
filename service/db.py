@@ -135,9 +135,11 @@ CREATE TABLE IF NOT EXISTS sample_sets (
 CREATE TABLE IF NOT EXISTS sample_items (
     item_id TEXT PRIMARY KEY,
     sample_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'comment',
     label TEXT NOT NULL,
     content TEXT NOT NULL,
-    UNIQUE (sample_id, label, content),
+    source TEXT NOT NULL DEFAULT 'manual',
+    UNIQUE (sample_id, kind, label, content),
     FOREIGN KEY (sample_id) REFERENCES sample_sets(sample_id)
 );
 
@@ -186,6 +188,7 @@ class Database:
         self._connection.executescript(SCHEMA)
         self._migrate_video_tasks()
         self._migrate_task_checkpoints()
+        self._migrate_sample_items()
         self._connection.commit()
         self.recover_blacklist_processing()
 
@@ -213,6 +216,75 @@ class Database:
                 self.connection.execute(
                     f"ALTER TABLE task_checkpoints ADD COLUMN {name} {definition}"
                 )
+
+    def _migrate_sample_items(self) -> None:
+        columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(sample_items)")
+        }
+        if "kind" not in columns:
+            self.connection.execute("ALTER TABLE sample_items ADD COLUMN kind TEXT")
+        if "source" not in columns:
+            self.connection.execute(
+                "ALTER TABLE sample_items ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+            )
+        self.connection.execute(
+            """
+            UPDATE sample_items
+            SET kind = CASE
+                WHEN (
+                    SELECT kind FROM sample_sets
+                    WHERE sample_sets.sample_id = sample_items.sample_id
+                ) = 'nickname' THEN 'nickname'
+                ELSE 'comment'
+            END
+            WHERE kind IS NULL OR kind = ''
+            """
+        )
+        if self._sample_items_have_legacy_unique_constraint():
+            self.connection.executescript(
+                """
+                CREATE TABLE sample_items_migrated (
+                    item_id TEXT PRIMARY KEY,
+                    sample_id TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'comment',
+                    label TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    UNIQUE (sample_id, kind, label, content),
+                    FOREIGN KEY (sample_id) REFERENCES sample_sets(sample_id)
+                );
+                INSERT INTO sample_items_migrated
+                    (item_id, sample_id, kind, label, content, source)
+                SELECT item_id, sample_id, COALESCE(kind, 'comment'), label, content,
+                       COALESCE(source, 'manual')
+                FROM sample_items AS legacy
+                WHERE legacy.rowid IN (
+                    SELECT MIN(rowid)
+                    FROM sample_items
+                    GROUP BY sample_id, COALESCE(kind, 'comment'), label, content
+                )
+                ORDER BY rowid;
+                DROP TABLE sample_items;
+                ALTER TABLE sample_items_migrated RENAME TO sample_items;
+                """
+            )
+
+    def _sample_items_have_legacy_unique_constraint(self) -> bool:
+        indexes = self.connection.execute("PRAGMA index_list(sample_items)").fetchall()
+        for index in indexes:
+            if not index["unique"]:
+                continue
+            index_name = str(index["name"]).replace('"', '""')
+            columns = self.connection.execute(
+                f'PRAGMA index_info("{index_name}")'
+            ).fetchall()
+            names = [str(column["name"]) for column in columns]
+            if names in (
+                ["sample_id", "label", "content"],
+                ["sample_id", "kind", "content"],
+            ):
+                return True
+        return False
 
     @property
     def connection(self) -> sqlite3.Connection:

@@ -8,6 +8,15 @@ from service.models import UidState
 from service.registry import UidRegistry
 
 
+class CapturingAnalyzer(FixedAnalyzer):
+    def __init__(self) -> None:
+        self.last_samples = ()
+
+    def analyze(self, accounts, samples):
+        self.last_samples = samples.items
+        return super().analyze(accounts, samples)
+
+
 def seeded_app():
     app = create_app(
         db_path=":memory:",
@@ -111,6 +120,153 @@ def test_negative_sample_response_keeps_negative_kind() -> None:
     assert response.json()["items"][0]["kind"] == "comment-negative"
 
 
+def test_new_sample_version_inherits_current_snapshot_and_preserves_mixed_items() -> None:
+    app, http, _ = seeded_app()
+
+    base = http.post(
+        "/api/samples",
+        json={"kind": "comment", "label": "positive", "text": "base comment"},
+    )
+    assert base.status_code == 201
+    assert http.post(f"/api/samples/{base.json()['sample_id']}/publish").status_code == 200
+
+    nickname = http.post(
+        "/api/samples",
+        json={"kind": "nickname", "label": "positive", "text": "hostile nickname"},
+    )
+    assert nickname.status_code == 201
+    assert nickname.json()["is_current"] is False
+    assert [item["kind"] for item in nickname.json()["items"]] == [
+        "comment-positive",
+        "nickname-positive",
+    ]
+    assert {item["text"] for item in nickname.json()["items"]} == {
+        "base comment",
+        "hostile nickname",
+    }
+    assert http.post(f"/api/samples/{nickname.json()['sample_id']}/publish").status_code == 200
+
+    next_draft = http.post(
+        "/api/samples",
+        json={
+            "kind": "comment",
+            "label": "positive",
+            "text": "base comment\nnew comment\nbase comment",
+        },
+    )
+
+    assert next_draft.status_code == 201
+    assert next_draft.json()["duplicate_count"] == 2
+    assert len(next_draft.json()["items"]) == 3
+    assert {item["text"] for item in next_draft.json()["items"]} == {
+        "base comment",
+        "hostile nickname",
+        "new comment",
+    }
+
+    published = http.post(f"/api/samples/{next_draft.json()['sample_id']}/publish")
+    assert published.status_code == 200
+    assert published.json()["is_current"] is True
+    assert http.post(f"/api/samples/{base.json()['sample_id']}/publish").status_code == 409
+
+    versions = http.get("/api/samples").json()["items"]
+    by_version = {item["version"]: item for item in versions}
+    assert by_version["samples-v1"]["status"] == "disabled"
+    assert by_version["samples-v1"]["items"][0]["text"] == "base comment"
+    assert by_version["samples-v2"]["status"] == "disabled"
+    assert len(by_version["samples-v2"]["items"]) == 2
+    assert by_version["samples-v3"]["status"] == "published"
+    assert len(by_version["samples-v3"]["items"]) == 3
+
+    current = app.state.sample_store.current()
+    assert current.version == "samples-v3"
+    assert {item.kind for item in current.items} == {"comment", "nickname"}
+    assert {item.content for item in current.items} == {
+        "base comment",
+        "hostile nickname",
+        "new comment",
+    }
+
+
+def test_sample_response_exposes_item_source_and_label() -> None:
+    _, http, _ = seeded_app()
+
+    response = http.post(
+        "/api/samples",
+        json={
+            "kind": "comment",
+            "label": "positive",
+            "items": [
+                {
+                    "content": "same imported body",
+                    "label": "positive",
+                    "kind": "comment",
+                    "source": "file",
+                },
+                {
+                    "content": "same imported body",
+                    "label": "negative",
+                    "kind": "comment",
+                    "source": "file",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["items"] == [
+        {
+            "text": "same imported body",
+            "content": "same imported body",
+            "kind": "comment-positive",
+            "label": "positive",
+            "source": "file",
+        },
+        {
+            "text": "same imported body",
+            "content": "same imported body",
+            "kind": "comment-negative",
+            "label": "negative",
+            "source": "file",
+        },
+    ]
+
+
+def test_orchestrator_receives_the_complete_current_sample_snapshot() -> None:
+    analyzer = CapturingAnalyzer()
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=FixedCollector(),
+        analyzer=analyzer,
+        blacklist_executor=RecordingBlacklistExecutor(),
+    )
+    http = TestClient(app)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+
+    first = http.post(
+        "/api/samples",
+        json={"kind": "comment", "label": "positive", "text": "first sample"},
+    ).json()
+    http.post(f"/api/samples/{first['sample_id']}/publish")
+    second = http.post(
+        "/api/samples",
+        json={"kind": "nickname", "label": "positive", "text": "nickname sample"},
+    ).json()
+    http.post(f"/api/samples/{second['sample_id']}/publish")
+
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1fullsnapshot"}
+    ).json()
+    app.state.orchestrator.run(task["task_id"])
+
+    assert {item.content for item in analyzer.last_samples} == {
+        "first sample",
+        "nickname sample",
+    }
+    assert {item.kind for item in analyzer.last_samples} == {"comment", "nickname"}
+
+
 def test_highlighted_review_sample_is_published_for_follow_up_analysis() -> None:
     _, http, task_id = seeded_app()
     evidence_id = http.get("/api/reviews", params={"task_id": task_id}).json()["items"][0][
@@ -126,6 +282,7 @@ def test_highlighted_review_sample_is_published_for_follow_up_analysis() -> None
     samples = http.get("/api/samples").json()["items"]
     assert len(samples) == 1
     assert samples[0]["status"] == "published"
+    assert samples[0]["items"][0]["source"] == "review"
 
 
 def test_blacklist_queue_pause_resume_and_test_executor_are_observable() -> None:

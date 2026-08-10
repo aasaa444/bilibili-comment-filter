@@ -7,6 +7,7 @@ import type {
   CreateUidRequest,
   Evidence,
   HealthResponse,
+  SampleSetKind,
   ReviewRecord,
   SampleSet,
   TaskComment,
@@ -136,7 +137,12 @@ export class ApiClient {
       const text = stringValue(candidate.text) ?? stringValue(candidate.content);
       if (!text) return [];
       const kind = stringValue(candidate.kind) ?? "comment-positive";
-      return [{ content: text, label: kind === "comment-negative" ? "negative" : "positive" }];
+      return [{
+        content: text,
+        kind: kind === "nickname-positive" ? "nickname" : "comment",
+        label: stringValue(candidate.label) ?? (kind === "comment-negative" ? "negative" : "positive"),
+        source: candidate.source === "file" || candidate.source === "review" ? candidate.source : "manual",
+      }];
     });
     const first = asRecord(payload.items[0]);
     const kind = stringValue(first.kind) ?? "comment-positive";
@@ -395,10 +401,13 @@ function normalizeSampleSet(value: unknown): SampleSet | null {
     const normalized = normalizeSampleItem(item, stringValue(candidate.kind));
     return normalized ? [normalized] : [];
   });
+  const rawKind = stringValue(candidate.kind);
   return {
     sampleId,
+    kind: isSampleSetKind(rawKind) ? rawKind : inferSampleSetKind(items),
     version,
     status,
+    isCurrent: booleanValue(candidate.is_current) ?? booleanValue(candidate.isCurrent) ?? status === "published",
     items,
     createdAt: stringValue(candidate.created_at) ?? stringValue(candidate.createdAt) ?? "",
     publishedAt: stringValue(candidate.published_at) ?? stringValue(candidate.publishedAt),
@@ -409,10 +418,27 @@ function normalizeSampleItem(value: unknown, sampleKind?: string): SampleSet["it
   const candidate = asRecord(value);
   const text = stringValue(candidate.text) ?? stringValue(candidate.content);
   const label = stringValue(candidate.label);
-  const kind = stringValue(candidate.kind)
-    ?? (sampleKind === "nickname" ? "nickname-positive" : label === "negative" ? "comment-negative" : "comment-positive");
+  const kind = normalizeSampleItemKind(stringValue(candidate.kind), sampleKind, label);
   if (!text || !isSampleKind(kind)) return null;
-  return { text, kind, source: candidate.source === "file" || candidate.source === "review" ? candidate.source : "manual" };
+  return {
+    text,
+    kind,
+    ...(label ? { label } : {}),
+    source: candidate.source === "file" || candidate.source === "review" ? candidate.source : "manual",
+  };
+}
+
+function normalizeSampleItemKind(value: string | undefined, sampleKind?: string, label?: string): SampleSet["items"][number]["kind"] {
+  if (value === "nickname" || value === "nickname-positive") return "nickname-positive";
+  if (value === "comment-negative") return "comment-negative";
+  if (value === "comment" || value === "comment-positive") return label === "negative" ? "comment-negative" : "comment-positive";
+  return sampleKind === "nickname" ? "nickname-positive" : label === "negative" ? "comment-negative" : "comment-positive";
+}
+
+function inferSampleSetKind(items: SampleSet["items"]): SampleSetKind {
+  const hasNickname = items.some((item) => item.kind === "nickname-positive");
+  const hasComment = items.some((item) => item.kind !== "nickname-positive");
+  return hasNickname && hasComment ? "mixed" : hasNickname ? "nickname" : "comment";
 }
 
 function normalizeBlacklistItem(value: unknown): BlacklistItem | null {
@@ -526,6 +552,10 @@ function isReviewAction(value: unknown): value is ReviewRecord["action"] {
 
 function isSampleKind(value: unknown): value is SampleSet["items"][number]["kind"] {
   return ["comment-positive", "comment-negative", "nickname-positive"].includes(value as string);
+}
+
+function isSampleSetKind(value: unknown): value is SampleSetKind {
+  return ["comment", "nickname", "mixed"].includes(value as string);
 }
 
 function isSampleSetStatus(value: unknown): value is SampleSet["status"] {

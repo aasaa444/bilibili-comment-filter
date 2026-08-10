@@ -41,6 +41,7 @@ interface ManagementState {
   evidence: Collection<Evidence>;
   reviewActions: Collection<ReviewRecord>;
   samples: Collection<SampleSet>;
+  sampleDetails: Record<string, boolean>;
   blacklist: Collection<BlacklistItem>;
   filters: Partial<Record<ViewName, string>>;
   sampleText: string;
@@ -70,6 +71,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     evidence: { items: null },
     reviewActions: { items: null },
     samples: { items: null },
+    sampleDetails: {},
     blacklist: { items: null },
     filters: {},
     sampleText: "",
@@ -170,6 +172,13 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       const evidenceId = reviewButton.dataset.evidenceId ?? "";
       const action = reviewButton.dataset.reviewAction as ReviewAction;
       await runAction(() => api.reviewEvidence(evidenceId, action), "复核操作已记录");
+      return;
+    }
+    const sampleDetails = target.closest<HTMLElement>("[data-sample-details]");
+    if (sampleDetails) {
+      const sampleId = sampleDetails.dataset.sampleDetails ?? "";
+      state.sampleDetails[sampleId] = !state.sampleDetails[sampleId];
+      renderContent();
       return;
     }
     const publishSample = target.closest<HTMLElement>("[data-publish-sample]");
@@ -452,7 +461,7 @@ function renderReviews(state: ManagementState): string {
 function renderSamples(state: ManagementState): string {
   return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">版本化输入</p><h3>样本库</h3></div></div>
     <form class="sample-form" data-form="sample"><div class="form-row"><label>样本类型<select name="sampleKind"><option value="comment-positive" ${state.sampleKind === "comment-positive" ? "selected" : ""}>评论正例</option><option value="comment-negative" ${state.sampleKind === "comment-negative" ? "selected" : ""}>评论反例</option><option value="nickname-positive" ${state.sampleKind === "nickname-positive" ? "selected" : ""}>昵称正例</option></select></label><label>文件导入<input name="sampleFile" type="file" accept=".txt,.csv,text/plain,text/csv" /></label></div><label>粘贴文本<textarea name="sampleText" rows="6" placeholder="每行一个样本；空行和 # 开头的行会跳过">${escapeHtml(state.sampleText)}</textarea></label><div class="sample-preview" data-sample-preview>${renderSamplePreview(state)}</div><button class="button button-primary" type="submit">创建样本草稿</button></form>
-    <div class="list-heading"><h3>历史版本</h3></div>${renderSampleCollection(state.samples)}</section>`;
+    <div class="list-heading"><h3>版本快照</h3></div>${renderSampleCollection(state.samples, state.sampleDetails)}</section>`;
 }
 
 function renderBlacklist(state: ManagementState): string {
@@ -553,10 +562,23 @@ function renderReviewHistory(collection: Collection<ReviewRecord>, filter: strin
   return `<div class="list">${items.map((item) => `<article class="list-row"><div class="row-main"><strong class="mono">${escapeHtml(item.uid)}</strong><span>${reviewActionLabel(item.action)} · ${escapeHtml(item.actor ?? "local-user")}</span><small>${escapeHtml(item.createdAt || "未提供")} · 证据 ${escapeHtml(item.evidenceId)}</small></div><div class="row-actions"><span class="status-pill" data-state="info">${escapeHtml(item.previousStatus ?? "无")} → ${escapeHtml(item.nextStatus ?? "无")}</span></div></article>`).join("")}</div>`;
 }
 
-function renderSampleCollection(collection: Collection<SampleSet>): string {
+function renderSampleCollection(collection: Collection<SampleSet>, expanded: Record<string, boolean> = {}): string {
   if (collection.items === null) return collection.error ? renderState("error", "样本库加载失败", collection.error) : renderState("loading", "正在载入样本库", "");
   if (collection.items.length === 0) return renderState("empty", "还没有样本版本", "通过文本或文件导入后创建草稿");
-  return `<div class="list">${collection.items.map((sample) => `<article class="list-row"><div class="row-main"><strong>版本 ${sample.version}</strong><span>${sample.items.length} 条样本 · ${sample.status}</span><small class="mono">${escapeHtml(sample.sampleId)}</small></div><div class="row-actions">${sample.status === "draft" ? `<button class="button button-primary" data-publish-sample="${escapeHtml(sample.sampleId)}" type="button">发布版本</button>` : `<span class="status-pill" data-state="${sample.status === "published" ? "ready" : "paused"}">${sample.status === "published" ? "已发布" : "已停用"}</span>`}</div></article>`).join("")}</div>`;
+  const current = collection.items.find((sample) => sample.isCurrent);
+  const currentMarkup = current
+    ? `<div class="sample-current" data-sample-current="${escapeHtml(current.sampleId)}"><strong>当前生效版本 · samples-v${current.version}</strong><span>${current.items.length} 条样本会进入后续 AI 分析</span></div>`
+    : `<div class="sample-current sample-current-empty"><strong>当前没有已发布版本</strong><span>发布一个草稿后，才会成为后续 AI 分析的样本快照</span></div>`;
+  const rows = collection.items.map((sample) => {
+    const isOpen = expanded[sample.sampleId] === true;
+    const preview = sample.items.slice(0, 2).map((item) => `<li><span class="status-pill" data-state="info">${sampleKindLabel(item.kind)}</span><span>${escapeHtml(item.text)}</span></li>`).join("");
+    const previewMore = sample.items.length > 2 ? `<li class="muted">还有 ${sample.items.length - 2} 条，点击“查看全部样本”展开</li>` : "";
+    const details = isOpen
+      ? `<section class="sample-details" data-sample-detail-panel="${escapeHtml(sample.sampleId)}"><ol>${sample.items.map((item, index) => `<li class="sample-detail-item"><span class="sample-detail-index">${index + 1}</span><div><p>${escapeHtml(item.text)}</p><small>${sampleKindLabel(item.kind)} · ${sampleLabelLabel(item.label)} · 来源：${sampleSourceLabel(item.source)}</small></div></li>`).join("")}</ol></section>`
+      : "";
+    return `<article class="list-row sample-row" data-sample-row="${escapeHtml(sample.sampleId)}"><div class="row-main"><div class="sample-row-heading"><strong>samples-v${sample.version}</strong><span class="status-pill" data-state="${sampleStatusState(sample)}">${sampleStatusLabel(sample)}</span></div><span>${sampleSetKindLabel(sample.kind)} · ${sample.items.length} 条样本</span><small>创建于 ${escapeHtml(sample.createdAt || "未提供")} · 发布时间：${escapeHtml(sample.publishedAt || "未发布")}</small><small class="mono">${escapeHtml(sample.sampleId)}</small><ul class="sample-preview-list">${preview || `<li class="muted">暂无正文</li>`}${previewMore}</ul></div><div class="row-actions"><button class="button button-ghost" data-sample-details="${escapeHtml(sample.sampleId)}" type="button" aria-expanded="${isOpen ? "true" : "false"}">${isOpen ? "收起样本详情" : "查看全部样本"}</button>${sample.status === "draft" ? `<button class="button button-primary" data-publish-sample="${escapeHtml(sample.sampleId)}" type="button">发布版本</button>` : ""}</div>${details}</article>`;
+  }).join("");
+  return `${currentMarkup}<div class="list sample-list">${rows}</div>`;
 }
 
 function renderBlacklistCollection(collection: Collection<BlacklistItem>, filter: string): string {
@@ -596,8 +618,32 @@ function blacklistStatusLabel(status: BlacklistItem["status"]): string {
   return ({ queued: "已排队", processing: "处理中", blocked: "平台拦截", failed: "失败", completed: "已完成", paused: "已暂停", cancelled: "已取消" })[status];
 }
 
+function sampleStatusLabel(sample: SampleSet): string {
+  if (sample.isCurrent) return "当前生效";
+  if (sample.status === "draft") return "草稿";
+  return "历史版本";
+}
+
+function sampleStatusState(sample: SampleSet): string {
+  if (sample.isCurrent) return "ready";
+  if (sample.status === "draft") return "info";
+  return "paused";
+}
+
+function sampleSetKindLabel(kind: SampleSet["kind"]): string {
+  return ({ comment: "评论样本", nickname: "昵称样本", mixed: "评论 + 昵称" })[kind];
+}
+
 function sampleKindLabel(kind: SampleKind): string {
   return ({ "comment-positive": "评论正例", "comment-negative": "评论反例", "nickname-positive": "昵称正例" })[kind];
+}
+
+function sampleLabelLabel(label: string | undefined): string {
+  return label === "negative" ? "反例" : label === "positive" ? "正例" : label || "未标注";
+}
+
+function sampleSourceLabel(source: SampleItem["source"]): string {
+  return ({ manual: "手工导入", file: "文件导入", review: "复核样本" })[source ?? "manual"];
 }
 
 function reviewActionLabel(action: ReviewAction): string {

@@ -142,7 +142,13 @@ test("API client keeps versioned samples and cancelled blacklist items", async (
           kind: "comment",
           version: "samples-v1",
           status: "published",
-          items: [{ label: "negative", content: "反例评论" }],
+          items: [{
+            label: "negative",
+            content: "反例评论",
+            kind: "comment-negative",
+            source: "file",
+          }],
+          is_current: true,
           created_at: "2026-08-09T00:00:00Z",
         }],
       });
@@ -162,6 +168,9 @@ test("API client keeps versioned samples and cancelled blacklist items", async (
   const blacklist = await client.listBlacklist();
 
   assert.equal(samples.items[0].version, 1);
+  assert.equal(samples.items[0].isCurrent, true);
   assert.equal(samples.items[0].items[0].kind, "comment-negative");
+  assert.equal(samples.items[0].items[0].label, "negative");
+  assert.equal(samples.items[0].items[0].source, "file");
   assert.equal(blacklist.items[0].status, "cancelled");
 });

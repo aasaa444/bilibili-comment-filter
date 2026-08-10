@@ -1,0 +1,57 @@
+import sqlite3
+
+from service.db import Database
+from service.samples import SampleStore
+
+
+def test_legacy_sample_items_are_migrated_without_losing_historical_text(tmp_path) -> None:
+    database_path = tmp_path / "legacy-samples.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE sample_sets (
+            sample_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            published_at TEXT,
+            retired_at TEXT
+        );
+        CREATE TABLE sample_items (
+            item_id TEXT PRIMARY KEY,
+            sample_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            content TEXT NOT NULL,
+            UNIQUE (sample_id, label, content),
+            FOREIGN KEY (sample_id) REFERENCES sample_sets(sample_id)
+        );
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO sample_sets
+            (sample_id, kind, version, status, created_at, published_at)
+        VALUES ('legacy-1', 'comment', 'samples-v1', 'published', ?, ?)
+        """,
+        ("2026-08-09T00:00:00+00:00", "2026-08-09T00:01:00+00:00"),
+    )
+    connection.executemany(
+        """
+        INSERT INTO sample_items (item_id, sample_id, label, content)
+        VALUES (?, 'legacy-1', ?, 'same body')
+        """,
+        [("item-1", "positive"), ("item-2", "negative")],
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(database_path)
+    database.initialize()
+    record = SampleStore(database).get("legacy-1")
+
+    assert len(record.items) == 2
+    assert {(item.label, item.kind, item.content, item.source) for item in record.items} == {
+        ("positive", "comment", "same body", "manual"),
+        ("negative", "comment", "same body", "manual"),
+    }

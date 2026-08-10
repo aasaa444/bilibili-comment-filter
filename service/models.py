@@ -213,6 +213,19 @@ class SampleItemInput(BaseModel):
 
     content: str = Field(min_length=1, max_length=10000)
     label: str | None = None
+    kind: str | None = Field(
+        default=None,
+        pattern=r"^(comment|nickname|comment-positive|comment-negative|nickname-positive)$",
+    )
+    source: str | None = Field(default=None, pattern=r"^(manual|file|review)$")
+
+
+class SampleItemResponse(BaseModel):
+    text: str
+    content: str
+    kind: str
+    label: str
+    source: str
 
 
 class SampleImportRequest(BaseModel):
@@ -230,10 +243,11 @@ class SampleResponse(BaseModel):
     version: str
     status: str
     label: str
-    items: list[SampleItemInput]
+    items: list[SampleItemResponse]
     duplicate_count: int = 0
     created_at: datetime
     published_at: datetime | None = None
+    is_current: bool = False
 
 
 class SampleListResponse(BaseModel):

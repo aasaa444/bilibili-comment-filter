@@ -61,6 +61,7 @@ class SampleItem:
     kind: str
     label: str
     content: str
+    source: str = "manual"
 
 
 @dataclass(frozen=True)
@@ -383,11 +384,11 @@ class OpenAICompatibleBatchAnalyzer:
             batch = pending_batches.pop(0)
             payload = {
                 "model": self.model,
-                "rule_version": self.rule_engine.catalog.version,
+                "rule_version": rule_engine.catalog.version,
                 "sample_version": sample_context.version,
                 "sample_mode": sample_context.mode,
                 "sample_degradation": sample_context.degradation,
-                "samples": [item.__dict__ for item in sample_context.items],
+                "samples": [_sample_payload(item) for item in sample_context.items],
                 "accounts": [self._account_payload(account) for account in batch],
             }
             completed_results = tuple(rule_results + model_results)
@@ -449,7 +450,7 @@ class OpenAICompatibleBatchAnalyzer:
 
     def _available_tokens(self, sample_context: SampleContext) -> int:
         sample_tokens = _estimate_text(
-            json.dumps([item.__dict__ for item in sample_context.items], ensure_ascii=False)
+            json.dumps([_sample_payload(item) for item in sample_context.items], ensure_ascii=False)
         )
         return max(1, self._input_budget() - sample_tokens)
 
@@ -603,6 +604,16 @@ def _estimate_text(value: str) -> int:
     ascii_characters = sum(character.isascii() for character in value)
     non_ascii_characters = len(value) - ascii_characters
     return max(1, non_ascii_characters + (ascii_characters + 3) // 4)
+
+
+def _sample_payload(item: SampleItem) -> dict[str, str]:
+    """Keep management-only sample metadata out of the model context."""
+    return {
+        "sample_id": item.sample_id,
+        "kind": item.kind,
+        "label": item.label,
+        "content": item.content,
+    }
 
 
 def _truncate_text(value: str, token_budget: int) -> str:

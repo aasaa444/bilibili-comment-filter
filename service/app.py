@@ -57,7 +57,7 @@ from .orchestrator import TaskOrchestrator
 from .persistence import CommentStore, EvidenceNotFoundError, EvidenceStore
 from .registry import InvalidUidTransitionError, UidNotFoundError, UidRegistry
 from .reviews import ReviewService
-from .samples import SampleStore
+from .samples import NewSampleItem, SampleStore
 from .tasks import (
     InvalidTaskTransitionError,
     TaskNotFoundError,
@@ -396,12 +396,23 @@ def create_app(
 
     @app.post("/api/samples", response_model=SampleResponse)
     def create_sample(request: SampleImportRequest) -> object:
-        items = [(item.content, item.label or request.label) for item in request.items]
-        if request.text:
-            items.extend((line, request.label) for line in request.text.splitlines())
         kind = "nickname" if request.kind == "nickname" else "comment"
         try:
             sample = sample_store.create(kind=kind, label=request.label, items=items)
+        items = [
+            NewSampleItem(
+                content=item.content,
+                label=item.label or request.label,
+                kind=_storage_sample_kind(item.kind) if item.kind else kind,
+                source=item.source or "manual",
+            )
+            for item in request.items
+        ]
+        if request.text:
+            items.extend(
+                NewSampleItem(line, request.label, kind, "manual")
+                for line in request.text.splitlines()
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse(status_code=201, content=sample_response(sample))
@@ -414,6 +425,8 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail=f"Sample {sample_id} was not found"
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(content=sample_response(sample))
 
     @app.get("/api/blacklist", response_model=BlacklistListResponse)
@@ -526,19 +539,21 @@ def evidence_response(record: object) -> EvidenceResponse:
 def sample_response(record: object) -> dict[str, object]:
     return {
         "sample_id": record.sample_id,
-        "version": int(record.version) if record.version.isdigit() else record.version,
+        "kind": record.kind,
+        "version": record.version,
         "status": record.status,
+        "label": record.label,
         "items": [
             {
                 "text": item.content,
                 "kind": (
                     "nickname-positive"
-                    if record.kind == "nickname"
+                    if item.kind == "nickname"
                     else "comment-negative"
                     if item.label == "negative"
                     else "comment-positive"
                 ),
-                "source": "review" if record.label == "review" else "manual",
+                "source": item.source,
                 "content": item.content,
                 "label": item.label,
             }
@@ -547,7 +562,12 @@ def sample_response(record: object) -> dict[str, object]:
         "created_at": record.created_at.isoformat(),
         "published_at": record.published_at.isoformat() if record.published_at else None,
         "duplicate_count": record.duplicate_count,
+        "is_current": record.is_current,
     }
+
+
+def _storage_sample_kind(value: str | None) -> str:
+    return "nickname" if value in {"nickname", "nickname-positive"} else "comment"
 
 
 def blacklist_response(item: object) -> dict[str, object]:
