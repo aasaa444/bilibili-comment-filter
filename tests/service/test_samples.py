@@ -55,3 +55,55 @@ def test_legacy_sample_items_are_migrated_without_losing_historical_text(tmp_pat
         ("positive", "comment", "same body", "manual"),
         ("negative", "comment", "same body", "manual"),
     }
+
+
+def test_new_snapshot_recovers_items_from_legacy_incremental_versions() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    with database.transaction() as connection:
+        connection.executemany(
+            """
+            INSERT INTO sample_sets
+                (sample_id, kind, version, status, created_at, published_at)
+            VALUES (?, 'comment', ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "legacy-v1",
+                    "samples-v1",
+                    "disabled",
+                    "2026-08-10T00:00:00+00:00",
+                    "2026-08-10T00:01:00+00:00",
+                ),
+                (
+                    "legacy-v2",
+                    "samples-v2",
+                    "published",
+                    "2026-08-10T00:02:00+00:00",
+                    "2026-08-10T00:03:00+00:00",
+                ),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO sample_items
+                (item_id, sample_id, kind, label, content, source)
+            VALUES (?, ?, 'comment', 'positive', ?, 'manual')
+            """,
+            [
+                ("legacy-item-v1", "legacy-v1", "first historical sample"),
+                ("legacy-item-v2", "legacy-v2", "second historical sample"),
+            ],
+        )
+
+    draft = SampleStore(database).create(
+        kind="comment",
+        label="positive",
+        items=[("new sample", None)],
+    )
+
+    assert {item.content for item in draft.items} == {
+        "first historical sample",
+        "second historical sample",
+        "new sample",
+    }

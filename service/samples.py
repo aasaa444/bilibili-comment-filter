@@ -80,37 +80,34 @@ class SampleStore:
         timestamp = datetime.now(UTC)
         sample_id = uuid4().hex
         with self.database.transaction() as connection:
-            current_row = connection.execute(
+            # T16.1 snapshots are cumulative, but versions created before that
+            # behavior was deployed may contain only their own import. Union
+            # every published snapshot here so the next draft repairs that
+            # legacy gap without mutating any historical version in place.
+            inherited_rows = connection.execute(
                 """
-                SELECT * FROM sample_sets
-                WHERE status = 'published'
-                ORDER BY published_at DESC, sample_id DESC
-                LIMIT 1
+                SELECT sample_items.*, sample_sets.kind AS sample_set_kind
+                FROM sample_items
+                JOIN sample_sets ON sample_sets.sample_id = sample_items.sample_id
+                WHERE sample_sets.status IN ('published', 'disabled')
+                ORDER BY sample_sets.published_at, sample_sets.created_at,
+                         sample_sets.sample_id, sample_items.rowid
                 """
-            ).fetchone()
-            if current_row is not None:
-                inherited_rows = connection.execute(
-                    """
-                    SELECT * FROM sample_items
-                    WHERE sample_id = ?
-                    ORDER BY rowid
-                    """,
-                    (current_row["sample_id"],),
-                ).fetchall()
-                for item_row in inherited_rows:
-                    value = str(item_row["content"]).strip()
-                    if not value:
-                        continue
-                    self._append_unique(
-                        normalized,
-                        seen,
-                        (
-                            value,
-                            str(item_row["label"]).strip() or normalized_label,
-                            self._storage_kind(item_row["kind"] or current_row["kind"]),
-                            self._storage_source(item_row["source"]),
-                        ),
-                    )
+            ).fetchall()
+            for item_row in inherited_rows:
+                value = str(item_row["content"]).strip()
+                if not value:
+                    continue
+                self._append_unique(
+                    normalized,
+                    seen,
+                    (
+                        value,
+                        str(item_row["label"]).strip() or normalized_label,
+                        self._storage_kind(item_row["kind"] or item_row["sample_set_kind"]),
+                        self._storage_source(item_row["source"]),
+                    ),
+                )
             for candidate in candidates:
                 value, effective_label, candidate_kind, candidate_source = candidate
                 key = self._dedupe_key(value, effective_label, candidate_kind)
