@@ -99,9 +99,11 @@ class FixedAnalyzer:
         results = tuple(
             AnalysisResult(
                 uid=account.uid,
-                decision=decisions[account.uid],
+                decision=decisions.get(account.uid, AnalysisDecision.NON_TARGET),
                 evidence_comment_ids=tuple(comment.comment_id for comment in account.comments),
-                signals=(f"fixture:{decisions[account.uid].value}",),
+                signals=(
+                    f"fixture:{decisions.get(account.uid, AnalysisDecision.NON_TARGET).value}",
+                ),
                 reason="fixture decision",
                 confidence=0.91,
                 model_version="fixture-model",
@@ -160,11 +162,14 @@ class IncompleteButMarkedCompleteCollector:
                 complete=True,
                 requested_pages=1,
                 declared_comments=2,
+                declared_total=2,
+                declared_reply_counts={"c-incomplete": 2},
             ),
             stats=CollectionStats(
                 requested_pages=1,
                 saved_comments=1,
                 declared_comments=2,
+                declared_replies=2,
                 coverage=0.5,
             ),
             complete=True,
@@ -274,6 +279,7 @@ def test_orchestrator_applies_three_states_and_repeats_idempotently() -> None:
     from fastapi.testclient import TestClient
 
     http = TestClient(app)
+    app.state.settings_store.set_blacklist_automation(True)
     http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
     task = http.post(
         "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1orchestrator1"}
@@ -293,6 +299,40 @@ def test_orchestrator_applies_three_states_and_repeats_idempotently() -> None:
     uid_items = {item["uid"]: item for item in http.get("/api/uids").json()["items"]}
     assert uid_items["1001"]["state"] == "queued"
     assert uid_items["1002"]["state"] == "review"
+    assert "1003" not in uid_items
+
+
+def test_orchestrator_applies_published_nickname_rule_when_model_is_unconfigured() -> None:
+    collector = FixedCollector()
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=collector,
+    )
+    draft = app.state.sample_store.create(
+        kind="nickname",
+        label="positive",
+        items=[("uncertain-user", None)],
+    )
+    app.state.sample_store.publish(draft.sample_id)
+    from fastapi.testclient import TestClient
+
+    http = TestClient(app)
+    app.state.settings_store.set_blacklist_automation(True)
+    http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+    task = http.post(
+        "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1nicknamefallback"}
+    ).json()
+
+    summary = app.state.orchestrator.run(task["task_id"])
+
+    assert summary.status.value == "partial"
+    assert summary.evidence_count == 2
+    assert summary.queue_count == 2
+    assert collector.calls == 1
+    uid_items = {item["uid"]: item for item in http.get("/api/uids").json()["items"]}
+    assert uid_items["1001"]["state"] == "queued"
+    assert uid_items["1002"]["state"] == "queued"
     assert "1003" not in uid_items
 
 
@@ -339,10 +379,119 @@ def test_orchestrator_does_not_persist_complete_checkpoint_below_coverage() -> N
     summary = app.state.orchestrator.run(task["task_id"])
 
     assert summary.status.value == "partial"
+    detail = http.get(f"/api/tasks/{task['task_id']}").json()
+    assert detail["progress"]["declared_replies"] == 2
+    assert detail["progress"]["declared_total"] == 2
+    assert detail["progress"]["coverage"] == 0.5
     assert app.state.task_store.checkpoint(task["task_id"])["complete"] is False
     app.state.task_store.retry(task["task_id"])
-    app.state.orchestrator.run(task["task_id"])
+    second = app.state.orchestrator.run(task["task_id"])
     assert collector.calls == 2
+    assert second.status.value == "partial"
+    assert app.state.task_store.checkpoint(task["task_id"])["complete"] is False
+
+
+def test_orchestrator_preserves_failed_items_across_checkpoint_resume() -> None:
+    class ResumeWithFailuresCollector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def collect(self, task, checkpoint: CollectionCheckpoint) -> CollectionResult:
+            self.calls += 1
+            if self.calls == 1:
+                assert checkpoint.root_page == 1
+                comment = CommentRecord(
+                    "failure-root-1",
+                    "1001",
+                    "first-failure-user",
+                    "first page",
+                    task.video_id,
+                    "https://example.test/failure-root-1",
+                    "failure-root-1",
+                    None,
+                    "root",
+                    1700000020,
+                    False,
+                )
+                return CollectionResult(
+                    comments=(comment,),
+                    checkpoint=CollectionCheckpoint(
+                        root_page=2,
+                        complete=False,
+                        requested_pages=1,
+                        declared_comments=2,
+                    ),
+                    stats=CollectionStats(
+                        requested_pages=1,
+                        saved_comments=1,
+                        declared_comments=2,
+                        coverage=0.5,
+                    ),
+                    complete=False,
+                    failed_items=("root_page:2:temporary",),
+                )
+
+            assert checkpoint.root_page == 2
+            comment = CommentRecord(
+                "failure-root-2",
+                "1002",
+                "second-failure-user",
+                "second page",
+                task.video_id,
+                "https://example.test/failure-root-2",
+                "failure-root-2",
+                None,
+                "root",
+                1700000021,
+                False,
+            )
+            return CollectionResult(
+                comments=(comment,),
+                checkpoint=CollectionCheckpoint(
+                    root_page=3,
+                    complete=True,
+                    requested_pages=2,
+                    declared_comments=2,
+                ),
+                    stats=CollectionStats(
+                        requested_pages=2,
+                        saved_comments=1,
+                        declared_comments=2,
+                        coverage=0.5,
+                    ),
+                    complete=False,
+                    terminal=True,
+                    failed_items=("root_page:3:metadata-warning",),
+                )
+
+    collector = ResumeWithFailuresCollector()
+    app = create_app(
+        db_path=":memory:",
+        auth_verifier=ValidVerifier(),
+        collector=collector,
+        analyzer=FixedAnalyzer(),
+    )
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as http:
+        http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
+        task = http.post(
+            "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1failuremerge"}
+        ).json()
+
+        first = http.post(f"/api/tasks/{task['task_id']}/run")
+        assert first.json()["status"] == "partial"
+        app.state.task_store.retry(task["task_id"])
+
+        second = http.post(f"/api/tasks/{task['task_id']}/run")
+        assert second.json()["status"] == "completed"
+        detail = http.get(f"/api/tasks/{task['task_id']}").json()
+
+    assert collector.calls == 2
+    assert detail["progress"]["failed_items"] == [
+        "root_page:2:temporary",
+        "root_page:3:metadata-warning",
+    ]
 
 
 def test_orchestrator_pauses_when_collection_session_expires() -> None:

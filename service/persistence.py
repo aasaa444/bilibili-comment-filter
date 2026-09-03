@@ -9,6 +9,7 @@ from .analyzer import AnalysisDecision, AnalysisResult
 from .collector import CommentRecord
 from .db import Database
 from .models import EvidenceReviewStatus
+from .profiles import DEFAULT_FILTER_PROFILE_ID
 
 
 class EvidenceNotFoundError(LookupError):
@@ -104,6 +105,7 @@ class EvidenceRecord:
     sample_version: str
     rule_version: str
     created_at: datetime
+    profile_id: str = DEFAULT_FILTER_PROFILE_ID
 
 
 class EvidenceStore:
@@ -117,6 +119,7 @@ class EvidenceStore:
         video_id: str,
         account_comments: tuple[CommentRecord, ...],
         result: AnalysisResult,
+        profile_id: str = DEFAULT_FILTER_PROFILE_ID,
     ) -> tuple[EvidenceRecord, bool]:
         existing = self.database.execute(
             "SELECT * FROM evidence WHERE task_id = ? AND uid = ?", (task_id, result.uid)
@@ -133,8 +136,8 @@ class EvidenceStore:
                 INSERT INTO evidence
                     (evidence_id, task_id, uid, decision, nickname, video_id, comment_ids_json,
                      comments_json, signals_json, reason, confidence, model_version,
-                     sample_version, rule_version, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     sample_version, rule_version, created_at, profile_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evidence_id,
@@ -152,6 +155,7 @@ class EvidenceStore:
                     result.sample_version,
                     result.rule_version,
                     timestamp,
+                    profile_id,
                 ),
             )
             row = connection.execute(
@@ -238,6 +242,7 @@ class EvidenceStore:
             sample_version=row["sample_version"],
             rule_version=row["rule_version"],
             created_at=datetime.fromisoformat(row["created_at"]),
+            profile_id=row["profile_id"] or DEFAULT_FILTER_PROFILE_ID,
         )
 
 

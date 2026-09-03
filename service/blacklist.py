@@ -242,14 +242,22 @@ class PlaywrightBlacklistExecutor:
                     self._raise_if_page_failure(page)
                     if page.get_by_text("已拉黑", exact=True).count() > 0:
                         return ExecutionResult(detail="UID is already blacklisted")
-                    button = page.get_by_text("拉黑", exact=True)
+                    more_actions = page.locator(".more-actions__trigger")
                     self._wait_for_visible(
                         page,
-                        button,
+                        more_actions,
                         kind=ExecutionFailureKind.INTERCEPTED,
                         detail="Native blacklist control was not found",
                     )
-                    button.click()
+                    more_actions.click()
+                    blacklist_action = page.get_by_text("加入黑名单", exact=True)
+                    self._wait_for_visible(
+                        page,
+                        blacklist_action,
+                        kind=ExecutionFailureKind.INTERCEPTED,
+                        detail="Native blacklist menu action was not found",
+                    )
+                    blacklist_action.click()
                     confirm = page.get_by_text("确定", exact=True)
                     self._wait_for_visible(
                         page,

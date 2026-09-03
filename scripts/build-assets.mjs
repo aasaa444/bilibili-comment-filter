@@ -1,4 +1,5 @@
 import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 const root = process.cwd();
@@ -12,12 +13,20 @@ await cp(path.join(dist, "shared"), path.join(webDist, "shared"), { recursive: t
 await cp(path.join(dist, "shared"), path.join(extensionDist, "shared"), { recursive: true });
 
 const webIndex = await readFile(path.join(root, "web", "index.html"), "utf8");
+const webStyles = await readFile(path.join(root, "web", "styles.css"), "utf8");
+const assetVersion = createHash("sha256")
+  .update(webStyles)
+  .update(await readFile(path.join(dist, "web", "src", "main.js")))
+  .digest("hex")
+  .slice(0, 12);
 await writeFile(
   path.join(webDist, "index.html"),
-  webIndex.replace("../dist/web/src/main.js", "./src/main.js"),
+  webIndex
+    .replace("../dist/web/src/main.js", `./src/main.js?v=${assetVersion}`)
+    .replace('href="styles.css"', `href="styles.css?v=${assetVersion}"`),
   "utf8",
 );
-await cp(path.join(root, "web", "styles.css"), path.join(webDist, "styles.css"));
+await writeFile(path.join(webDist, "styles.css"), webStyles, "utf8");
 await cp(path.join(root, "extension", "manifest.json"), path.join(extensionDist, "manifest.json"));
 await cp(path.join(root, "extension", "popup.html"), path.join(extensionDist, "popup.html"));
 await cp(path.join(root, "extension", "popup.css"), path.join(extensionDist, "popup.css"));

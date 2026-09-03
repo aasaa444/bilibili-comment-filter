@@ -17,7 +17,8 @@ def test_uid_registry_deduplicates_by_uid_and_keeps_nickname_as_snapshot() -> No
 
 
 def test_uid_registry_exposes_full_then_incremental_versioned_sync() -> None:
-    client = TestClient(create_app(db_path=":memory:"))
+    app = create_app(db_path=":memory:")
+    client = TestClient(app)
     client.post("/api/uids", json={"uid": "1001", "nickname": "alpha"})
 
     full = client.get("/api/uids/sync", params={"since": 0})
@@ -36,3 +37,11 @@ def test_uid_registry_exposes_full_then_incremental_versioned_sync() -> None:
     assert delta_payload["version"] == 3
     assert {item["uid"] for item in delta_payload["items"]} == {"1001", "1002"}
     assert delta_payload["items"][0]["state"] == "exception"
+
+    app.state.uid_registry.remove("1001")
+    removed = client.get("/api/uids/sync", params={"since": delta_payload["version"]})
+    removed_payload = removed.json()
+    assert removed.status_code == 200
+    assert removed_payload["mode"] == "delta"
+    assert removed_payload["items"] == []
+    assert removed_payload["removed"] == ["1001"]

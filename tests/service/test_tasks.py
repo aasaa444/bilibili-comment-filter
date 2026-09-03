@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from service.app import create_app
 from service.db import Database
+from service.models import TaskStatus
 from service.tasks import TaskProgress, TaskStore
 
 VIDEO_URL = "https://www.bilibili.com/video/BV1task123"
@@ -24,6 +25,64 @@ def test_task_creation_is_idempotent_for_the_same_video() -> None:
     assert duplicate.json()["video_id"] == "BV1task123"
     assert duplicate.json()["status"] == "queued"
     assert len(client.get("/api/tasks").json()["items"]) == 1
+
+
+def test_task_creation_uses_bilibili_title_instead_of_browser_title_snapshot(
+    monkeypatch,
+) -> None:
+    class MetadataTransport:
+        def __init__(self, _cookies_provider) -> None:
+            self.metadata_calls: list[str] = []
+
+        def fetch_video_metadata(self, video_id: str) -> dict[str, object]:
+            self.metadata_calls.append(video_id)
+            return {"aid": "117058427821372", "title": "B站官方原标题"}
+
+        def fetch_root_page(self, _video_id: str, _page: object) -> dict[str, object]:
+            raise AssertionError("comment collection must not start during task creation")
+
+        def fetch_replies(
+            self, _video_id: str, _root_id: str, _page: int
+        ) -> dict[str, object]:
+            raise AssertionError("comment collection must not start during task creation")
+
+    transport = MetadataTransport(None)
+    monkeypatch.setattr("service.app.BilibiliCommentTransport", lambda *_args, **_kwargs: transport)
+    client = TestClient(create_app(db_path=":memory:"))
+
+    response = client.post(
+        "/api/tasks",
+        json={
+            "video_url": "https://www.bilibili.com/video/BV1eFu36LEt2",
+            "title": "浏览器页签快照，不应作为任务原标题",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["title"] == "B站官方原标题"
+    assert transport.metadata_calls == ["BV1eFu36LEt2"]
+
+
+def test_task_list_repairs_legacy_title_from_bilibili_metadata() -> None:
+    class MetadataProvider:
+        def fetch_video_metadata(self, video_id: str) -> dict[str, object]:
+            assert video_id == "BV1eFu36LEt2"
+            return {"aid": "117058427821372", "title": "B站官方原标题"}
+
+    app = create_app(
+        db_path=":memory:",
+        video_metadata_provider=MetadataProvider(),
+    )
+    legacy_task, _ = app.state.task_store.create(
+        video_url="https://www.bilibili.com/video/BV1eFu36LEt2",
+        title="历史浏览器页签标题",
+    )
+
+    response = TestClient(app).get("/api/tasks")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["task_id"] == legacy_task.task_id
+    assert response.json()["items"][0]["title"] == "B站官方原标题"
 
 
 def test_concurrent_task_creation_returns_one_shared_task(tmp_path) -> None:
@@ -89,6 +148,44 @@ def test_task_detail_exposes_lifecycle_progress_and_retry_contract() -> None:
     assert retry.json()["detail"] == "Only failed, partial, or paused tasks can be retried"
 
 
+def test_retry_auth_unavailable_requeues_only_matching_paused_tasks() -> None:
+    database = Database(":memory:")
+    database.initialize()
+    store = TaskStore(database)
+    auth_task, _ = store.create(video_url="https://www.bilibili.com/video/BV1authretry1")
+    other_paused_task, _ = store.create(
+        video_url="https://www.bilibili.com/video/BV1otherpaused1"
+    )
+    queued_task, _ = store.create(video_url="https://www.bilibili.com/video/BV1queuedtask1")
+
+    store.transition(
+        auth_task.task_id,
+        TaskStatus.PAUSED,
+        error_code="auth_unavailable",
+        error_message="session required",
+    )
+    store.transition(
+        other_paused_task.task_id,
+        TaskStatus.PAUSED,
+        error_code="collection_paused",
+        error_message="rate limited",
+    )
+
+    resumed = store.retry_auth_unavailable()
+
+    assert [task.task_id for task in resumed] == [auth_task.task_id]
+    refreshed_auth_task = store.get(auth_task.task_id)
+    assert refreshed_auth_task.status is TaskStatus.QUEUED
+    assert refreshed_auth_task.attempt == 1
+    assert refreshed_auth_task.error_code is None
+    assert refreshed_auth_task.error_message is None
+    assert store.get(other_paused_task.task_id).status is TaskStatus.PAUSED
+    assert store.get(other_paused_task.task_id).error_code == "collection_paused"
+    assert store.get(queued_task.task_id).attempt == 0
+
+    database.close()
+
+
 def test_task_creation_rejects_non_bilibili_or_non_video_paths() -> None:
     client = TestClient(create_app(db_path=":memory:"))
 
@@ -129,6 +226,41 @@ def test_checkpoint_round_trip_survives_task_store_restart(tmp_path) -> None:
             declared_comments=42,
             declared_replies=4,
             declared_total=42,
+            coverage=1.0,
+        ),
+        checkpoint=expected,
+    )
+    database.close()
+
+    restarted_database = Database(db_path)
+    restarted_database.initialize()
+
+    assert TaskStore(restarted_database).checkpoint(task.task_id) == expected
+
+
+def test_checkpoint_round_trip_preserves_opaque_root_cursor(tmp_path) -> None:
+    db_path = tmp_path / "opaque-cursor.sqlite3"
+    database = Database(db_path)
+    database.initialize()
+    task, _ = TaskStore(database).create(video_url=VIDEO_URL)
+
+    expected = {
+        "root_cursor": "CAEiAggD",
+        "requested_pages": 2,
+        "declared_comments": 20,
+        "declared_total": 20,
+        "declared_reply_counts": {},
+        "root_page": 1,
+        "replies": {},
+        "complete": False,
+    }
+    TaskStore(database).update_progress(
+        task.task_id,
+        TaskProgress(
+            requested_pages=2,
+            saved_comments=20,
+            declared_comments=20,
+            declared_total=20,
             coverage=1.0,
         ),
         checkpoint=expected,

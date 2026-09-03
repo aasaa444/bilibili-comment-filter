@@ -205,4 +205,53 @@
 - 同一状态在两个 surface 中保持同一名称和语义，例如“已隐藏”“待复核”“例外”“后台服务已连接”。
 - 插件断开服务时仍可使用已同步 UID 缓存；界面必须显式显示缓存过滤与后台任务之间的区别。
 
+## 13. Evidence review interaction plan (recorded)
+
+This is the agreed direction for the next evidence-review iteration. It records the layout decision before implementation; it does not replace the existing visual tokens.
+
+- Surface: desktop management page, with rapid sequential evidence review as the primary task.
+- Information architecture: a review inbox with a persistent status/filter toolbar, a dense evidence list, and a right-side detail inspector on desktop. On narrow screens the inspector becomes an overlay or stacked detail area.
+- Row default content: checkbox, UID, nickname snapshot, AI result, confidence, comment excerpt, hit signals, human review state, and high-frequency actions. Full comment context, model reason, model version, source video, and comment link remain in the inspector.
+- Action visibility: the primary row actions remain visible without expanding the item. Long-tail actions such as exception and sample marking may live under a labeled More menu.
+- Feedback: update only the affected row after an action; preserve filter, scroll position, and selected detail. Show row-level busy, success, and retryable error states. Batch actions show the exact selected count and affected scope.
+- Review status: distinguish AI result (`hit` / `uncertain`) from human review state (`pending` / `confirmed` / `local-only` / `revoked` / `exception` / `sampled`).
+- History: keep review history separate from the active inbox so past actions do not interrupt the pending-work flow.
+- Semantic contract: button labels must describe their real side effects. `confirm` means entering the official blacklist queue; `hide-only` means local hiding only; `revoke` removes the local decision; `exception` prevents hiding; `highlight` adds a review sample.
+- Acceptance baseline: a reviewer can act on an item without opening it, inspect full evidence without losing list position, understand the resulting state immediately, and batch one common action with one confirmation.
+
 Validated against `business-mockup-1.html` (latest iteration).
+
+## 14. Sample library and blacklist control plan (recorded)
+
+This records the agreed behavior and the current implementation gap before the next implementation pass.
+
+### Sample library semantics
+
+- A sample version is an immutable snapshot. Publishing a new version disables the previously published version, but does not delete its `sample_sets` row, its `sample_items`, or the historical version used by an analysis run.
+- The analyzer uses only the latest published snapshot. Disabled history is retained for traceability, but is not implicitly merged into the current AI input.
+- New versions should default to inheriting the current published samples and then applying the new import or review samples. Deduplicate by sample kind plus normalized text. Publishing therefore produces a complete current snapshot, so adding one sample does not silently reduce the effective sample library to one item.
+- The sample library list must show, at a glance, version, role, status, item count, created/published time, and whether the version is currently effective. The visible rule is: “只有当前生效版本参与 AI 分析；历史版本保留用于追溯。”
+- Each version row shows a short content preview (with labels such as positive/negative/nickname), and provides “查看全部样本” in a detail inspector or overlay. The full content view must include the sample text and its label/source; raw sample IDs remain secondary copyable diagnostics, not the primary identity.
+- Draft, published, and disabled versions use user-facing Chinese labels: “草稿”“当前生效”“历史版本”. Publishing a draft updates the original row and keeps the user in the sample library context.
+
+### Blacklist error semantics
+
+- The primary queue row must not expose internal English selector errors as the only explanation. It must state what happened, why processing stopped, and the available recovery action.
+- For example, `Native blacklist confirmation control was not found` means the isolated browser reached the account action flow but did not find the expected B 站 confirmation control (currently the exact “确定” selector). The item is paused as an intercepted page-structure failure; it is not a successful blacklist and not an ordinary retryable network failure.
+- User-facing error categories should include: “B 站确认窗口结构发生变化，队列已暂停”“B 站登录态失效，请重新同步登录”“检测到验证码或风控页面，队列已暂停”“本机浏览器执行环境不可用”和“暂时性网络错误，可重试”.
+- “查看技术详情” may reveal the original error, failure kind, attempt count, and timestamps for diagnosis. The raw message is supporting evidence, never the main action guidance.
+- Error states retain the UID, queue item, current status, and retry/pause/resume action. A failed or paused item must not disappear merely because the readable explanation is being displayed.
+
+### Automatic official-blacklist master switch
+
+- Add a persisted global switch named “自动执行官方拉黑”. It is **off by default** and its state is stored in the local SQLite settings store, surviving service restarts.
+- Off state is explicit: “已关闭 · 仅本地隐藏”. AI hits still enter the local hidden UID set and retain evidence, but new official blacklist queue items are not created and the worker does not consume the existing queued work.
+- Existing queued work is retained rather than cancelled or deleted. When the switch is turned on, queued work can continue; items already paused, failed, blocked, or cancelled retain their state and error until the corresponding recovery action is deliberately used.
+- On state is explicit: “已开启 · 命中后排入官方拉黑队列”. New high-confidence hits create official queue items, while local hiding remains immediate and independent of official execution.
+- The switch belongs in the blacklist queue header as the single authoritative control. The dashboard may show its current state as read-only status, but must not introduce a second action with different semantics.
+- Toggling the switch gives immediate local feedback and a persisted-result confirmation. The UI must distinguish “本地隐藏已生效” from “官方拉黑已排队/已完成”; one must never imply the other.
+
+### Implementation boundary
+
+- This section is a recorded product and interaction decision only. It does not claim that sample inheritance, readable blacklist errors, or the automatic-blacklist switch are implemented yet.
+- The implementation pass must update the SQLite settings/data flow, API types and endpoints, analyzer/orchestrator and worker gates, sample version creation, management-page layout, and the relevant regression tests as one coherent change.

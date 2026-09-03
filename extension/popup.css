@@ -136,6 +136,31 @@ h2 {
   font-weight: 700;
 }
 
+.button-secondary {
+  width: 100%;
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--secondary);
+}
+
+.button-secondary:hover:not(:disabled) {
+  border-color: var(--primary);
+  color: var(--text);
+}
+
+#auth-status {
+  margin-top: 6px;
+}
+
+#auth-status[data-state="ready"] {
+  color: var(--success);
+}
+
+#auth-status[data-state="error"] {
+  color: var(--error);
+}
+
 .button-primary:hover:not(:disabled) {
   background: #ff9f0e;
 }

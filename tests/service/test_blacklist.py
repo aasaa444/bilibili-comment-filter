@@ -30,7 +30,9 @@ class FakeLocator:
 
     def click(self) -> None:
         self._page.clicked.append(self._text)
-        if self._text == "拉黑":
+        if self._text == ".more-actions__trigger":
+            self._page.menu_open = True
+        elif self._text == "加入黑名单":
             self._page.dialog_open = True
         elif self._text == "确定":
             self._page.confirmed = True
@@ -51,6 +53,7 @@ class FakePage:
         captcha: bool = False,
         platform_intercepted: str | None = None,
         blacklist_control: bool = True,
+        blacklist_menu_control: bool = True,
         already_blacklisted: bool = False,
         success_after_confirmation: bool = True,
     ) -> None:
@@ -58,8 +61,10 @@ class FakePage:
         self.captcha = captcha
         self.platform_intercepted = platform_intercepted
         self.blacklist_control = blacklist_control
+        self.blacklist_menu_control = blacklist_menu_control
         self.blacklisted = already_blacklisted
         self.success_after_confirmation = success_after_confirmation
+        self.menu_open = False
         self.dialog_open = False
         self.confirmed = False
         self.clicked: list[str] = []
@@ -69,6 +74,14 @@ class FakePage:
     def goto(self, *_args, **_kwargs) -> None:
         return None
 
+    def locator(self, selector: str) -> FakeLocator:
+        visible = (
+            selector == ".more-actions__trigger"
+            and self.blacklist_control
+            and not self.blacklisted
+        )
+        return FakeLocator(self, selector, int(visible))
+
     def get_by_text(self, text: str, *, exact: bool) -> FakeLocator:
         visible = False
         if text == "登录" and exact:
@@ -77,8 +90,12 @@ class FakePage:
             visible = self.captcha
         elif text == self.platform_intercepted and not exact:
             visible = True
-        elif text == "拉黑" and exact:
-            visible = self.blacklist_control and not self.blacklisted
+        elif text == "加入黑名单" and exact:
+            visible = (
+                self.menu_open
+                and self.blacklist_menu_control
+                and not self.blacklisted
+            )
         elif text == "已拉黑" and exact:
             visible = self.blacklisted
         elif text == "确定" and exact:
@@ -189,8 +206,8 @@ def test_native_executor_confirms_blacklist_and_uses_configured_headless_mode(
     result = PlaywrightBlacklistExecutor().execute(make_item())
 
     assert result.success is True
-    assert page.clicked == ["拉黑", "确定"]
-    assert len(page.waited_for) == 3
+    assert page.clicked == [".more-actions__trigger", "加入黑名单", "确定"]
+    assert len(page.waited_for) == 4
     assert all(
         state == "visible" and timeout == 10_000
         for _, state, timeout in page.waited_for
@@ -285,6 +302,19 @@ def test_native_executor_classifies_missing_blacklist_control_as_intercepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     browser = FakeBrowser(FakePage(blacklist_control=False))
+    install_fake_playwright(monkeypatch, browser)
+
+    with pytest.raises(BlacklistExecutionError) as raised:
+        PlaywrightBlacklistExecutor().execute(make_item())
+
+    assert raised.value.kind is ExecutionFailureKind.INTERCEPTED
+    assert_resources_closed(browser)
+
+
+def test_native_executor_classifies_missing_blacklist_menu_action_as_intercepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = FakeBrowser(FakePage(blacklist_menu_control=False))
     install_fake_playwright(monkeypatch, browser)
 
     with pytest.raises(BlacklistExecutionError) as raised:

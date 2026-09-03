@@ -7,15 +7,20 @@ import {
 } from "../../shared/state.js";
 import type {
   AuthSession,
+  AnalysisRun,
   BlacklistItem,
   BlacklistSettings,
   Evidence,
+  FilterProfile,
+  ModelHealth,
   ReviewAction,
   ReviewRecord,
   SampleItem,
   SampleKind,
   SampleSet,
   TaskComment,
+  TaskAnalysis,
+  TaskEvent,
   UidRecord,
   VideoTask,
 } from "../../shared/types.js";
@@ -23,12 +28,19 @@ import { mergeSampleItems, parseSampleText } from "./sample-import.js";
 
 type ViewName = "dashboard" | "tasks" | "uids" | "reviews" | "samples" | "blacklist";
 type Collection<T> = { items: T[] | null; error?: string };
+type EvidenceResultFilter = "uncertain" | "hit" | "all";
+const TASK_COMMENTS_PAGE_SIZE = 20;
 
 interface TaskDetailState {
   open: boolean;
   loading: boolean;
   comments: TaskComment[] | null;
+  events: TaskEvent[] | null;
+  analysis: TaskAnalysis | null;
+  commentPage: number;
   error?: string;
+  eventsError?: string;
+  analysisError?: string;
 }
 
 interface ReviewFeedback {
@@ -47,6 +59,7 @@ interface ManagementState {
   loading: boolean;
   connection: ConnectionState;
   auth: AuthSession | null;
+  model: ModelHealth | null;
   tasks: Collection<VideoTask>;
   taskDetails: Record<string, TaskDetailState>;
   uids: Collection<UidRecord>;
@@ -54,12 +67,14 @@ interface ManagementState {
   dashboardEvidence: Collection<Evidence>;
   reviewActions: Collection<ReviewRecord>;
   samples: Collection<SampleSet>;
+  profiles: Collection<FilterProfile>;
   sampleDetails: Record<string, boolean>;
   blacklist: Collection<BlacklistItem>;
   blacklistSettings: BlacklistSettings | null;
   blacklistSettingsError?: string;
   filters: Partial<Record<ViewName, string>>;
   reviewStatus: "pending" | "history" | "all";
+  reviewResultFilter: EvidenceResultFilter;
   selectedEvidenceId?: string;
   selectedEvidenceIds: string[];
   evidenceFeedback: Record<string, ReviewFeedback>;
@@ -85,6 +100,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     loading: false,
     connection: { kind: "loading", label: "正在连接本机服务" },
     auth: null,
+    model: null,
     tasks: { items: null },
     taskDetails: {},
     uids: { items: null },
@@ -92,11 +108,13 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     dashboardEvidence: { items: null },
     reviewActions: { items: null },
     samples: { items: null },
+    profiles: { items: null },
     sampleDetails: {},
     blacklist: { items: null },
     blacklistSettings: null,
     filters: {},
     reviewStatus: "pending",
+    reviewResultFilter: "uncertain",
     selectedEvidenceIds: [],
     evidenceFeedback: {},
     sampleText: "",
@@ -129,6 +147,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     root.innerHTML = renderFrame(state);
     try {
       const health = await api.getHealth();
+      state.model = health.model ?? null;
       state.connection = connectionStateFromHealth(health);
       if (state.connection.kind !== "ready") {
         state.loading = false;
@@ -136,22 +155,25 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
         return;
       }
     } catch (error) {
+      state.model = null;
       state.connection = connectionStateFromRequestError(asRequestError(error));
       state.loading = false;
       root.innerHTML = renderFrame(state);
       return;
     }
 
-    const [auth, tasks, uids, evidence, dashboardEvidence, reviewActions, samples, blacklist, blacklistSettings] = await Promise.all([
+    const requestedEvidenceResult = state.reviewResultFilter === "all" ? undefined : state.reviewResultFilter;
+    const [auth, tasks, uids, evidence, dashboardEvidence, reviewActions, samples, profiles, blacklist, blacklistSettings] = await Promise.all([
       api.getAuthSession().catch(() => null),
       loadCollection(() => api.listTasks()),
       loadCollection(() => api.listUids()),
-      loadCollection(() => api.listEvidence({ reviewStatus: state.reviewStatus })),
-      state.reviewStatus === "pending"
+      loadCollection(() => api.listEvidence({ reviewStatus: state.reviewStatus, result: requestedEvidenceResult })),
+      state.reviewStatus === "pending" && requestedEvidenceResult === undefined
         ? Promise.resolve(null)
         : loadCollection(() => api.listEvidence({ reviewStatus: "pending" })),
       loadCollection(() => api.listReviewActions()),
       loadCollection(() => api.listSamples()),
+      loadCollection(() => api.listProfiles()),
       loadCollection(() => api.listBlacklist()),
       loadBlacklistSettings(api),
     ]);
@@ -167,6 +189,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     }
     state.reviewActions = reviewActions;
     state.samples = samples;
+    state.profiles = profiles;
     state.blacklist = blacklist;
     state.blacklistSettings = blacklistSettings.value;
     state.blacklistSettingsError = blacklistSettings.error;
@@ -205,10 +228,25 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       await loadTaskComments(retryComments.dataset.taskCommentsRetry ?? "");
       return;
     }
+    const retryObservability = target.closest<HTMLElement>("[data-task-observability-retry]");
+    if (retryObservability) {
+      await loadTaskComments(retryObservability.dataset.taskObservabilityRetry ?? "");
+      return;
+    }
+    const commentPageButton = target.closest<HTMLElement>("[data-task-comments-page]");
+    if (commentPageButton) {
+      const taskId = commentPageButton.dataset.taskCommentsPage ?? "";
+      const requestedPage = Number(commentPageButton.dataset.page);
+      const detail = state.taskDetails[taskId];
+      if (!detail || detail.comments === null || !Number.isInteger(requestedPage)) return;
+      detail.commentPage = clampTaskCommentPage(requestedPage, detail.comments.length);
+      renderContent();
+      return;
+    }
     const taskDetailsButton = target.closest<HTMLElement>("[data-task-details]");
     if (taskDetailsButton) {
       const taskId = taskDetailsButton.dataset.taskDetails ?? "";
-      const detail = state.taskDetails[taskId] ?? { open: false, loading: false, comments: null };
+      const detail = state.taskDetails[taskId] ?? createTaskDetailState(false);
       detail.open = !detail.open;
       state.taskDetails[taskId] = detail;
       renderContent();
@@ -251,6 +289,12 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
       await runAction(() => api.publishSample(publishSample.dataset.publishSample ?? ""), "样本版本已发布");
       return;
     }
+    const activateProfile = target.closest<HTMLElement>("[data-activate-profile]");
+    if (activateProfile) {
+      const profileId = activateProfile.dataset.activateProfile ?? "";
+      await runAction(() => api.activateProfile(profileId), "当前过滤策略已切换；新建任务将使用该策略");
+      return;
+    }
     const queueAction = target.closest<HTMLElement>("[data-queue-action]");
     if (queueAction) {
       const itemId = queueAction.dataset.itemId ?? "";
@@ -278,7 +322,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
         return;
       }
       const task = await runAction(
-        () => api.createTask({ bvid, videoUrl, title: String(data.get("title") ?? "").trim() || undefined }),
+        () => api.createTask({ bvid, videoUrl }),
         "视频任务已创建",
       );
       if (task && "taskId" in task) replaceTask(task);
@@ -310,6 +354,26 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
         state.sampleFileItems = [];
         await loadAll();
       }
+      return;
+    }
+    if (formName === "profile") {
+      const name = String(data.get("profileName") ?? "").trim();
+      if (!name) {
+        setNotice("error", "请输入策略名称");
+        return;
+      }
+      const splitTerms = (field: string): string[] => String(data.get(field) ?? "")
+        .split(/[,，\n]/).map((value) => value.trim()).filter(Boolean);
+      const profile = await runAction(() => api.createProfile({
+        name,
+        description: String(data.get("profileDescription") ?? "").trim(),
+        knownTerms: splitTerms("knownTerms"),
+        standaloneTerms: splitTerms("standaloneTerms"),
+        friendlyExceptions: splitTerms("friendlyExceptions"),
+        hostileContext: splitTerms("hostileContext"),
+        nicknamePositive: splitTerms("nicknamePositive"),
+      }), "过滤策略已创建；切换后新任务会使用它");
+      if (profile) await loadAll(true);
     }
   }
 
@@ -319,9 +383,10 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     if (target.dataset.filter) {
       state.filters[target.dataset.filter as ViewName] = target.value;
       if (target.dataset.filter === "reviews") {
-        const visible = filteredEvidenceItems(state.evidence, target.value) ?? [];
+        const visible = filteredEvidenceItems(state.evidence, target.value, state.reviewResultFilter) ?? [];
         const visibleIds = new Set(visible.map((item) => item.evidenceId));
         state.selectedEvidenceIds = state.selectedEvidenceIds.filter((evidenceId) => visibleIds.has(evidenceId));
+        if (state.selectedEvidenceId && !visibleIds.has(state.selectedEvidenceId)) state.selectedEvidenceId = undefined;
       }
       renderContent();
       return;
@@ -350,6 +415,14 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     }
     if (target instanceof HTMLSelectElement && target.name === "reviewStatus") {
       state.reviewStatus = target.value as ManagementState["reviewStatus"];
+      state.selectedEvidenceId = undefined;
+      state.selectedEvidenceIds = [];
+      await loadAll(true);
+      return;
+    }
+    if (target instanceof HTMLSelectElement && target.name === "reviewResultFilter") {
+      if (target.value !== "uncertain" && target.value !== "hit" && target.value !== "all") return;
+      state.reviewResultFilter = target.value;
       state.selectedEvidenceId = undefined;
       state.selectedEvidenceIds = [];
       await loadAll(true);
@@ -435,6 +508,11 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     state.evidenceFeedback[evidenceId] = { action, status: "busy" };
     renderContent();
     try {
+      const visibleBeforeReview = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "", state.reviewResultFilter) ?? [];
+      const currentIndex = visibleBeforeReview.findIndex((item) => item.evidenceId === evidenceId);
+      const nextEvidenceId = currentIndex < 0
+        ? undefined
+        : visibleBeforeReview[currentIndex + 1]?.evidenceId ?? visibleBeforeReview[currentIndex - 1]?.evidenceId;
       const record = await api.reviewEvidence(evidenceId, action);
       const actions = state.reviewActions.items ?? [];
       state.reviewActions = {
@@ -444,7 +522,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
         items: (state.evidence.items ?? []).filter((item) => item.evidenceId !== evidenceId),
       };
       state.selectedEvidenceIds = state.selectedEvidenceIds.filter((id) => id !== evidenceId);
-      if (state.selectedEvidenceId === evidenceId) state.selectedEvidenceId = undefined;
+      state.selectedEvidenceId = nextEvidenceId;
       state.evidenceFeedback[evidenceId] = {
         action,
         status: "success",
@@ -460,7 +538,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
   }
 
   async function runBatchReview(action: ReviewAction): Promise<void> {
-    const visibleItems = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "") ?? [];
+    const visibleItems = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "", state.reviewResultFilter) ?? [];
     const visibleIds = new Set(visibleItems.map((item) => item.evidenceId));
     const ids = state.selectedEvidenceIds.filter((evidenceId) => visibleIds.has(evidenceId));
     if (ids.length === 0) {
@@ -526,7 +604,7 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
   }
 
   function selectVisibleEvidence(checked: boolean): void {
-    const items = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "");
+    const items = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "", state.reviewResultFilter);
     if (items === null) return;
     const selected = new Set(state.selectedEvidenceIds);
     for (const item of items) {
@@ -537,32 +615,60 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     renderContent();
   }
 
-  async function loadTaskComments(taskId: string): Promise<void> {
-    const detail = state.taskDetails[taskId] ?? { open: true, loading: false, comments: null };
+async function loadTaskComments(taskId: string): Promise<void> {
+    const detail = state.taskDetails[taskId] ?? createTaskDetailState(true);
     detail.open = true;
     detail.loading = true;
     detail.comments = null;
+    detail.events = null;
+    detail.analysis = null;
+    detail.commentPage = 1;
     detail.error = undefined;
+    detail.eventsError = undefined;
+    detail.analysisError = undefined;
     state.taskDetails[taskId] = detail;
     renderContent();
-    try {
-      detail.comments = (await api.listTaskComments(taskId)).items;
-    } catch (error) {
-      detail.error = messageFromError(error);
-    } finally {
-      detail.loading = false;
-      renderContent();
-    }
+    const [comments, events, analysis] = await Promise.all([
+      api.listTaskComments(taskId).then((result) => ({ items: result.items })).catch((error) => ({ error })),
+      api.listTaskEvents(taskId).then((result) => ({ items: result.items })).catch((error) => ({ error })),
+      api.getTaskAnalysis(taskId).then((result) => ({ value: result })).catch((error) => ({ error })),
+    ]);
+    if ("error" in comments) detail.error = messageFromError(comments.error);
+    else detail.comments = comments.items;
+    if ("error" in events) detail.eventsError = messageFromError(events.error);
+    else detail.events = events.items;
+    if ("error" in analysis) detail.analysisError = messageFromError(analysis.error);
+    else detail.analysis = analysis.value;
+    detail.loading = false;
+    renderContent();
   }
 
   function renderContent(): void {
     const content = root.querySelector<HTMLElement>("[data-content]");
     if (!content) return;
+    if (state.activeView === "reviews" && renderReviewRegions()) return;
     const previousInbox = root.querySelector<HTMLElement>("[data-evidence-inbox]");
     const scrollTop = previousInbox?.scrollTop ?? 0;
     content.innerHTML = renderView(state);
     const nextInbox = root.querySelector<HTMLElement>("[data-evidence-inbox]");
     if (nextInbox && scrollTop > 0) nextInbox.scrollTop = scrollTop;
+  }
+
+  function renderReviewRegions(): boolean {
+    const inbox = root.querySelector<HTMLElement>("[data-evidence-inbox]");
+    const inspector = root.querySelector<HTMLElement>("[data-evidence-inspector]");
+    const history = root.querySelector<HTMLElement>("[data-review-history]");
+    const items = filteredEvidenceItems(state.evidence, state.filters.reviews ?? "", state.reviewResultFilter);
+    if (!inbox || !inspector || !history || items === null) return false;
+
+    const scrollTop = inbox.scrollTop;
+    inbox.innerHTML = renderEvidenceInboxContents(state, "reviews", state.filters.reviews ?? "");
+    inbox.scrollTop = scrollTop;
+
+    const selected = state.evidence.items?.find((item) => item.evidenceId === state.selectedEvidenceId);
+    inspector.innerHTML = renderEvidenceInspectorContents(selected, state);
+    history.innerHTML = renderReviewHistory(state.reviewActions, state.filters.reviews ?? "", state.evidenceFeedback);
+    return true;
   }
 
   function replaceTask(task: VideoTask): void {
@@ -583,6 +689,15 @@ export function mountManagementPage(root: HTMLElement, api = new ApiClient()): v
     state.notice = { kind, message };
     root.innerHTML = renderFrame(state);
   }
+}
+
+function createTaskDetailState(open: boolean): TaskDetailState {
+  return { open, loading: false, comments: null, events: null, analysis: null, commentPage: 1 };
+}
+
+function clampTaskCommentPage(requestedPage: number, commentCount: number): number {
+  const pageCount = Math.max(1, Math.ceil(commentCount / TASK_COMMENTS_PAGE_SIZE));
+  return Math.min(Math.max(1, requestedPage), pageCount);
 }
 
 async function loadCollection<T>(load: () => Promise<ApiList<T>>): Promise<Collection<T>> {
@@ -675,6 +790,8 @@ function renderDashboard(state: ManagementState): string {
       ${renderTaskForm()}
     </section>
     ${renderAuthDiagnostic(state.auth)}
+    ${renderModelDiagnostic(state.model)}
+    ${renderFilterProfileControl(state.profiles)}
     ${renderBlacklistControlStatus(state.blacklistSettings, state.blacklistSettingsError, true)}
     <section class="stat-grid" aria-label="工作区统计">
       ${renderStat("视频任务", taskItems ? String(taskItems.length) : "未加载", "任务列表")}
@@ -683,9 +800,33 @@ function renderDashboard(state: ManagementState): string {
       ${renderStat("拉黑队列", queueItems ? String(queueItems.length) : "未加载", "官方动作")}
     </section>
     <div class="dashboard-columns">
-      <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">任务阶段</p><h3>最近视频任务</h3></div><button class="button button-ghost" data-view="tasks" type="button">查看全部</button></div>${renderTaskCollection(state.tasks, "dashboard", "", state.taskDetails)}</section>
+      <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">任务阶段</p><h3>最近视频任务</h3></div><button class="button button-ghost" data-view="tasks" type="button">查看全部</button></div>${renderTaskCollection(state.tasks, "dashboard", "", state.taskDetails, state.profiles.items ?? [])}</section>
       <section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">需要判断</p><h3>待复核 UID</h3></div><button class="button button-ghost" data-view="reviews" type="button">打开证据</button></div>${renderEvidenceCollection(state, "dashboard")}</section>
     </div>`;
+}
+
+function renderModelDiagnostic(model: ModelHealth | null): string {
+  if (!model) {
+    return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">远程模型诊断</p><h3>模型状态暂不可用</h3></div><span class="status-pill" data-state="error">无法读取</span></div><p class="muted">本地隐藏和任务提交不依赖模型配置；刷新管理页后可重新读取。</p></section>`;
+  }
+  const ready = model.status === "ready";
+  const label = ready ? "模型已配置" : "模型未配置";
+  const state = ready ? "ready" : "paused";
+  const flag = (value: boolean): string => (value ? "已配置" : "未配置");
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">远程模型诊断</p><h3>AI 分析配置</h3></div><span class="status-pill" data-state="${state}">${label}</span></div><p class="muted">${escapeHtml(model.detail)}</p><p class="muted">地址：${flag(model.baseUrlConfigured)} · 模型名：${flag(model.modelConfigured)} · API Key：${flag(model.apiKeyConfigured)}</p></section>`;
+}
+
+function renderFilterProfileControl(collection: Collection<FilterProfile>): string {
+  if (collection.items === null) {
+    return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">过滤策略</p><h3>当前策略暂不可读取</h3></div><span class="status-pill" data-state="error">无法读取</span></div><p class="muted">${escapeHtml(collection.error ?? "本机服务尚未返回策略数据")}</p></section>`;
+  }
+  const current = collection.items.find((profile) => profile.isCurrent) ?? collection.items[0];
+  if (!current) return renderState("empty", "尚未创建过滤策略", "请创建一条策略后再提交视频任务");
+  const profileRows = collection.items.map((profile) => {
+    const ruleCount = profile.knownTerms.length + profile.standaloneTerms.length + profile.nicknamePositive.length;
+    return `<article class="list-row"><div class="row-main"><strong>${escapeHtml(profile.name)}</strong><span>${escapeHtml(profile.description || "未填写目标描述")}</span><small>规则 ${ruleCount} 条 · 例外 ${profile.friendlyExceptions.length} 条</small></div><div class="row-actions"><span class="status-pill" data-state="${profile.isCurrent ? "ready" : "info"}">${profile.isCurrent ? "当前生效" : "可切换"}</span>${profile.isCurrent ? "" : `<button class="button button-ghost" data-activate-profile="${escapeHtml(profile.profileId)}" type="button">设为当前</button>`}</div></article>`;
+  }).join("");
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">当前过滤策略</p><h3>${escapeHtml(current.name)}</h3><p class="muted">${escapeHtml(current.description)}</p></div><span class="status-pill" data-state="ready">新任务生效</span></div><div class="list">${profileRows}</div><details class="profile-create"><summary>创建通用过滤策略</summary><form class="sample-form" data-form="profile"><div class="form-row"><label>策略名称<input name="profileName" required placeholder="例如：广告评论过滤" /></label><label>目标描述<input name="profileDescription" placeholder="识别什么评论或账号" /></label></div><div class="form-row"><label>关键词<input name="knownTerms" placeholder="逗号或换行分隔" /></label><label>强命中词<input name="standaloneTerms" placeholder="出现即命中" /></label></div><div class="form-row"><label>友军例外<input name="friendlyExceptions" placeholder="优先排除" /></label><label>恶意上下文<input name="hostileContext" placeholder="与关键词组合判定" /></label></div><label>昵称高置信样本<input name="nicknamePositive" placeholder="昵称语义直接表达目标时使用" /></label><button class="button button-primary" type="submit">创建策略</button></form></details></section>`;
 }
 
 function renderBlacklistControlStatus(
@@ -720,7 +861,7 @@ function renderAuthDiagnostic(session: AuthSession | null): string {
 
 function renderTasks(state: ManagementState): string {
   const filter = state.filters.tasks ?? "";
-  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">异步工作单元</p><h3>视频任务</h3></div>${renderFilter("tasks", "搜索任务 ID、BVID 或标题", filter)}</div>${renderTaskForm()}${renderTaskCollection(state.tasks, "tasks", filter, state.taskDetails)}</section>`;
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">异步工作单元</p><h3>视频任务</h3></div>${renderFilter("tasks", "搜索任务 ID、BVID 或标题", filter)}</div>${renderTaskForm()}${renderTaskCollection(state.tasks, "tasks", filter, state.taskDetails, state.profiles.items ?? [])}</section>`;
 }
 
 function renderUids(state: ManagementState): string {
@@ -739,14 +880,23 @@ function renderReviews(state: ManagementState): string {
     all: "全部证据",
   } as const;
   const statusSelector = `<label class="review-status-filter">证据范围<select name="reviewStatus">${Object.entries(reviewStatusLabels).map(([value, label]) => `<option value="${value}" ${state.reviewStatus === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>`;
+  const reviewResultLabels: Record<EvidenceResultFilter, string> = {
+    uncertain: "AI 不确定（优先复核）",
+    hit: "AI 已命中",
+    all: "全部 AI 结果",
+  };
+  const resultSelector = `<label class="review-status-filter">AI 判定<select name="reviewResultFilter">${Object.entries(reviewResultLabels).map(([value, label]) => `<option value="${value}" ${state.reviewResultFilter === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>`;
   const description = state.reviewStatus === "pending"
-    ? "完成一项复核后，证据会从收件箱移出，并保留在下方复核历史。"
+    ? state.reviewResultFilter === "uncertain"
+      ? "当前优先处理 AI 不确定证据；完成一项复核后会移入下方历史。"
+      : "完成一项复核后，证据会从收件箱移出，并保留在下方复核历史。"
     : "历史与全部视图用于回看已处理证据；主要动作只在待复核收件箱提供。";
-  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">${reviewStatusLabels[state.reviewStatus]}</p><h3>判定复核</h3><p class="muted">${description}</p></div><div class="review-heading-controls">${statusSelector}${renderFilter("reviews", "搜索 UID、评论或来源视频", filter)}</div></div><div class="review-workbench">${renderEvidenceCollection(state, "reviews", filter)}${renderEvidenceInspector(selected, state)}</div><div class="list-heading"><h3>复核历史</h3></div>${renderReviewHistory(state.reviewActions, filter, state.evidenceFeedback)}</section>`;
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">${reviewStatusLabels[state.reviewStatus]}</p><h3>判定复核</h3><p class="muted">${description}</p></div><div class="review-heading-controls">${statusSelector}${resultSelector}${renderFilter("reviews", "搜索 UID、评论或来源视频", filter)}</div></div><div class="review-workbench">${renderEvidenceCollection(state, "reviews", filter)}${renderEvidenceInspector(selected, state)}</div><div class="list-heading"><h3>复核历史</h3></div><div data-review-history>${renderReviewHistory(state.reviewActions, filter, state.evidenceFeedback)}</div></section>`;
 }
 
 function renderSamples(state: ManagementState): string {
-  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">版本化输入</p><h3>样本库</h3></div></div>
+  const activeProfile = state.profiles.items?.find((profile) => profile.isCurrent);
+  return `<section class="workspace-section"><div class="section-heading"><div><p class="eyebrow">版本化输入</p><h3>样本库</h3><p class="muted">${activeProfile ? `新样本将归入当前策略：${escapeHtml(activeProfile.name)}` : "新样本将归入当前过滤策略"}</p></div></div>
     <form class="sample-form" data-form="sample"><div class="form-row"><label>样本类型<select name="sampleKind"><option value="comment-positive" ${state.sampleKind === "comment-positive" ? "selected" : ""}>评论正例</option><option value="comment-negative" ${state.sampleKind === "comment-negative" ? "selected" : ""}>评论反例</option><option value="nickname-positive" ${state.sampleKind === "nickname-positive" ? "selected" : ""}>昵称正例</option></select></label><label>文件导入<input name="sampleFile" type="file" accept=".txt,.csv,text/plain,text/csv" /></label></div><label>粘贴文本<textarea name="sampleText" rows="6" placeholder="每行一个样本；空行和 # 开头的行会跳过">${escapeHtml(state.sampleText)}</textarea></label><div class="sample-preview" data-sample-preview>${renderSamplePreview(state)}</div><button class="button button-primary" type="submit">创建样本草稿</button></form>
     <div class="list-heading"><h3>版本快照</h3></div>${renderSampleCollection(state.samples, state.sampleDetails)}</section>`;
 }
@@ -760,26 +910,22 @@ function renderTaskForm(): string {
   return `<form class="task-form" data-form="task"><label>视频 URL<input name="videoUrl" type="url" placeholder="https://www.bilibili.com/video/BV..." required /></label><label>BVID<input name="bvid" placeholder="可从 URL 自动提取" /></label><p class="muted">任务名称将从 B 站视频元数据读取，浏览器页签标题不会作为原标题保存。</p><button class="button button-primary" type="submit">创建视频任务</button></form>`;
 }
 
-function renderTaskCollection(collection: Collection<VideoTask>, view: "dashboard" | "tasks", filter = "", taskDetails: Record<string, TaskDetailState> = {}): string {
+function renderTaskCollection(collection: Collection<VideoTask>, view: "dashboard" | "tasks", filter = "", taskDetails: Record<string, TaskDetailState> = {}, profiles: FilterProfile[] = []): string {
   if (collection.items === null) return collection.error ? renderState("error", "任务列表加载失败", collection.error) : renderState("loading", "正在载入任务", "");
   const items = collection.items.filter((task) => `${task.taskId} ${task.bvid} ${task.title}`.toLowerCase().includes(filter.toLowerCase()));
   if (items.length === 0) return renderState(filter ? "filtered-empty" : "empty", filter ? "当前筛选没有匹配任务" : "还没有视频任务", filter ? "清除筛选或回到完整集合" : "从上方提交一个普通 BV 视频");
-  return `<div class="list" data-list="${view}">${items.slice(0, view === "dashboard" ? 5 : undefined).map((task) => renderTaskRow(task, taskDetails[task.taskId])).join("")}</div>`;
+  return `<div class="list" data-list="${view}">${items.slice(0, view === "dashboard" ? 5 : undefined).map((task) => renderTaskRow(task, taskDetails[task.taskId], profiles)).join("")}</div>`;
 }
 
-function renderTaskRow(task: VideoTask, detail?: TaskDetailState): string {
+function renderTaskRow(task: VideoTask, detail?: TaskDetailState, profiles: FilterProfile[] = []): string {
   const view = taskViewState(task.status);
   const isOpen = detail?.open === true;
-  return `<article class="task-row" data-state="${view.kind}"><div class="list-row"><div class="row-main"><strong>${escapeHtml(task.title || task.bvid)}</strong><span class="mono">${escapeHtml(task.taskId)} · ${escapeHtml(task.bvid)}</span><small>${escapeHtml(task.phase ?? "")} ${task.progress === undefined ? "" : `${task.progress}%`}</small></div><div class="row-actions"><span class="status-pill" data-state="${view.kind}">${view.label}</span><button class="button button-ghost" data-task-details="${escapeHtml(task.taskId)}" type="button" aria-expanded="${isOpen ? "true" : "false"}">${isOpen ? "收起详情" : "查看评论详情"}</button>${task.status === "failed" ? `<button class="button button-ghost" data-retry-task="${escapeHtml(task.taskId)}" type="button">重试</button>` : ""}</div></div>${isOpen ? renderTaskDetail(task, detail) : ""}</article>`;
+  const canRetry = task.status === "failed" || task.status === "partial" || task.status === "paused";
+  return `<article class="task-row" data-state="${view.kind}"><div class="list-row"><div class="row-main"><strong>${escapeHtml(task.title || task.bvid)}</strong><span class="mono">${escapeHtml(task.taskId)} · ${escapeHtml(task.bvid)}</span><small>${escapeHtml(profileLabel(profiles, task.profileId))} · ${escapeHtml(task.phase ?? "")} ${task.progress === undefined ? "" : `${task.progress}%`}</small></div><div class="row-actions"><span class="status-pill" data-state="${view.kind}">${view.label}</span><button class="button button-ghost" data-task-details="${escapeHtml(task.taskId)}" type="button" aria-expanded="${isOpen ? "true" : "false"}">${isOpen ? "收起详情" : "查看任务详情"}</button>${canRetry ? `<button class="button button-ghost" data-retry-task="${escapeHtml(task.taskId)}" type="button">重试</button>` : ""}</div></div>${isOpen ? renderTaskDetail(task, detail) : ""}</article>`;
 }
 
 function renderTaskDetail(task: VideoTask, detail: TaskDetailState): string {
-  const failedItems = task.failedItems;
-  const failedMarkup = failedItems === undefined
-    ? `<p class="muted">未提供</p>`
-    : failedItems.length === 0
-      ? `<p class="muted">无</p>`
-      : `<ul class="task-failure-list">${failedItems.map((item) => `<li class="mono">${escapeHtml(item)}</li>`).join("")}</ul>`;
+  const failedMarkup = renderTaskFailures(task.failedItems);
   let commentsMarkup: string;
   if (detail.loading) {
     commentsMarkup = renderState("loading", "正在载入任务评论", "只更新当前任务详情");
@@ -788,9 +934,284 @@ function renderTaskDetail(task: VideoTask, detail: TaskDetailState): string {
   } else if (!detail.comments || detail.comments.length === 0) {
     commentsMarkup = renderState("empty", "暂无已保存评论", "该任务没有可展示的根评论或楼中楼");
   } else {
-    commentsMarkup = `<div class="task-comments">${detail.comments.map(renderTaskComment).join("")}</div>`;
+    commentsMarkup = renderTaskComments(task.taskId, detail.comments, detail.commentPage);
   }
-  return `<section class="task-detail" data-task-detail="${escapeHtml(task.taskId)}" aria-label="任务详情"><div class="task-detail-heading"><div><p class="eyebrow">采集结果</p><h4>任务详情</h4></div>${task.error ? `<span class="status-pill" data-state="error">${escapeHtml(task.errorCode ?? "任务有失败项")}</span>` : `<span class="status-pill" data-state="ready">已保存结果</span>`}</div><div class="task-stat-grid"><div class="task-stat"><span>保存根评论</span><strong>${formatTaskNumber(task.collectedComments)}</strong></div><div class="task-stat"><span>保存楼中楼</span><strong>${formatTaskNumber(task.replyCount)}</strong></div><div class="task-stat"><span>置顶评论</span><strong>${formatTaskNumber(task.pinnedComments)}</strong></div><div class="task-stat"><span>覆盖率</span><strong>${formatTaskCoverage(task.coverage)}</strong></div><div class="task-stat"><span>请求页数</span><strong>${formatTaskNumber(task.requestedPages)}</strong></div><div class="task-stat"><span>声明评论 / 回复</span><strong>${formatTaskNumber(task.declaredComments)} / ${formatTaskNumber(task.declaredReplies)}</strong></div><div class="task-stat"><span>声明总量</span><strong>${formatTaskNumber(task.declaredTotal)}</strong></div></div><div class="task-failures"><h5>失败项</h5>${failedMarkup}</div>${task.error ? `<div class="task-error"><strong>任务错误${task.errorCode ? ` · ${escapeHtml(task.errorCode)}` : ""}</strong><p>${escapeHtml(task.error)}</p></div>` : ""}<div class="task-comments-section"><div class="section-heading"><div><p class="eyebrow">评论明细</p><h5>根评论与楼中楼</h5></div></div>${commentsMarkup}</div></section>`;
+  const observabilityMarkup = `<div class="task-observability-grid">${renderTaskAnalysis(task, detail.analysis, detail.analysisError, detail.loading)}${renderTaskTimeline(task, detail.events, detail.eventsError, detail.loading)}</div>`;
+  const taskIssueMarkup = task.error || task.errorCode ? renderTaskIssue(task.errorCode, task.error) : "";
+  const taskIssueState = task.errorCode === "collection_incomplete" ? "info" : "error";
+  const taskIssueLabel = task.errorCode ? taskErrorLabel(task.errorCode) : "任务有失败项";
+  return `<section class="task-detail" data-task-detail="${escapeHtml(task.taskId)}" aria-label="任务详情"><div class="task-detail-heading"><div><p class="eyebrow">采集结果</p><h4>任务详情</h4></div>${taskIssueMarkup ? `<span class="status-pill" data-state="${taskIssueState}">${escapeHtml(taskIssueLabel)}</span>` : `<span class="status-pill" data-state="ready">已保存结果</span>`}</div><div class="task-stat-grid"><div class="task-stat"><span>保存根评论</span><strong>${formatTaskNumber(task.collectedComments)}</strong></div><div class="task-stat"><span>保存楼中楼</span><strong>${formatTaskNumber(task.replyCount)}</strong></div><div class="task-stat"><span>置顶评论</span><strong>${formatTaskNumber(task.pinnedComments)}</strong></div><div class="task-stat"><span>覆盖率</span><strong>${formatTaskCoverage(task.coverage)}</strong></div><div class="task-stat"><span>请求页数</span><strong>${formatTaskNumber(task.requestedPages)}</strong></div><div class="task-stat"><span>声明评论 / 回复</span><strong>${formatTaskNumber(task.declaredComments)} / ${formatTaskNumber(task.declaredReplies)}</strong></div><div class="task-stat"><span>声明总量</span><strong>${formatTaskNumber(task.declaredTotal)}</strong></div></div><div class="task-failures"><h5>失败项</h5>${failedMarkup}</div>${taskIssueMarkup}${observabilityMarkup}<div class="task-comments-section"><div class="section-heading"><div><p class="eyebrow">评论明细</p><h5>根评论与楼中楼</h5></div></div>${commentsMarkup}</div></section>`;
+}
+
+interface TaskFailureSummary {
+  label: string;
+  count: number;
+}
+
+function renderTaskFailures(failedItems: string[] | undefined): string {
+  if (failedItems === undefined) return `<p class="muted">未提供</p>`;
+  if (failedItems.length === 0) return `<p class="muted">无</p>`;
+  const summaries = summarizeTaskFailures(failedItems);
+  const summaryMarkup = summaries
+    .map((summary) => `<li><span>${escapeHtml(summary.label)}</span><strong>${summary.count} 条</strong></li>`)
+    .join("");
+  const rawMarkup = `<details class="task-failure-raw"><summary>查看原始失败项（${failedItems.length} 条）</summary><ul class="task-failure-list">${failedItems.map((item) => `<li class="mono">${escapeHtml(item)}</li>`).join("")}</ul></details>`;
+  return `<ul class="task-failure-summary">${summaryMarkup}</ul>${rawMarkup}`;
+}
+
+function summarizeTaskFailures(failedItems: string[]): TaskFailureSummary[] {
+  const counts = new Map<string, number>();
+  for (const item of failedItems) {
+    const label = taskFailureLabel(item);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([label, count]) => ({ label, count }));
+}
+
+function taskFailureLabel(item: string): string {
+  const normalized = item.trim().toLowerCase();
+  if (normalized.startsWith("inconsistent_root_item:")) {
+    if (normalized.includes("missing_comment_id")) return "根评论缺少评论 ID";
+    if (normalized.includes(":not_object")) return "根评论结构异常";
+    return "根评论数据异常";
+  }
+  if (normalized.startsWith("empty_reply_page:")) return "楼中楼空页";
+  if (normalized.startsWith("empty_root_page:")) return "根评论空页";
+  if (normalized.startsWith("reply_page_failed:")) return "楼中楼采集失败";
+  return "其他采集异常";
+}
+
+function renderTaskIssue(errorCode: string | undefined, errorMessage: string | undefined): string {
+  const label = errorCode ? taskErrorLabel(errorCode) : "任务有失败项";
+  const message = taskErrorMessage(errorCode, errorMessage);
+  const rawMarkup = errorCode || errorMessage
+    ? `<details class="task-raw-diagnostic"><summary>查看内部错误信息</summary><dl><div><dt>错误码</dt><dd class="mono">${escapeHtml(errorCode ?? "未提供")}</dd></div><div><dt>原始信息</dt><dd>${escapeHtml(errorMessage ?? "未提供")}</dd></div></dl></details>`
+    : "";
+  const state = errorCode === "collection_incomplete" ? "task-error task-error-info" : "task-error";
+  return `<div class="${state}"><strong>${escapeHtml(label)}</strong><p>${escapeHtml(message)}</p>${rawMarkup}</div>`;
+}
+
+function taskErrorLabel(errorCode: string): string {
+  return ({
+    collection_incomplete: "采集未完整",
+    collection_failed: "评论采集失败",
+    collection_paused: "采集已暂停",
+    auth_unavailable: "登录态不可用",
+    invalid_model_response: "AI 返回格式无法识别",
+    model_unavailable: "AI 服务暂不可用",
+    analysis_failed: "AI 分析失败",
+  } as Record<string, string>)[errorCode] ?? "任务处理失败";
+}
+
+function taskErrorMessage(errorCode: string | undefined, errorMessage: string | undefined): string {
+  if (errorCode === "collection_incomplete") {
+    return errorMessage?.includes("were analyzed")
+      ? "采集没有覆盖全部评论，但已保存的评论已经继续交给 AI 分析。"
+      : "采集没有覆盖全部评论，当前已保存内容未能继续分析。";
+  }
+  if (errorCode === "invalid_model_response") {
+    return "模型返回内容无法解析为有效 JSON，请检查模型输出格式和最大输出长度。";
+  }
+  if (errorCode === "model_unavailable") return "模型服务暂时不可用，已保留采集结果，稍后可以重试。";
+  if (errorCode === "auth_unavailable") return "B 站登录态不可用，采集已暂停；更新登录态后再重试。";
+  return errorMessage || "任务未能完成，请查看处理时间线。";
+}
+
+function renderTaskAnalysis(
+  task: VideoTask,
+  analysis: TaskAnalysis | null,
+  error: string | undefined,
+  loading: boolean,
+): string {
+  const taskId = task.taskId;
+  if (error) {
+    return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">AI 运行记录</p><h5>AI 分析摘要</h5></div><span class="status-pill" data-state="error">读取失败</span></div>${renderState("error", "AI 分析记录加载失败", error)}<button class="button button-ghost" data-task-observability-retry="${escapeHtml(taskId)}" type="button">重试读取诊断</button></section>`;
+  }
+  if (analysis === null) {
+    const detail = loading
+      ? ""
+      : isTerminalTask(task)
+        ? "任务在诊断记录启用前完成，本机没有保存 AI 分析记录，无法从历史数据补写。"
+        : "该任务尚未进入分析阶段";
+    const title = loading ? "正在读取 AI 分析记录" : isTerminalTask(task) ? "历史任务未启用诊断" : "暂无 AI 分析记录";
+    return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">AI 运行记录</p><h5>AI 分析摘要</h5></div>${!loading && isTerminalTask(task) ? `<span class="status-pill" data-state="info">历史任务</span>` : ""}</div>${renderState(loading ? "loading" : "empty", title, detail)}</section>`;
+  }
+  const run = analysis.latest;
+  if (!run) {
+    const isLegacy = isTerminalTask(task) && analysis.attempts.length === 0;
+    return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">AI 运行记录</p><h5>AI 分析摘要</h5></div><span class="status-pill" data-state="info">${isLegacy ? "历史任务" : "未开始"}</span></div>${renderState("empty", isLegacy ? "历史任务未启用诊断" : "AI 尚未开始", isLegacy ? "任务在诊断记录启用前完成，无法从历史数据补写。" : "采集阶段没有把任务交给模型")}</section>`;
+  }
+  const runState = run.status === "completed" ? "ready" : run.status === "failed" ? "error" : run.status === "unavailable" ? "paused" : "processing";
+  const errorMarkup = run.errorMessage
+    ? renderTaskIssue(run.errorCode, run.errorMessage)
+    : "";
+  return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">AI 运行记录 · 第 ${run.attempt + 1} 次尝试</p><h5>AI 分析摘要</h5></div><span class="status-pill" data-state="${runState}">${analysisStatusLabel(run.status)}</span></div><div class="task-analysis-grid"><div class="task-stat"><span>模型</span><strong class="mono">${escapeHtml(run.model ?? "未记录")}</strong></div><div class="task-stat"><span>样本版本</span><strong class="mono">${escapeHtml(run.sampleVersion ?? "未使用")}</strong></div><div class="task-stat"><span>分析批次</span><strong>${run.batchCount}</strong></div><div class="task-stat"><span>分析 UID</span><strong>${run.accountCount}</strong></div><div class="task-stat"><span>命中</span><strong>${run.hitCount}</strong></div><div class="task-stat"><span>不确定</span><strong>${run.uncertainCount}</strong></div><div class="task-stat"><span>非目标</span><strong>${run.nonTargetCount}</strong></div><div class="task-stat"><span>证据</span><strong>${run.evidenceCount}</strong></div></div>${analysis.attempts.length > 1 ? `<p class="muted">已保留 ${analysis.attempts.length} 次分析尝试的摘要。</p>` : ""}${errorMarkup}</section>`;
+}
+
+function renderTaskTimeline(
+  task: VideoTask,
+  events: TaskEvent[] | null,
+  error: string | undefined,
+  loading: boolean,
+): string {
+  const taskId = task.taskId;
+  if (error) {
+    return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">任务诊断</p><h5>处理时间线</h5></div><span class="status-pill" data-state="error">读取失败</span></div>${renderState("error", "时间线加载失败", error)}<button class="button button-ghost" data-task-observability-retry="${escapeHtml(taskId)}" type="button">重试读取诊断</button></section>`;
+  }
+  if (events === null) {
+    return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">任务诊断</p><h5>处理时间线</h5></div></div>${loading ? renderState("loading", "正在读取处理时间线", "") : renderState("empty", "暂无处理记录", "")}</section>`;
+  }
+  if (events.length === 0) {
+    const isLegacy = isTerminalTask(task);
+    return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">任务诊断</p><h5>处理时间线</h5></div>${isLegacy ? `<span class="status-pill" data-state="info">历史任务</span>` : ""}</div>${renderState("empty", isLegacy ? "历史任务未启用诊断" : "暂无处理记录", isLegacy ? "没有可回溯的处理记录；对可重试任务点击“重试”后会生成完整记录。" : "任务还没有开始执行")}</section>`;
+  }
+  return `<section class="task-observability-panel"><div class="section-heading"><div><p class="eyebrow">任务诊断</p><h5>处理时间线</h5></div><span class="status-pill" data-state="info">${events.length} 条记录</span></div><ol class="task-timeline">${events.map((event) => `<li class="task-timeline-item"><div class="task-timeline-meta"><span class="status-pill" data-state="${event.status === "failed" ? "error" : event.status === "succeeded" ? "ready" : "info"}">${escapeHtml(taskEventLabel(event.eventType))}</span><span>${escapeHtml(taskPhaseLabel(event.phase))}</span><time datetime="${escapeAttribute(event.createdAt)}">${escapeHtml(event.createdAt)}</time></div><p>${escapeHtml(taskEventMessage(event))}</p>${renderTaskEventDetails(event.details)}</li>`).join("")}</ol></section>`;
+}
+
+function renderTaskEventDetails(details: Record<string, unknown>): string {
+  const entries = Object.entries(details);
+  if (entries.length === 0) return "";
+  const visible = entries.filter(([key, value]) => isVisibleTaskDetail(key, value));
+  const visibleMarkup = visible.length > 0
+    ? `<dl class="task-event-details">${visible.map(([key, value]) => `<div><dt>${escapeHtml(taskDetailLabel(key))}</dt><dd>${escapeHtml(formatTaskDetailValue(key, value))}</dd></div>`).join("")}</dl>`
+    : "";
+  const rawMarkup = `<details class="task-raw-diagnostic"><summary>查看原始诊断数据</summary><pre class="mono">${escapeHtml(formatRawTaskDetails(details))}</pre></details>`;
+  return `${visibleMarkup}${rawMarkup}`;
+}
+
+const VISIBLE_TASK_DETAIL_KEYS = new Set([
+  "account_count",
+  "batch_count",
+  "evidence_count",
+  "hit_count",
+  "uncertain_count",
+  "non_target_count",
+  "partial_result_count",
+  "error_code",
+  "error_message",
+  "response_valid",
+  "sample_version",
+  "requested_pages",
+  "saved_comments",
+  "saved_replies",
+  "declared_comments",
+  "declared_replies",
+  "declared_total",
+  "coverage",
+  "failed_item_count",
+  "complete",
+  "terminal",
+  "analysis_continues",
+  "collection_complete",
+  "result_count",
+  "model",
+  "attempt",
+  "from",
+  "to",
+  "reason",
+]);
+
+function isVisibleTaskDetail(key: string, value: unknown): boolean {
+  return VISIBLE_TASK_DETAIL_KEYS.has(key) && (typeof value !== "object" || value === null);
+}
+
+function formatTaskDetailValue(key: string, value: unknown): string {
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (value === null || value === undefined) return "未提供";
+  if (key === "coverage" && typeof value === "number") return formatTaskCoverage(value);
+  if ((key === "from" || key === "to") && typeof value === "string") return taskStatusLabel(value);
+  if (key === "error_code" && typeof value === "string") return taskErrorLabel(value);
+  return String(value);
+}
+
+function formatRawTaskDetails(details: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(details, null, 2);
+  } catch {
+    return "原始诊断数据无法格式化";
+  }
+}
+
+function taskEventMessage(event: TaskEvent): string {
+  const details = event.details;
+  switch (event.eventType) {
+    case "task_created":
+      return "任务已创建，等待开始采集";
+    case "task_started":
+      return "开始执行任务";
+    case "retry_scheduled":
+      return "重试已排队";
+    case "task_transition":
+      return `任务状态：${taskStatusLabel(details.from)} → ${taskStatusLabel(details.to)}`;
+    case "phase_started":
+      return event.phase === "collecting" ? "开始采集评论" : event.phase === "analyzing" ? "开始 AI 分析" : "处理阶段已开始";
+    case "collection_progress":
+      return "采集器返回当前进度";
+    case "collection_saved":
+      return "已保存评论和续采进度";
+    case "collection_paused":
+      return "采集已暂停，等待恢复条件";
+    case "collection_incomplete":
+      return details.analysis_continues === true || (taskDetailNumber(details, "saved_comments") ?? 0) + (taskDetailNumber(details, "saved_replies") ?? 0) > 0
+        ? "采集未完整；已保存评论继续进入 AI 分析"
+        : "采集未完整；没有可分析评论，因此未启动 AI";
+    case "collection_failed":
+      return "评论采集失败";
+    case "analysis_started":
+      return `准备批量分析${taskDetailNumber(details, "account_count") === undefined ? " UID" : ` ${taskDetailNumber(details, "account_count")} 个 UID`}`;
+    case "model_batch":
+      return event.status === "succeeded"
+        ? `AI 批次已全部返回${taskDetailNumber(details, "batch_count") === undefined ? "" : `，共 ${taskDetailNumber(details, "batch_count")} 批`}`
+        : "开始发送 AI 批次";
+    case "model_response":
+      return `AI 返回结果已通过格式校验${taskDetailNumber(details, "result_count") === undefined ? "" : `，得到 ${taskDetailNumber(details, "result_count")} 个 UID`}`;
+    case "analysis_completed":
+      return `AI 分析完成：命中 ${taskDetailNumber(details, "hit_count") ?? 0}，不确定 ${taskDetailNumber(details, "uncertain_count") ?? 0}，非目标 ${taskDetailNumber(details, "non_target_count") ?? 0}`;
+    case "analysis_failed":
+      return `AI 分析失败${typeof details.error_code === "string" ? `：${taskErrorLabel(details.error_code)}` : ""}`;
+    default:
+      return /[\u3400-\u9fff]/.test(event.message) ? event.message : taskEventLabel(event.eventType);
+  }
+}
+
+function taskDetailNumber(details: Record<string, unknown>, key: string): number | undefined {
+  return typeof details[key] === "number" && Number.isFinite(details[key]) ? details[key] as number : undefined;
+}
+
+function taskStatusLabel(value: unknown): string {
+  return ({ queued: "排队", collecting: "采集", analyzing: "AI 分析", completed: "完成", partial: "部分完成", failed: "失败", paused: "暂停" } as Record<string, string>)[String(value)] ?? String(value ?? "未提供");
+}
+
+function analysisStatusLabel(status: AnalysisRun["status"]): string {
+  return ({ running: "分析中", completed: "分析成功", failed: "分析失败", unavailable: "模型不可用", not_started: "未进入 AI" } as Record<string, string>)[status] ?? status;
+}
+
+function taskEventLabel(eventType: string): string {
+  return ({ task_created: "任务创建", task_started: "开始执行", retry_scheduled: "已排队重试", task_transition: "状态变更", phase_started: "阶段开始", phase_failed: "阶段失败", collection_progress: "采集进度", collection_saved: "采集已保存", collection_paused: "采集暂停", collection_incomplete: "采集未完整", collection_failed: "采集失败", analysis_started: "分析开始", model_batch: "模型批次", model_response: "模型响应", analysis_completed: "分析完成", analysis_failed: "分析失败" } as Record<string, string>)[eventType] ?? eventType;
+}
+
+function taskPhaseLabel(phase: string): string {
+  return ({ queued: "排队", collecting: "采集", analyzing: "AI 分析", completed: "完成", task: "任务" } as Record<string, string>)[phase] ?? phase;
+}
+
+function taskDetailLabel(key: string): string {
+  return ({ account_count: "账号数", batch_count: "批次数", evidence_count: "证据数", hit_count: "命中", uncertain_count: "不确定", non_target_count: "非目标", partial_result_count: "部分结果", error_code: "错误类型", error_type: "错误类型", error_message: "错误信息", response_valid: "响应有效", sample_version: "样本版本", requested_pages: "请求页数", saved_comments: "保存根评论", saved_replies: "保存回复", declared_comments: "声明评论", declared_replies: "声明回复", declared_total: "声明总量", coverage: "覆盖率", failed_item_count: "失败项数", complete: "采集完成", terminal: "采集终止", analysis_continues: "继续分析", collection_complete: "采集完整", result_count: "结果数", model: "模型", attempt: "尝试次数", from: "原状态", to: "新状态", reason: "原因" } as Record<string, string>)[key] ?? key;
+}
+
+function isTerminalTask(task: VideoTask): boolean {
+  return task.status === "ready" || task.status === "partial" || task.status === "failed";
+}
+
+function renderTaskComments(taskId: string, comments: TaskComment[], requestedPage: number): string {
+  const pageCount = Math.max(1, Math.ceil(comments.length / TASK_COMMENTS_PAGE_SIZE));
+  const page = clampTaskCommentPage(requestedPage, comments.length);
+  const startIndex = (page - 1) * TASK_COMMENTS_PAGE_SIZE;
+  const pageItems = comments.slice(startIndex, startIndex + TASK_COMMENTS_PAGE_SIZE);
+  const endIndex = startIndex + pageItems.length;
+  const pagination = pageCount > 1
+    ? `<nav class="task-comments-pagination" aria-label="评论分页"><button class="button button-quiet" data-task-comments-page="${escapeHtml(taskId)}" data-page="${page - 1}" type="button" aria-label="上一页" ${page === 1 ? "disabled" : ""}>上一页</button><span aria-live="polite">第 ${page} / ${pageCount} 页</span><button class="button button-quiet" data-task-comments-page="${escapeHtml(taskId)}" data-page="${page + 1}" type="button" aria-label="下一页" ${page === pageCount ? "disabled" : ""}>下一页</button></nav>`
+    : "";
+  return `<div class="task-comments-toolbar"><span class="task-comments-meta">显示 ${startIndex + 1}-${endIndex} 条，共 ${comments.length} 条评论 · 每页 ${TASK_COMMENTS_PAGE_SIZE} 条</span>${pagination}</div><div class="task-comments">${pageItems.map(renderTaskComment).join("")}</div>`;
 }
 
 function renderTaskComment(comment: TaskComment): string {
@@ -819,18 +1240,27 @@ function renderUidCollection(collection: Collection<UidRecord>, filter: string):
 
 function renderEvidenceCollection(state: ManagementState, view: "dashboard" | "reviews", filter = ""): string {
   const evidenceCollection = view === "dashboard" ? state.dashboardEvidence : state.evidence;
-  const items = filteredEvidenceItems(evidenceCollection, filter);
+  const items = filteredEvidenceItems(evidenceCollection, filter, view === "reviews" ? state.reviewResultFilter : "all");
   const isInbox = view === "reviews" && state.reviewStatus === "pending";
+  const resultFilter = view === "reviews" ? state.reviewResultFilter : "all";
   if (items === null) {
     return evidenceCollection.error
       ? renderState("error", "证据加载失败", evidenceCollection.error)
       : renderState("loading", "正在载入证据", "");
   }
   if (items.length === 0) {
+    const resultEmptyTitle = resultFilter === "uncertain"
+      ? "当前没有 AI 不确定证据"
+      : resultFilter === "hit"
+        ? "当前没有 AI 已命中证据"
+        : "待复核收件箱为空";
+    const resultEmptyDetail = resultFilter === "all"
+      ? "已处理证据会保留在下方复核历史"
+      : "可以切换 AI 判定筛选查看其他证据";
     const emptyState = renderState(
       filter ? "filtered-empty" : "empty",
-      filter ? "当前筛选没有匹配证据" : "待复核收件箱为空",
-      filter ? "清除筛选或回到完整集合" : "已处理证据会保留在下方复核历史",
+      filter ? "当前筛选没有匹配证据" : resultEmptyTitle,
+      filter ? "清除筛选或回到完整集合" : resultEmptyDetail,
     );
     if (!isInbox) return emptyState;
     return `<div class="evidence-inbox" data-evidence-inbox><div class="evidence-inbox-heading"><span>待处理收件箱 · 0 条证据</span></div>${renderEvidenceInboxToolbar(state, items)}${emptyState}</div>`;
@@ -840,14 +1270,27 @@ function renderEvidenceCollection(state: ManagementState, view: "dashboard" | "r
   return `<div class="evidence-inbox" data-evidence-inbox><div class="evidence-inbox-heading"><span>${view === "reviews" ? `当前筛选 ${items.length} 条证据` : `最近 ${visibleItems.length} 条证据`}</span>${view === "dashboard" ? `<span class="muted">主要字段已直接显示</span>` : ""}</div>${toolbar}<div class="evidence-list">${visibleItems.map((item) => renderEvidenceRow(item, state, view)).join("")}</div></div>`;
 }
 
-function filteredEvidenceItems(collection: Collection<Evidence>, filter: string): Evidence[] | null {
+function filteredEvidenceItems(
+  collection: Collection<Evidence>,
+  filter: string,
+  resultFilter: EvidenceResultFilter = "all",
+): Evidence[] | null {
   if (collection.items === null) return null;
   const normalizedFilter = filter.toLowerCase();
   return collection.items.filter((item) => (
-    `${item.uid} ${item.nicknameSnapshot} ${item.commentText} ${item.sourceVideo ?? ""} ${item.videoId} ${item.signals.join(" ")}`
+    (resultFilter === "all" || item.result === resultFilter)
+    && `${item.uid} ${item.nicknameSnapshot} ${item.commentText} ${item.sourceVideo ?? ""} ${item.videoId} ${item.signals.join(" ")}`
       .toLowerCase()
       .includes(normalizedFilter)
   ));
+}
+
+function renderEvidenceInboxContents(state: ManagementState, view: "dashboard" | "reviews", filter: string): string {
+  const markup = renderEvidenceCollection(state, view, filter);
+  const openTag = `<div class="evidence-inbox" data-evidence-inbox>`;
+  if (!markup.startsWith(openTag)) return markup;
+  const closeIndex = markup.lastIndexOf("</div>");
+  return closeIndex > openTag.length ? markup.slice(openTag.length, closeIndex) : markup;
 }
 
 function renderEvidenceInboxToolbar(state: ManagementState, items: Evidence[]): string {
@@ -885,7 +1328,7 @@ function renderEvidenceRow(evidence: Evidence, state: ManagementState, view: "da
     ? `<button class="button button-ghost evidence-inspect-button" data-evidence-select="${escapeHtml(evidence.evidenceId)}" type="button">${state.selectedEvidenceId === evidence.evidenceId ? "已选中详情" : "查看详情"}</button>`
     : `<button class="button button-ghost evidence-inspect-button" data-view="reviews" type="button">去复核</button>`;
   const actions = isInbox ? renderEvidenceActionControls(evidence, state) : "";
-  return `<article class="evidence-row ${selected ? "is-selected" : ""}" data-evidence-row="${escapeHtml(evidence.evidenceId)}"><div class="evidence-row-layout">${selection}<div class="evidence-row-content"><div class="evidence-row-heading"><div class="evidence-identity"><strong class="mono">${escapeHtml(evidence.uid)}</strong><span>${escapeHtml(evidence.nicknameSnapshot || "无昵称快照")}</span></div><div class="evidence-statuses"><span class="status-pill" data-state="${evidence.result === "hit" ? "ready" : "processing"}">AI · ${evidence.result === "hit" ? "命中" : "不确定"}</span><span class="status-pill" data-state="${human.state}">人工 · ${escapeHtml(human.label)}</span></div></div><div class="evidence-row-meta"><span class="mono">置信度 ${formatEvidenceConfidence(evidence.confidence)}</span><span>${escapeHtml(evidence.videoId || "来源视频未提供")}</span><span>${escapeHtml(evidence.createdAt || "时间未提供")}</span></div><p class="evidence-summary">${escapeHtml(evidence.commentText || "未提供评论摘要")}</p><div class="evidence-signal-line"><span class="muted">命中信号</span><span>${escapeHtml(evidence.signals.length > 0 ? evidence.signals.join(" · ") : evidence.signal ?? "未提供")}</span></div><div class="evidence-row-footer"><span class="muted">${escapeHtml(human.detail)}</span><div class="row-actions">${inspectButton}${actions}</div></div>${feedbackMarkup(evidence, feedback)}</div></div></article>`;
+  return `<article class="evidence-row ${selected ? "is-selected" : ""}" data-evidence-row="${escapeHtml(evidence.evidenceId)}"><div class="evidence-row-layout">${selection}<div class="evidence-row-content"><div class="evidence-row-heading"><div class="evidence-identity"><strong class="mono">${escapeHtml(evidence.uid)}</strong><span>${escapeHtml(evidence.nicknameSnapshot || "无昵称快照")}</span></div><div class="evidence-statuses"><span class="status-pill" data-state="${evidence.result === "hit" ? "ready" : "processing"}">AI · ${evidence.result === "hit" ? "命中" : "不确定"}</span><span class="status-pill" data-state="${human.state}">人工 · ${escapeHtml(human.label)}</span></div></div><div class="evidence-row-meta"><span class="mono">${escapeHtml(profileLabel(state.profiles.items ?? [], evidence.profileId))}</span><span class="mono">置信度 ${formatEvidenceConfidence(evidence.confidence)}</span><span>${escapeHtml(evidence.videoId || "来源视频未提供")}</span><span>${escapeHtml(evidence.createdAt || "时间未提供")}</span></div><p class="evidence-summary">${escapeHtml(evidence.commentText || "未提供评论摘要")}</p><div class="evidence-signal-line"><span class="muted">命中信号</span><span>${escapeHtml(evidence.signals.length > 0 ? evidence.signals.join(" · ") : evidence.signal ?? "未提供")}</span></div><div class="evidence-row-footer"><span class="muted">${escapeHtml(human.detail)}</span><div class="row-actions">${inspectButton}${actions}</div></div>${feedbackMarkup(evidence, feedback)}</div></div></article>`;
 }
 
 function renderEvidenceActionControls(evidence: Evidence, state: ManagementState): string {
@@ -941,6 +1384,13 @@ function renderEvidenceInspector(evidence: Evidence | undefined, state: Manageme
     ? evidence.comments.map(renderEvidenceComment).join("")
     : `<li class="evidence-thread-item"><p>${escapeHtml(evidence.commentText || "未提供评论正文")}</p><span class="muted">未提供完整评论数组</span></li>`;
   return `<aside class="evidence-inspector" data-evidence-inspector><div class="evidence-inspector-heading"><div><p class="eyebrow">详情检查器</p><h4>${escapeHtml(evidence.uid)} · ${escapeHtml(evidence.nicknameSnapshot || "无昵称快照")}</h4></div><button class="button button-ghost" data-evidence-close="true" type="button">关闭详情</button></div><div class="evidence-inspector-status"><span class="status-pill" data-state="${evidence.result === "hit" ? "ready" : "processing"}">AI · ${evidence.result === "hit" ? "命中" : "不确定"} · ${formatEvidenceConfidence(evidence.confidence)}</span><span class="status-pill" data-state="${human.state}">人工 · ${escapeHtml(human.label)}</span></div><section class="evidence-inspector-section"><h5>完整评论与楼层上下文</h5><ol class="evidence-thread">${comments}</ol></section><section class="evidence-inspector-section"><h5>判定证据</h5><dl><div><dt>来源视频</dt><dd>${evidence.sourceVideo ? `<a href="${escapeAttribute(evidence.sourceVideo)}" target="_blank" rel="noreferrer">${escapeHtml(evidence.videoId || evidence.sourceVideo)}</a>` : escapeHtml(evidence.videoId || "未提供")}</dd></div><div><dt>评论链接</dt><dd>${evidence.commentUrl ? `<a href="${escapeAttribute(evidence.commentUrl)}" target="_blank" rel="noreferrer">打开评论原址</a>` : "未提供"}</dd></div><div><dt>命中信号</dt><dd>${escapeHtml(evidence.signals.length > 0 ? evidence.signals.join(" · ") : evidence.signal ?? "未提供")}</dd></div><div><dt>模型理由</dt><dd>${escapeHtml(evidence.modelReason ?? "未提供")}</dd></div><div><dt>模型版本</dt><dd class="mono">${escapeHtml(evidence.modelVersion ?? "未提供")}</dd></div><div><dt>样本版本</dt><dd class="mono">${escapeHtml(evidence.sampleVersion ?? "未使用")}</dd></div><div><dt>规则版本</dt><dd class="mono">${escapeHtml(evidence.ruleVersion ?? "未提供")}</dd></div><div><dt>判定时间</dt><dd>${escapeHtml(evidence.createdAt || "未提供")}</dd></div></dl></section><div class="action-row evidence-inspector-actions">${renderEvidenceActionControls(evidence, state)}</div>${feedbackMarkup(evidence, state.evidenceFeedback[evidence.evidenceId])}</aside>`;
+}
+
+function renderEvidenceInspectorContents(evidence: Evidence | undefined, state: ManagementState): string {
+  const markup = renderEvidenceInspector(evidence, state);
+  const openIndex = markup.indexOf(">") + 1;
+  const closeIndex = markup.lastIndexOf("</aside>");
+  return openIndex > 0 && closeIndex > openIndex ? markup.slice(openIndex, closeIndex) : markup;
 }
 
 function renderEvidenceComment(comment: TaskComment): string {
@@ -1026,6 +1476,11 @@ function renderSamplePreview(state: ManagementState): string {
 
 function renderFilter(name: ViewName, placeholder: string, value: string): string {
   return `<label class="filter-field"><span class="sr-only">${placeholder}</span><input data-filter="${name}" value="${escapeAttribute(value)}" placeholder="${placeholder}" /></label>`;
+}
+
+function profileLabel(profiles: FilterProfile[], profileId: string | undefined): string {
+  if (!profileId) return "默认过滤策略";
+  return profiles.find((profile) => profile.profileId === profileId)?.name ?? profileId;
 }
 
 function renderStat(label: string, value: string, detail: string): string {

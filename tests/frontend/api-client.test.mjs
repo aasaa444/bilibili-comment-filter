@@ -14,7 +14,7 @@ function mockFetch(responses, calls) {
   };
 }
 
-test("task creation maps the frontend DTO to backend video_url/title fields", async () => {
+test("task creation sends the video URL and lets the service resolve the official title", async () => {
   const calls = [];
   const client = new ApiClient("http://127.0.0.1:8000", mockFetch({
     "/api/tasks": {
@@ -28,13 +28,11 @@ test("task creation maps the frontend DTO to backend video_url/title fields", as
   const task = await client.createTask({
     bvid: "BV1abCdefGh1",
     videoUrl: "https://www.bilibili.com/video/BV1abCdefGh1",
-    title: "任务标题",
   });
 
   assert.equal(task.bvid, "BV1abCdefGh1");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     video_url: "https://www.bilibili.com/video/BV1abCdefGh1",
-    title: "任务标题",
   });
 });
 
@@ -108,6 +106,49 @@ test("task comments request the task-scoped endpoint and normalize comment DTOs"
       context: ["根评论正文", "楼中楼正文"],
     },
   ]);
+});
+
+test("task observability requests expose events and the latest analysis attempt", async () => {
+  const calls = [];
+  const client = new ApiClient("http://127.0.0.1:8000", mockFetch({
+    "/api/tasks/task-1/events": {
+      items: [{
+        event_id: 3,
+        task_id: "task-1",
+        attempt: 0,
+        phase: "analyzing",
+        event_type: "analysis_completed",
+        status: "succeeded",
+        message: "AI analysis completed",
+        details: { non_target_count: 2 },
+        created_at: "2026-08-10T00:00:00Z",
+      }],
+    },
+    "/api/tasks/task-1/analysis": {
+      latest: {
+        analysis_id: "analysis-1",
+        task_id: "task-1",
+        attempt: 0,
+        status: "completed",
+        batch_count: 1,
+        account_count: 2,
+        hit_count: 0,
+        uncertain_count: 0,
+        non_target_count: 2,
+        evidence_count: 0,
+      },
+      attempts: [],
+    },
+  }, calls));
+
+  const events = await client.listTaskEvents("task-1");
+  const analysis = await client.getTaskAnalysis("task-1");
+
+  assert.equal(calls[0].input, "http://127.0.0.1:8000/api/tasks/task-1/events");
+  assert.equal(calls[1].input, "http://127.0.0.1:8000/api/tasks/task-1/analysis");
+  assert.equal(events.items[0].eventType, "analysis_completed");
+  assert.equal(events.items[0].details.non_target_count, 2);
+  assert.equal(analysis.latest.nonTargetCount, 2);
 });
 
 test("UID sync maps backend state/nickname to the cache DTO and keeps the version query", async () => {

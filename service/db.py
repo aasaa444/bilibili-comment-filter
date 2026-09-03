@@ -41,6 +41,16 @@ CREATE TABLE IF NOT EXISTS uid_events (
     FOREIGN KEY (uid) REFERENCES uid_records(uid)
 );
 
+CREATE TABLE IF NOT EXISTS uid_removals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_uid_removals_version
+    ON uid_removals(version);
+
 CREATE TABLE IF NOT EXISTS sync_versions (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     current_version INTEGER NOT NULL DEFAULT 0
@@ -54,11 +64,22 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS filter_profiles (
+    profile_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    rules_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS video_tasks (
     task_id TEXT PRIMARY KEY,
     video_id TEXT NOT NULL UNIQUE,
     video_url TEXT NOT NULL,
     title TEXT,
+    title_source TEXT NOT NULL DEFAULT 'legacy',
     status TEXT NOT NULL,
     attempt INTEGER NOT NULL DEFAULT 0,
     submitted_at TEXT NOT NULL,
@@ -74,6 +95,7 @@ CREATE TABLE IF NOT EXISTS video_tasks (
     declared_total INTEGER,
     coverage REAL NOT NULL DEFAULT 0,
     failed_items_json TEXT NOT NULL DEFAULT '[]'
+    ,profile_id TEXT NOT NULL DEFAULT 'default-james-haters'
 );
 
 CREATE TABLE IF NOT EXISTS task_checkpoints (
@@ -81,7 +103,7 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
     root_page INTEGER NOT NULL DEFAULT 1,
     replies_json TEXT NOT NULL DEFAULT '{}',
     complete INTEGER NOT NULL DEFAULT 0,
-    root_cursor INTEGER,
+    root_cursor TEXT,
     requested_pages INTEGER NOT NULL DEFAULT 0,
     declared_comments INTEGER NOT NULL DEFAULT 0,
     declared_total INTEGER,
@@ -124,6 +146,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     sample_version TEXT NOT NULL,
     rule_version TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    profile_id TEXT NOT NULL DEFAULT 'default-james-haters',
     UNIQUE (task_id, uid),
     FOREIGN KEY (task_id) REFERENCES video_tasks(task_id)
 );
@@ -135,7 +158,8 @@ CREATE TABLE IF NOT EXISTS sample_sets (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     published_at TEXT,
-    retired_at TEXT
+    retired_at TEXT,
+    profile_id TEXT NOT NULL DEFAULT 'default-james-haters'
 );
 
 CREATE TABLE IF NOT EXISTS sample_items (
@@ -178,6 +202,46 @@ CREATE TABLE IF NOT EXISTS blacklist_queue (
     completed_at TEXT,
     FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id)
 );
+
+CREATE TABLE IF NOT EXISTS task_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    phase TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES video_tasks(task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_events_task_created
+    ON task_events(task_id, created_at, event_id);
+
+CREATE TABLE IF NOT EXISTS task_analysis_runs (
+    analysis_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    model TEXT,
+    sample_version TEXT,
+    batch_count INTEGER NOT NULL DEFAULT 0,
+    account_count INTEGER NOT NULL DEFAULT 0,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    uncertain_count INTEGER NOT NULL DEFAULT 0,
+    non_target_count INTEGER NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE (task_id, attempt),
+    FOREIGN KEY (task_id) REFERENCES video_tasks(task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_analysis_runs_task_attempt
+    ON task_analysis_runs(task_id, attempt);
 """
 
 
@@ -198,8 +262,10 @@ class Database:
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.executescript(SCHEMA)
         self._migrate_video_tasks()
+        self._migrate_filter_profiles()
         self._migrate_task_checkpoints()
         self._migrate_sample_items()
+        self._migrate_profile_references()
         self._migrate_blacklist_queue()
         self._connection.commit()
         self.recover_blacklist_processing()
@@ -210,6 +276,36 @@ class Database:
         }
         if "declared_total" not in columns:
             self.connection.execute("ALTER TABLE video_tasks ADD COLUMN declared_total INTEGER")
+        if "title_source" not in columns:
+            self.connection.execute(
+                "ALTER TABLE video_tasks ADD COLUMN title_source TEXT NOT NULL DEFAULT 'legacy'"
+            )
+
+    def _migrate_filter_profiles(self) -> None:
+        columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(filter_profiles)")
+        }
+        additions = {
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "rules_json": "TEXT NOT NULL DEFAULT '{}'",
+            "status": "TEXT NOT NULL DEFAULT 'active'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE filter_profiles ADD COLUMN {name} {definition}"
+                )
+
+    def _migrate_profile_references(self) -> None:
+        for table in ("video_tasks", "sample_sets", "evidence"):
+            columns = {
+                row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")
+            }
+            if "profile_id" not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN profile_id TEXT NOT NULL "
+                    "DEFAULT 'default-james-haters'"
+                )
 
     def _migrate_task_checkpoints(self) -> None:
         columns = {
@@ -217,7 +313,7 @@ class Database:
             for row in self.connection.execute("PRAGMA table_info(task_checkpoints)")
         }
         additions = {
-            "root_cursor": "INTEGER",
+            "root_cursor": "TEXT",
             "requested_pages": "INTEGER NOT NULL DEFAULT 0",
             "declared_comments": "INTEGER NOT NULL DEFAULT 0",
             "declared_total": "INTEGER",

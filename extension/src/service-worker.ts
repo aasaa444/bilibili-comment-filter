@@ -1,7 +1,7 @@
 import { ApiClient, ApiRequestError } from "../../shared/api.js";
 import { applyUidSync, createEmptyUidCache, deserializeUidCache, serializeUidCache } from "../../shared/uid-cache.js";
 import { connectionStateFromHealth, connectionStateFromRequestError, type ConnectionState } from "../../shared/state.js";
-import type { AuthCookie, VideoTask } from "../../shared/types.js";
+import type { AuthCookie, AuthSession, VideoTask } from "../../shared/types.js";
 import type { RuntimeMessage, RuntimeResponse, PopupState } from "./messages.js";
 import { getVideoIdentity } from "./video.js";
 
@@ -12,6 +12,16 @@ const LAST_TASK_STORAGE_KEY = "last-submitted-task-v1";
 let memoryCache: ReturnType<typeof createEmptyUidCache> | null = null;
 let memoryConnection: ConnectionState = { kind: "loading", label: "正在连接本机服务" };
 let memoryLastTask: VideoTask | undefined;
+let backgroundAuthSync: Promise<AuthSession | undefined> | undefined;
+
+interface AuthSessionSyncResult {
+  auth: AuthSession;
+  connection: ConnectionState;
+}
+
+interface InternalAuthSessionSyncResult extends AuthSessionSyncResult {
+  cookieValues: string[];
+}
 
 export async function readCachedUidCache(): Promise<ReturnType<typeof createEmptyUidCache>> {
   if (memoryCache) return memoryCache;
@@ -65,12 +75,15 @@ export async function syncUidCache(client = new ApiClient()): Promise<{
 export async function getPopupState(tab?: chrome.tabs.Tab): Promise<PopupState> {
   const activeTab = tab ?? (await getActiveTab());
   const video = getVideoIdentity(activeTab?.url ?? "", activeTab?.title ?? "");
+  const authSync = syncAuthSessionInBackground();
   const syncResult = await syncUidCache();
+  await authSync;
   const cache = syncResult.cache;
   const lastTask = await readLastTask();
   return {
     video,
-    connection: syncResult.connection,
+    connection: memoryConnection,
+    authSyncAvailable: isBilibiliPageUrl(activeTab?.url ?? ""),
     cache: {
       available: cache.version > 0,
       version: cache.version,
@@ -92,21 +105,11 @@ export async function submitCurrentVideo(expectedBvid?: string): Promise<VideoTa
   const client = new ApiClient();
   let cookieValues: string[] = [];
   try {
-    const health = await client.getHealth();
-    const connection = connectionStateFromHealth(health);
-    memoryConnection = connection;
-    await persistConnection(connection);
-    if (connection.kind !== "ready") {
-      const detail = "detail" in connection ? connection.detail : undefined;
-      throw new ApiRequestError(503, detail ?? "本机服务尚未就绪");
-    }
-    const cookies = await readBilibiliCookies(tab?.url ?? video.url);
-    cookieValues = cookies.map((cookie) => cookie.value).filter((value) => value.length > 0);
-    await client.saveAuthSession({ source: "extension", origin: video.url, cookies });
+    const authSync = await synchronizeAuthSession(tab, video.url, client);
+    cookieValues = authSync.cookieValues;
     const task = await client.createTask({
       bvid: video.bvid,
       videoUrl: video.url,
-      title: video.title || undefined,
     });
     memoryLastTask = task;
     await storageSet(LAST_TASK_STORAGE_KEY, task);
@@ -117,6 +120,54 @@ export async function submitCurrentVideo(expectedBvid?: string): Promise<VideoTa
     await persistConnection(memoryConnection);
     throw normalized;
   }
+}
+
+export async function syncAuthSession(): Promise<AuthSessionSyncResult> {
+  const tab = await getActiveTab();
+  const tabUrl = tab?.url ?? "";
+  if (!isBilibiliPageUrl(tabUrl)) {
+    throw new ApiRequestError(400, "当前页面不是 B 站页面，无法同步登录态");
+  }
+
+  const video = getVideoIdentity(tabUrl, tab?.title ?? "");
+  return sanitizeAuthSessionResult(
+    await synchronizeAuthSession(tab, video?.url ?? tabUrl, new ApiClient()),
+  );
+}
+
+export function syncAuthSessionInBackground(): Promise<AuthSession | undefined> {
+  if (backgroundAuthSync) return backgroundAuthSync;
+
+  const run = (async (): Promise<AuthSession | undefined> => {
+    try {
+      const tab = await getBilibiliTab();
+      const tabUrl = tab?.url ?? "";
+      if (!tab || !isBilibiliPageUrl(tabUrl)) return undefined;
+      const video = getVideoIdentity(tabUrl, tab.title ?? "");
+      const result = await synchronizeAuthSession(
+        tab,
+        video?.url ?? tabUrl,
+        new ApiClient(),
+      );
+      return result.auth;
+    } catch (error) {
+      const normalized = asRequestError(error);
+      memoryConnection = connectionStateFromRequestError(normalized);
+      await persistConnection(memoryConnection);
+      return undefined;
+    }
+  })();
+
+  backgroundAuthSync = run;
+  void run.then(
+    () => {
+      if (backgroundAuthSync === run) backgroundAuthSync = undefined;
+    },
+    () => {
+      if (backgroundAuthSync === run) backgroundAuthSync = undefined;
+    },
+  );
+  return run;
 }
 
 export async function handleRuntimeMessage(message: RuntimeMessage): Promise<RuntimeResponse> {
@@ -130,6 +181,8 @@ export async function handleRuntimeMessage(message: RuntimeMessage): Promise<Run
       }
       case "GET_POPUP_STATE":
         return { ok: true, popup: await getPopupState() };
+      case "SYNC_AUTH_SESSION":
+        return { ok: true, ...(await syncAuthSession()) };
       case "SUBMIT_CURRENT_VIDEO":
         return { ok: true, task: await submitCurrentVideo(message.expectedBvid) };
     }
@@ -141,17 +194,25 @@ export async function handleRuntimeMessage(message: RuntimeMessage): Promise<Run
 
 async function broadcastCache(cache: ReturnType<typeof createEmptyUidCache>): Promise<void> {
   if (typeof chrome === "undefined") return;
-  const tabs = await tabsQuery({ url: ["https://www.bilibili.com/video/*", "https://bilibili.com/video/*"] });
-  await Promise.all(
-    tabs
-      .filter((tab) => tab.id !== undefined)
-      .map(
-        (tab) =>
-          new Promise<void>((resolve) => {
-            chrome.tabs.sendMessage(tab.id as number, { type: "UID_CACHE_UPDATED", cache }, () => resolve());
-          }),
-      ),
-  );
+  try {
+    const tabs = await tabsQuery({ url: ["https://www.bilibili.com/video/*", "https://bilibili.com/video/*"] });
+    await Promise.all(
+      tabs
+        .filter((tab) => tab.id !== undefined)
+        .map(
+          (tab) =>
+            new Promise<void>((resolve) => {
+              try {
+                chrome.tabs.sendMessage(tab.id as number, { type: "UID_CACHE_UPDATED", cache }, () => resolve());
+              } catch {
+                resolve();
+              }
+            }),
+        ),
+    );
+  } catch {
+    // Cache synchronization is authoritative; notifying an already-closed tab is best effort.
+  }
 }
 
 async function readLastTask(): Promise<VideoTask | undefined> {
@@ -165,6 +226,41 @@ async function readLastTask(): Promise<VideoTask | undefined> {
 
 async function persistConnection(connection: ConnectionState): Promise<void> {
   await storageSet(CONNECTION_STORAGE_KEY, connection);
+}
+
+async function synchronizeAuthSession(
+  tab: chrome.tabs.Tab | null,
+  origin: string,
+  client: ApiClient,
+): Promise<InternalAuthSessionSyncResult> {
+  let cookieValues: string[] = [];
+  try {
+    const health = await client.getHealth();
+    const connection = connectionStateFromHealth(health);
+    memoryConnection = connection;
+    if (connection.kind !== "ready") {
+      await persistConnection(connection);
+      const detail = "detail" in connection ? connection.detail : undefined;
+      throw new ApiRequestError(503, detail ?? "本机服务尚未就绪");
+    }
+
+    const cookies = await readBilibiliCookies(tab?.url ?? origin);
+    cookieValues = cookies.map((cookie) => cookie.value).filter((value) => value.length > 0);
+    const auth = normalizeAuthSession(await client.saveAuthSession({ source: "extension", origin, cookies }), cookieValues);
+    const safeConnection = redactConnectionValues(connection, cookieValues);
+    memoryConnection = safeConnection;
+    await persistConnection(safeConnection);
+    return { auth, connection: safeConnection, cookieValues };
+  } catch (error) {
+    const normalized = redactCookieValues(asRequestError(error), cookieValues);
+    memoryConnection = connectionStateFromRequestError(normalized);
+    await persistConnection(memoryConnection);
+    throw normalized;
+  }
+}
+
+function sanitizeAuthSessionResult(result: InternalAuthSessionSyncResult): AuthSessionSyncResult {
+  return { auth: result.auth, connection: result.connection };
 }
 
 async function readBilibiliCookies(url: string): Promise<AuthCookie[]> {
@@ -192,18 +288,76 @@ async function readBilibiliCookies(url: string): Promise<AuthCookie[]> {
 }
 
 function redactCookieValues(error: ApiRequestError, cookieValues: string[]): ApiRequestError {
-  const uniqueValues = [...new Set(cookieValues)];
-  const message = uniqueValues.reduce(
-    (current, value) => current.split(value).join("[Cookie 已隐藏]"),
-    error.message,
-  );
+  const message = redactCookieText(error.message, cookieValues);
   return message === error.message ? error : new ApiRequestError(error.status, message, error.code);
+}
+
+function redactConnectionValues(connection: ConnectionState, cookieValues: string[]): ConnectionState {
+  if (!("detail" in connection) || !connection.detail) return connection;
+  const detail = redactCookieText(connection.detail, cookieValues);
+  return detail === connection.detail ? connection : { ...connection, detail };
+}
+
+function redactCookieText(text: string, cookieValues: string[]): string {
+  return [...new Set(cookieValues)].filter((value) => value.length > 0).reduce(
+    (current, value) => current.split(value).join("[Cookie 已隐藏]"),
+    text,
+  );
+}
+
+function normalizeAuthSession(value: unknown, cookieValues: string[]): AuthSession {
+  const candidate = asRecord(value);
+  const status = candidate.status;
+  if (!isAuthStatus(status)) throw new ApiRequestError(502, "认证状态响应格式无效");
+  return {
+    status,
+    detail: redactCookieText(
+      typeof candidate.detail === "string" ? candidate.detail : "未提供认证诊断信息",
+      cookieValues,
+    ),
+    checkedAt: redactCookieText(
+      typeof candidate.checked_at === "string"
+        ? candidate.checked_at
+        : typeof candidate.checkedAt === "string" ? candidate.checkedAt : "",
+      cookieValues,
+    ) || undefined,
+    cookiePresent: typeof candidate.cookie_present === "boolean"
+      ? candidate.cookie_present
+      : typeof candidate.cookiePresent === "boolean" ? candidate.cookiePresent : false,
+  };
+}
+
+function isAuthStatus(value: unknown): value is AuthSession["status"] {
+  return ["valid", "invalid", "missing", "verification_failed"].includes(value as string);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function isBilibiliPageUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    return url.protocol === "https:" && (hostname === "bilibili.com" || hostname.endsWith(".bilibili.com"));
+  } catch {
+    return false;
+  }
 }
 
 async function getActiveTab(): Promise<chrome.tabs.Tab | null> {
   if (typeof chrome === "undefined") return null;
   const tabs = await tabsQuery({ active: true, currentWindow: true });
   return tabs[0] ?? null;
+}
+
+async function getBilibiliTab(): Promise<chrome.tabs.Tab | null> {
+  const activeTab = await getActiveTab();
+  if (activeTab && isBilibiliPageUrl(activeTab.url ?? "")) return activeTab;
+  const tabs = await tabsQuery({
+    url: ["https://www.bilibili.com/*", "https://*.bilibili.com/*"],
+  });
+  return tabs.find((tab) => isBilibiliPageUrl(tab.url ?? "")) ?? null;
 }
 
 function tabsQuery(query: chrome.tabs.QueryInfo): Promise<chrome.tabs.Tab[]> {
@@ -247,11 +401,20 @@ function registerListeners(): void {
     void handleRuntimeMessage(message).then(sendResponse);
     return true;
   });
-  chrome.runtime.onInstalled.addListener(() => void syncUidCache());
-  chrome.runtime.onStartup.addListener(() => void syncUidCache());
+  chrome.runtime.onInstalled.addListener(() => {
+    void syncUidCache();
+    void syncAuthSessionInBackground();
+  });
+  chrome.runtime.onStartup.addListener(() => {
+    void syncUidCache();
+    void syncAuthSessionInBackground();
+  });
   chrome.alarms?.create("uid-cache-sync", { periodInMinutes: 5 });
   chrome.alarms?.onAlarm.addListener((alarm) => {
-    if (alarm.name === "uid-cache-sync") void syncUidCache();
+    if (alarm.name === "uid-cache-sync") {
+      void syncUidCache();
+      void syncAuthSessionInBackground();
+    }
   });
 }
 

@@ -9,6 +9,32 @@ function jsonResponse(value, status = 200) {
   });
 }
 
+test("API client normalizes model health flags without exposing configuration values", async () => {
+  const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
+    assert.equal(input, "http://127.0.0.1:8765/api/health");
+    return jsonResponse({
+      status: "ready",
+      model: {
+        status: "ready",
+        detail: "remote model is configured",
+        base_url_configured: true,
+        model_configured: true,
+        api_key_configured: true,
+      },
+    });
+  });
+
+  const health = await client.getHealth();
+
+  assert.deepEqual(health.model, {
+    status: "ready",
+    detail: "remote model is configured",
+    baseUrlConfigured: true,
+    modelConfigured: true,
+    apiKeyConfigured: true,
+  });
+});
+
 test("API client normalizes completed tasks, nested progress and evidence decisions", async () => {
   const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
     assert.equal(input, "http://127.0.0.1:8765/api/tasks");
@@ -52,6 +78,76 @@ test("API client normalizes completed tasks, nested progress and evidence decisi
   assert.equal(tasks.items[0].error, "部分回复页获取失败");
 });
 
+test("API client keeps the complete evidence snapshot for the review inspector", async () => {
+  const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
+    assert.equal(input, "http://127.0.0.1:8765/api/reviews");
+    return jsonResponse({
+      items: [{
+        evidence_id: "evidence-1",
+        task_id: "task-1",
+        uid: "1001",
+        decision: "hit",
+        nickname: "hostile-user",
+        video_id: "BV1example01",
+        comments: [{
+          comment_id: "root-1",
+          uid: "1001",
+          nickname: "hostile-user",
+          content: "完整根评论",
+          video_id: "BV1example01",
+          comment_url: "https://www.bilibili.com/video/BV1example01#reply-root-1",
+          root_id: "root-1",
+          parent_id: null,
+          level: "root",
+          created_at: 1700000000,
+          is_pinned: false,
+          context: ["同楼层上下文"],
+        }, {
+          comment_id: "reply-1",
+          uid: "1001",
+          nickname: "hostile-user",
+          content: "完整楼中楼",
+          video_id: "BV1example01",
+          comment_url: "https://www.bilibili.com/video/BV1example01#reply-reply-1",
+          root_id: "root-1",
+          parent_id: "root-1",
+          level: "reply",
+          created_at: 1700000001,
+          is_pinned: false,
+          context: ["根评论：完整根评论"],
+        }],
+        signals: ["巴斯特", "明显敌意"],
+        reason: "模型理由",
+        confidence: 0.97,
+        model_version: "remote-model-v1",
+        sample_version: "samples-v3",
+        rule_version: "rules-v2",
+        created_at: "2026-08-10T00:00:00Z",
+      }],
+    });
+  });
+
+  const evidence = (await client.listEvidence()).items[0];
+
+  assert.equal(evidence.taskId, "task-1");
+  assert.equal(evidence.videoId, "BV1example01");
+  assert.equal(evidence.comments.length, 2);
+  assert.equal(evidence.comments[1].parentId, "root-1");
+  assert.deepEqual(evidence.signals, ["巴斯特", "明显敌意"]);
+  assert.equal(evidence.sampleVersion, "samples-v3");
+  assert.equal(evidence.ruleVersion, "rules-v2");
+  assert.equal(evidence.commentUrl, "https://www.bilibili.com/video/BV1example01#reply-root-1");
+});
+
+test("API client sends the AI result filter with evidence queries", async () => {
+  const client = new ApiClient("http://127.0.0.1:8765", async (input) => {
+    assert.equal(input, "http://127.0.0.1:8765/api/reviews?result=uncertain&review_status=pending");
+    return jsonResponse({ items: [] });
+  });
+
+  await client.listEvidence({ result: "uncertain", reviewStatus: "pending" });
+});
+
 test("API client maps review actions and cookie sessions to backend payloads", async () => {
   const requests = [];
   const client = new ApiClient("http://127.0.0.1:8765", async (input, init) => {
@@ -81,6 +177,19 @@ test("API client maps review actions and cookie sessions to backend payloads", a
   assert.deepEqual(authBody.cookies, { SESSDATA: "secret" });
   assert.equal(reviewBody.action, "highlight");
   assert.equal(review.action, "positive-sample");
+});
+
+test("API client removes a UID through the dedicated revoke endpoint", async () => {
+  let request;
+  const client = new ApiClient("http://127.0.0.1:8765", async (input, init) => {
+    request = { input, init };
+    return new Response(null, { status: 204 });
+  });
+
+  await client.removeUid("1001");
+
+  assert.equal(request.input, "http://127.0.0.1:8765/api/uids/1001");
+  assert.equal(request.init.method, "DELETE");
 });
 
 test("API client exposes the latest authentication diagnostic without cookie values", async () => {

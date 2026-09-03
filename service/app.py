@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .analyzer import (
+    AccountBundle,
+    AnalysisBatchResult,
+    AnalyzerUnavailableError,
     BatchAnalyzer,
     OpenAICompatibleBatchAnalyzer,
     OpenAICompatibleTransport,
+    SampleSet,
+    evaluate_rule_results,
 )
 from .auth import AuthService, AuthVerifier, BilibiliAuthVerifier
 from .blacklist import (
@@ -24,28 +30,39 @@ from .collector import (
     BilibiliCommentCollector,
     BilibiliCommentTransport,
     CommentCollector,
+    VideoMetadataProvider,
+    fetch_official_video_title,
 )
 from .db import Database
 from .models import (
+    AnalysisRunResponse,
     AuthCookie,
     AuthSessionRequest,
     AuthSessionResponse,
+    AuthStatus,
     BlacklistListResponse,
     BlacklistResponse,
+    BlacklistSettingsRequest,
+    BlacklistSettingsResponse,
     CommentListResponse,
     ComponentHealth,
     EvidenceListResponse,
     EvidenceResponse,
     EvidenceReviewStatus,
+    FilterProfileCreateRequest,
+    FilterProfileListResponse,
+    FilterProfileResponse,
     HealthResponse,
+    ModelHealth,
     ReviewActionRequest,
     ReviewActionResponse,
     SampleImportRequest,
     SampleListResponse,
     SampleResponse,
-    BlacklistSettingsRequest,
-    BlacklistSettingsResponse,
+    TaskAnalysisResponse,
     TaskCreateRequest,
+    TaskEventListResponse,
+    TaskEventResponse,
     TaskListResponse,
     TaskProgressResponse,
     TaskResponse,
@@ -56,11 +73,14 @@ from .models import (
     UidState,
     UidSyncResponse,
 )
+from .observability import AnalysisRunStore, TaskEventStore
 from .orchestrator import TaskOrchestrator
 from .persistence import CommentStore, EvidenceNotFoundError, EvidenceStore
+from .profiles import FilterProfileStore
 from .registry import InvalidUidTransitionError, UidNotFoundError, UidRegistry
 from .reviews import ReviewService
 from .samples import NewSampleItem, SampleStore
+from .settings import BlacklistAutomationSettings, SettingsStore
 from .tasks import (
     InvalidTaskTransitionError,
     TaskNotFoundError,
@@ -68,7 +88,7 @@ from .tasks import (
     UnsupportedVideoError,
     VideoTask,
 )
-from .worker import BackgroundWorker
+from .worker import BackgroundWorker, WorkerConfig
 
 DEFAULT_DB_PATH = Path(
     os.getenv(
@@ -77,7 +97,20 @@ DEFAULT_DB_PATH = Path(
     )
 )
 
-from .settings import BlacklistAutomationSettings, SettingsStore
+
+class UnconfiguredBatchAnalyzer:
+    """Fail clearly when no remote OpenAI-compatible model is configured."""
+
+    def analyze(
+        self, _accounts: tuple[AccountBundle, ...], _samples: SampleSet
+    ) -> AnalysisBatchResult:
+        rule_results = evaluate_rule_results(_accounts, _samples)
+        raise AnalyzerUnavailableError(
+            "Remote OpenAI-compatible model is not configured; set "
+            "BILIBILI_FILTER_OPENAI_BASE_URL and BILIBILI_FILTER_OPENAI_MODEL",
+            partial_results=rule_results,
+        )
+
 
 def create_app(
     *,
@@ -85,6 +118,7 @@ def create_app(
     auth_verifier: AuthVerifier | None = None,
     worker_available: bool = True,
     collector: CommentCollector | None = None,
+    video_metadata_provider: VideoMetadataProvider | None = None,
     analyzer: BatchAnalyzer | None = None,
     blacklist_executor: BlacklistExecutor | None = None,
     web_root: str | Path | None = None,
@@ -93,40 +127,49 @@ def create_app(
     database = Database(db_path or DEFAULT_DB_PATH)
     database.initialize()
     auth_service = AuthService(database, auth_verifier or BilibiliAuthVerifier())
+    task_event_store = TaskEventStore(database)
+    analysis_run_store = AnalysisRunStore(database)
     uid_registry = UidRegistry(database)
-    task_store = TaskStore(database)
+    task_store = TaskStore(database, event_store=task_event_store)
     comment_store = CommentStore(database)
     evidence_store = EvidenceStore(database)
-    sample_store = SampleStore(database)
+    profile_store = FilterProfileStore(database)
+    sample_store = SampleStore(database, profile_store)
     settings_store = SettingsStore(database)
     settings_store.get_blacklist_automation()
     queue = BlacklistQueueService(database, uid_registry)
-    collector = collector or BilibiliCommentCollector(
-        BilibiliCommentTransport(database.latest_auth_cookies)
-    )
-    model_base_url = _env_text(
-        "BILIBILI_FILTER_OPENAI_BASE_URL",
-        "http://127.0.0.1:11434/v1",
-        "BILIBILI_FILTER_MODEL_URL",
-    )
-    model_api_key = _env_optional_text(
-        "BILIBILI_FILTER_OPENAI_API_KEY", "BILIBILI_FILTER_MODEL_KEY"
-    )
-    model_name = _env_text(
-        "BILIBILI_FILTER_OPENAI_MODEL", "local-model", "BILIBILI_FILTER_MODEL"
-    )
-    analyzer = analyzer or OpenAICompatibleBatchAnalyzer(
-        transport=OpenAICompatibleTransport(
-            base_url=model_base_url,
-            api_key=model_api_key,
-            model=model_name,
-            max_output_tokens=_env_positive_int(
-                "BILIBILI_FILTER_OPENAI_MAX_OUTPUT_TOKENS", 512
-            ),
-        ),
-        model=model_name,
-        context_budget=_env_positive_int("BILIBILI_FILTER_OPENAI_CONTEXT_TOKENS", 100000),
-    )
+    if collector is None:
+        transport = BilibiliCommentTransport(database.latest_auth_cookies)
+        collector = BilibiliCommentCollector(transport)
+        video_metadata_provider = video_metadata_provider or transport
+    model_base_url = _env_optional_text("BILIBILI_FILTER_OPENAI_BASE_URL")
+    model_api_key = _env_optional_text("BILIBILI_FILTER_OPENAI_API_KEY")
+    model_name = _env_optional_text("BILIBILI_FILTER_OPENAI_MODEL")
+    model_health = _model_health(model_base_url, model_name, model_api_key)
+    if analyzer is None:
+        if model_base_url and model_name:
+            analyzer = OpenAICompatibleBatchAnalyzer(
+                transport=OpenAICompatibleTransport(
+                    base_url=model_base_url,
+                    api_key=model_api_key,
+                    model=model_name,
+                    timeout=_env_positive_float(
+                        "BILIBILI_FILTER_OPENAI_TIMEOUT_SECONDS", 120.0
+                    ),
+                    max_output_tokens=_env_positive_int(
+                        "BILIBILI_FILTER_OPENAI_MAX_OUTPUT_TOKENS", 4096
+                    ),
+                ),
+                model=model_name,
+                context_budget=_env_positive_int(
+                    "BILIBILI_FILTER_OPENAI_CONTEXT_TOKENS", 100000
+                ),
+                max_batch_accounts=_env_positive_int(
+                    "BILIBILI_FILTER_OPENAI_MAX_BATCH_ACCOUNTS", 32
+                ),
+            )
+        else:
+            analyzer = UnconfiguredBatchAnalyzer()
     orchestrator = TaskOrchestrator(
         task_store=task_store,
         uid_registry=uid_registry,
@@ -137,6 +180,9 @@ def create_app(
         evidence_store=evidence_store,
         auth_service=auth_service,
         sample_provider=sample_store.current,
+        video_metadata_provider=video_metadata_provider,
+        event_store=task_event_store,
+        analysis_run_store=analysis_run_store,
         auto_blacklist_enabled=settings_store.is_blacklist_automation_enabled,
     )
     executor = blacklist_executor or PlaywrightBlacklistExecutor(
@@ -147,6 +193,14 @@ def create_app(
         orchestrator=orchestrator,
         queue=queue,
         executor=executor,
+        config=WorkerConfig(
+            queue_interval=_env_nonnegative_float(
+                "BILIBILI_FILTER_BLACKLIST_INTERVAL_SECONDS", 60.0
+            ),
+            queue_jitter=_env_nonnegative_float(
+                "BILIBILI_FILTER_BLACKLIST_JITTER_SECONDS", 30.0
+            ),
+        ),
         auto_blacklist_enabled=settings_store.is_blacklist_automation_enabled,
     )
     review_service = ReviewService(
@@ -157,15 +211,28 @@ def create_app(
         sample_store=sample_store,
         settings_store=settings_store,
     )
+    title_refresh_attempted: set[str] = set()
+
+    def refresh_task_title(task: VideoTask) -> VideoTask:
+        if task.title_source == "bilibili" or task.task_id in title_refresh_attempted:
+            return task
+        title_refresh_attempted.add(task.task_id)
+        title = fetch_official_video_title(video_metadata_provider, task.video_id)
+        if title is None:
+            return task
+        return task_store.update_title(task.task_id, title)
 
     app = FastAPI(title="Bilibili Comment Filter Service", version="0.1.0")
     app.state.database = database
     app.state.auth_service = auth_service
     app.state.uid_registry = uid_registry
     app.state.task_store = task_store
+    app.state.task_event_store = task_event_store
+    app.state.analysis_run_store = analysis_run_store
     app.state.comment_store = comment_store
     app.state.evidence_store = evidence_store
     app.state.sample_store = sample_store
+    app.state.profile_store = profile_store
     app.state.settings_store = settings_store
     app.state.blacklist_settings = settings_store
     app.state.review_service = review_service
@@ -175,6 +242,7 @@ def create_app(
     app.state.worker = worker
     app.state.start_background_worker = start_background_worker
     app.state.worker_available = worker_available
+    app.state.model_health = model_health
 
     app.add_middleware(
         CORSMiddleware,
@@ -215,6 +283,7 @@ def create_app(
                 status=auth_verification.status.value,
                 detail=auth_verification.detail,
             ),
+            model=model_health,
         )
 
     @app.get("/api/auth/session", response_model=AuthSessionResponse)
@@ -233,6 +302,8 @@ def create_app(
         verification, checked_at = auth_service.synchronize(
             cookies=normalized_cookies, source=request.source
         )
+        if verification.status is AuthStatus.VALID:
+            task_store.retry_auth_unavailable()
         return AuthSessionResponse(
             status=verification.status,
             detail=verification.detail,
@@ -244,12 +315,12 @@ def create_app(
     def sync_uids(since: int = 0) -> UidSyncResponse:
         if since < 0:
             raise HTTPException(status_code=422, detail="since must be non-negative")
-        mode, version, items = uid_registry.sync(since)
+        mode, version, items, removed = uid_registry.sync(since)
         return UidSyncResponse(
             mode=mode,
             version=version,
             items=[uid_response(item) for item in items],
-            removed=[],
+            removed=removed,
         )
 
     @app.get("/api/uids", response_model=UidListResponse)
@@ -280,14 +351,65 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return uid_response(record)
 
+    @app.delete("/api/uids/{uid}", status_code=204)
+    def delete_uid(uid: str) -> Response:
+        queue.cancel_for_uid(uid)
+        uid_registry.remove(uid)
+        return Response(status_code=204)
+
     @app.get("/api/tasks", response_model=TaskListResponse)
     def list_tasks() -> TaskListResponse:
-        return TaskListResponse(items=[task_response(task) for task in task_store.list()])
+        return TaskListResponse(
+            items=[task_response(refresh_task_title(task)) for task in task_store.list()]
+        )
+
+    @app.get("/api/profiles", response_model=FilterProfileListResponse)
+    def list_profiles() -> FilterProfileListResponse:
+        return FilterProfileListResponse(
+            items=[filter_profile_response(profile) for profile in profile_store.list()]
+        )
+
+    @app.get("/api/profiles/current", response_model=FilterProfileResponse)
+    def get_current_profile() -> FilterProfileResponse:
+        return filter_profile_response(profile_store.current())
+
+    @app.post("/api/profiles", response_model=FilterProfileResponse, status_code=201)
+    def create_profile(request: FilterProfileCreateRequest) -> FilterProfileResponse:
+        try:
+            profile = profile_store.create(
+                name=request.name,
+                description=request.description,
+                known_terms=tuple(request.known_terms),
+                standalone_terms=tuple(request.standalone_terms),
+                friendly_exceptions=tuple(request.friendly_exceptions),
+                hostile_context=tuple(request.hostile_context),
+                nickname_positive=tuple(request.nickname_positive),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return filter_profile_response(profile)
+
+    @app.post("/api/profiles/{profile_id}/activate", response_model=FilterProfileResponse)
+    def activate_profile(profile_id: str) -> FilterProfileResponse:
+        try:
+            profile_store.activate(profile_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"Filter profile {profile_id} was not found"
+            ) from exc
+        return filter_profile_response(profile_store.current())
 
     @app.post("/api/tasks", response_model=TaskResponse)
     def create_task(request: TaskCreateRequest) -> object:
         try:
-            task, created = task_store.create(video_url=request.video_url, title=request.title)
+            video_id = task_store.video_id_from_url(request.video_url)
+            title = fetch_official_video_title(video_metadata_provider, video_id)
+            task, created = task_store.create(
+                video_url=request.video_url,
+                title=title,
+                title_source="bilibili" if title else "pending",
+                profile_id=profile_store.current().profile_id,
+            )
         except UnsupportedVideoError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         response = task_response(task)
@@ -299,7 +421,7 @@ def create_app(
     @app.get("/api/tasks/{task_id}", response_model=TaskResponse)
     def get_task(task_id: str) -> TaskResponse:
         try:
-            return task_response(task_store.get(task_id))
+            return task_response(refresh_task_title(task_store.get(task_id)))
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"Task {task_id} was not found") from exc
 
@@ -331,6 +453,28 @@ def create_app(
                 comment_response(comment) for comment in comment_store.list_for_task(task_id)
             ]
         )
+
+    @app.get("/api/tasks/{task_id}/events", response_model=TaskEventListResponse)
+    def list_task_events(task_id: str) -> TaskEventListResponse:
+        try:
+            task_store.get(task_id)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} was not found") from exc
+        return TaskEventListResponse(
+            items=[task_event_response(event) for event in task_event_store.list_for_task(task_id)]
+        )
+
+    @app.get("/api/tasks/{task_id}/analysis", response_model=TaskAnalysisResponse)
+    def get_task_analysis(task_id: str) -> TaskAnalysisResponse:
+        try:
+            task_store.get(task_id)
+        except TaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} was not found") from exc
+        attempts = [
+            analysis_run_response(run)
+            for run in analysis_run_store.list_for_task(task_id)
+        ]
+        return TaskAnalysisResponse(latest=attempts[0] if attempts else None, attempts=attempts)
 
     @app.get("/api/reviews", response_model=EvidenceListResponse)
     def list_reviews(
@@ -429,9 +573,18 @@ def create_app(
                 for line in request.text.splitlines()
             )
         try:
-            sample = sample_store.create(kind=kind, label=request.label, items=items)
+            profile_id = request.profile_id or profile_store.current().profile_id
+            profile_store.get(profile_id)
+            sample = sample_store.create(
+                kind=kind, label=request.label, items=items, profile_id=profile_id
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Filter profile {exc.args[0]} was not found",
+            ) from exc
         return JSONResponse(status_code=201, content=sample_response(sample))
 
     @app.post("/api/samples/{sample_id}/publish", response_model=SampleResponse)
@@ -513,20 +666,65 @@ def _env_positive_int(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _env_text(name: str, default: str, *aliases: str) -> str:
-    for candidate in (name, *aliases):
-        value = os.getenv(candidate)
-        if value and value.strip():
-            return value.strip()
-    return default
+def _env_positive_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    try:
+        parsed = float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) and parsed > 0 else default
 
 
-def _env_optional_text(name: str, *aliases: str) -> str | None:
-    for candidate in (name, *aliases):
-        value = os.getenv(candidate)
-        if value and value.strip():
-            return value.strip()
-    return None
+def _env_nonnegative_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    try:
+        parsed = float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) and parsed >= 0 else default
+
+
+def _env_optional_text(name: str) -> str | None:
+    value = os.getenv(name)
+    return value.strip() if value and value.strip() else None
+
+
+def _model_health(
+    base_url: str | None, model_name: str | None, api_key: str | None
+) -> ModelHealth:
+    base_url_configured = bool(base_url)
+    model_configured = bool(model_name)
+    api_key_configured = bool(api_key)
+    if base_url_configured and model_configured:
+        key_detail = (
+            "API Key 已设置"
+            if api_key_configured
+            else "API Key 未设置；目标端点可能不需要密钥"
+        )
+        return ModelHealth(
+            status="ready",
+            detail=f"远程 OpenAI-compatible 模型已配置（{key_detail}）",
+            base_url_configured=True,
+            model_configured=True,
+            api_key_configured=api_key_configured,
+        )
+
+    missing = []
+    if not base_url_configured:
+        missing.append("BILIBILI_FILTER_OPENAI_BASE_URL")
+    if not model_configured:
+        missing.append("BILIBILI_FILTER_OPENAI_MODEL")
+    return ModelHealth(
+        status="unconfigured",
+        detail=(
+            "远程 OpenAI-compatible 模型未配置；缺少 "
+            + "、".join(missing)
+            + "。本地 UID 隐藏和任务提交仍可用。"
+        ),
+        base_url_configured=base_url_configured,
+        model_configured=model_configured,
+        api_key_configured=api_key_configured,
+    )
 
 
 def comment_response(comment: object) -> dict[str, object]:
@@ -563,6 +761,7 @@ def evidence_response(record: object) -> EvidenceResponse:
         sample_version=record.sample_version,
         rule_version=record.rule_version,
         created_at=record.created_at,
+        profile_id=record.profile_id,
     )
 
 
@@ -593,7 +792,26 @@ def sample_response(record: object) -> dict[str, object]:
         "published_at": record.published_at.isoformat() if record.published_at else None,
         "duplicate_count": record.duplicate_count,
         "is_current": record.is_current,
+        "profile_id": record.profile_id,
     }
+
+
+def filter_profile_response(profile: object) -> FilterProfileResponse:
+    catalog = profile.catalog
+    return FilterProfileResponse(
+        profile_id=profile.profile_id,
+        name=profile.name,
+        description=profile.description,
+        status=profile.status,
+        known_terms=list(catalog.known_terms),
+        standalone_terms=list(catalog.standalone_terms),
+        friendly_exceptions=list(catalog.friendly_exceptions),
+        hostile_context=list(catalog.hostile_context),
+        nickname_positive=list(catalog.nickname_positive),
+        created_at=profile.created_at,
+        updated_at=profile.updated_at,
+        is_current=profile.is_current,
+    )
 
 
 def _storage_sample_kind(value: str | None) -> str:
@@ -619,6 +837,14 @@ def blacklist_response(item: object) -> dict[str, object]:
     }
 
 
+def blacklist_settings_response(settings: BlacklistAutomationSettings) -> BlacklistSettingsResponse:
+    return BlacklistSettingsResponse(
+        enabled=settings.enabled,
+        mode=settings.mode,
+        updated_at=settings.updated_at,
+    )
+
+
 def uid_response(record: object) -> UidRecordResponse:
     return UidRecordResponse(
         uid=record.uid,
@@ -642,6 +868,7 @@ def task_response(task: VideoTask) -> TaskResponse:
         attempt=task.attempt,
         error_code=task.error_code,
         error_message=task.error_message,
+        profile_id=task.profile_id,
         progress=TaskProgressResponse(
             requested_pages=task.progress.requested_pages,
             saved_comments=task.progress.saved_comments,
@@ -656,11 +883,39 @@ def task_response(task: VideoTask) -> TaskResponse:
     )
 
 
-def blacklist_settings_response(settings: BlacklistAutomationSettings) -> BlacklistSettingsResponse:
-    return BlacklistSettingsResponse(
-        enabled=settings.enabled,
-        mode=settings.mode,
-        updated_at=settings.updated_at,
+def task_event_response(record: object) -> TaskEventResponse:
+    return TaskEventResponse(
+        event_id=record.event_id,
+        task_id=record.task_id,
+        attempt=record.attempt,
+        phase=record.phase,
+        event_type=record.event_type,
+        status=record.status,
+        message=record.message,
+        details=record.details,
+        created_at=record.created_at,
     )
+
+
+def analysis_run_response(record: object) -> AnalysisRunResponse:
+    return AnalysisRunResponse(
+        analysis_id=record.analysis_id,
+        task_id=record.task_id,
+        attempt=record.attempt,
+        status=record.status,
+        model=record.model,
+        sample_version=record.sample_version,
+        batch_count=record.batch_count,
+        account_count=record.account_count,
+        hit_count=record.hit_count,
+        uncertain_count=record.uncertain_count,
+        non_target_count=record.non_target_count,
+        evidence_count=record.evidence_count,
+        error_code=record.error_code,
+        error_message=record.error_message,
+        started_at=record.started_at,
+        completed_at=record.completed_at,
+    )
+
 
 app = create_app()

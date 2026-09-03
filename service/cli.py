@@ -8,6 +8,25 @@ import uvicorn
 
 from .app import create_app
 
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in _TRUE_ENV_VALUES:
+        return True
+    if normalized in _FALSE_ENV_VALUES:
+        return False
+
+    raise ValueError(
+        f"{name} must be one of 0, 1, false, true, no, yes, off, on; got {value!r}"
+    )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bilibili-filter")
@@ -34,7 +53,7 @@ def main() -> None:
     application = create_app(
         db_path=args.database,
         web_root=web_root if web_root.exists() else None,
-        start_background_worker=True,
+        start_background_worker=_env_bool("BILIBILI_FILTER_WORKER_ENABLED", default=True),
     )
     uvicorn.run(
         application,

@@ -33,8 +33,25 @@ FastAPI service
   a resumable checkpoint and an optional pause reason. Risk-control/API interception is a paused
   task outcome, not an ordinary retryable partial failure; malformed pagination metadata is
   recorded as a failed item while the current checkpoint remains resumable.
+- When the Bilibili WBI response provides an explicit all-level `declared_total` (from
+  `cursor.all_count`), coverage uses it as the whole-comment denominator and does not add
+  per-root reply declarations again; legacy transports without that total use separate root
+  and reply declarations.
+- `BilibiliCommentTransport` follows the current web comment protocol: it loads rotating WBI keys
+  from the navigation response, signs `/x/v2/reply/wbi/main`, and carries opaque
+  `cursor.pagination_reply.next_offset` values through `pagination_str`; when a response also
+  contains numeric `cursor.next`, the opaque offset remains authoritative. `seek_rpid` is a
+  single-comment positioning hint, not a continuation cursor. The pure signer lives in
+  `service/bilibili_wbi.py` and is independently fixture-tested.
 - `BatchAnalyzer.analyze(accounts, samples)` returns validated `hit`, `non_target` or `uncertain`
   results with evidence references and sample/rule versions.
+- The OpenAI-compatible analyzer groups unresolved UIDs by both estimated context budget and a
+  configurable account cap (`BILIBILI_FILTER_OPENAI_MAX_BATCH_ACCOUNTS`, default `32`). A read
+  timeout on a multi-UID request is classified separately and retried after recursive batch
+  splitting; a single-UID timeout remains an explicit model-unavailable result with partial
+  results preserved. The configured output limit remains an upper bound, while each request also
+  receives a batch-size-based ceiling to prevent an oversized global output budget from making
+  small requests unnecessarily slow.
 - `TaskOrchestrator.run(task_id)` coordinates collection, grouping, analysis, registry updates,
   evidence persistence and queue creation idempotently.
 - `UidRegistry` owns global UID states and cache versions.
@@ -63,7 +80,7 @@ The initial API is intentionally small and observable:
 
 - `GET /api/health`
 - `GET/POST /api/auth/session`
-- `GET /api/uids`, `POST /api/uids`, `PATCH /api/uids/{uid}`
+- `GET /api/uids`, `POST /api/uids`, `PATCH /api/uids/{uid}`, `DELETE /api/uids/{uid}`
 - `GET/POST /api/tasks`, `GET /api/tasks/{task_id}`, `POST /api/tasks/{task_id}/retry`
 - `GET /api/tasks/{task_id}/comments`
 - `GET/POST /api/reviews`, `POST /api/reviews/{evidence_id}`
@@ -71,6 +88,13 @@ The initial API is intentionally small and observable:
 - `GET/POST /api/samples`, `POST /api/samples/{sample_id}/publish`
 - `GET /api/blacklist`, `POST /api/blacklist/{item_id}/pause`, `/resume`, `/retry`
 - `GET /api/uids/sync?since=<version>`
+
+The health response includes a `model` diagnostic with only configuration flags:
+`base_url_configured`, `model_configured`, and `api_key_configured`. It never returns the
+configured endpoint, model name, or key. Missing remote-model configuration is reported as a
+model-level `unconfigured` state while the service remains `ready`, because local UID hiding and
+task submission do not depend on the remote analyzer. A queued task can still surface a truthful
+model-unavailable result for later retry.
 
 The service must return truthful connection and state errors. It must not return a ready/connected
 status when the backing store or worker is unavailable.
@@ -99,12 +123,20 @@ status when the backing store or worker is unavailable.
 - Posting the same normalized video while an unfinished task exists returns that task. A future
   explicit rerun flag may create a new task; the first implementation does not silently duplicate
   active work.
-- Coverage uses the source-declared total when present and records its denominator kind. When the
-  source does not declare a total, the task reports observed-page coverage rather than inventing a
-  percentage.
+- Coverage uses a conservative denominator: the larger of the source-declared total and the sum
+  of declared root comments plus declared replies. When the source does not declare a total, the
+  task reports the observed declared counts rather than inventing a percentage.
+- The collector distinguishes a terminal source page from a complete collection. A resumed run
+  may reach the platform's terminal page while remaining incomplete; the orchestrator merges its
+  comments into SQLite before deciding task-level completion.
 - Rule-only seed examples are available before user sample versions exist. The built-in provider
   is versioned and is replaced/augmented by the published sample set for later tasks.
 - Session handoff never logs raw cookies. The local store may persist the session needed by the
   worker, but API responses expose only authentication status, timestamps and diagnostic reasons.
+- When `POST /api/auth/session` verifies a valid session, `TaskStore` atomically requeues only
+  tasks paused with `error_code=auth_unavailable`; risk-control and other pause reasons remain paused.
+- The extension also performs a coalesced background auth sync when popup state is opened, on
+  install, browser startup and the existing periodic cache alarm, but only when a Bilibili tab is
+  present; no Bilibili tab means no cookie read.
 - Docker runs Chromium headless. Windows local mode also uses a hidden/headless worker process;
   neither mode opens a visible browser window or captures keyboard/mouse input.

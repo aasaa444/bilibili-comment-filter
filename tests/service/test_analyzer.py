@@ -8,7 +8,7 @@ from service.analyzer import (
     AnalysisDecision,
     AnalyzerContextLimitError,
     AnalyzerInvalidResponseError,
-    AnalyzerUnavailableError,
+    AnalyzerTimeoutError,
     CommentForAnalysis,
     OpenAICompatibleBatchAnalyzer,
     OpenAICompatibleTransport,
@@ -97,6 +97,106 @@ def test_analyzer_batches_accounts_and_keeps_same_uid_together() -> None:
     assert result.sample_context.mode == "full"
 
 
+def test_analyzer_caps_large_uid_batches_before_model_call() -> None:
+    transport = RecordingModelTransport()
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=transport,
+        model="fixture-model",
+        context_budget=100000,
+        max_batch_accounts=2,
+    )
+
+    result = analyzer.analyze(
+        [account(str(1000 + index), "ordinary discussion") for index in range(5)],
+        SampleSet("v1", ()),
+    )
+
+    assert [len(request["accounts"]) for request in transport.requests] == [2, 2, 1]
+    assert result.batch_count == 3
+    assert len(result.results) == 5
+
+
+def test_analyzer_splits_a_timed_out_large_batch_and_keeps_results() -> None:
+    class TimeoutTransport:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def complete(self, payload: dict) -> str:
+            self.calls.append(len(payload["accounts"]))
+            if len(payload["accounts"]) > 1:
+                raise AnalyzerTimeoutError("fixture read timeout")
+            item = payload["accounts"][0]
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "uid": item["uid"],
+                            "decision": "uncertain",
+                            "evidence_comment_ids": [item["comments"][0]["comment_id"]],
+                            "reason": "fixture review",
+                            "confidence": 0.5,
+                            "model_version": "fixture-model",
+                        }
+                    ]
+                }
+            )
+
+    transport = TimeoutTransport()
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=transport,
+        model="fixture-model",
+        context_budget=100000,
+        max_batch_accounts=100,
+    )
+
+    result = analyzer.analyze(
+        [account(str(1000 + index), "ordinary discussion") for index in range(4)],
+        SampleSet("v1", ()),
+    )
+
+    assert transport.calls == [4, 2, 1, 1, 2, 1, 1]
+    assert result.batch_count == 7
+    assert {item.uid for item in result.results} == {"1000", "1001", "1002", "1003"}
+
+
+def test_analyzer_splits_a_batch_after_model_validation_failure() -> None:
+    class ValidationTransport:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def complete(self, payload: dict) -> str:
+            self.calls.append(len(payload["accounts"]))
+            item = payload["accounts"][0]
+            result = {
+                "uid": item["uid"],
+                "decision": "uncertain",
+                "evidence_comment_ids": [item["comments"][0]["comment_id"]],
+                "reason": "fixture review",
+                "confidence": 0.5,
+                "model_version": "fixture-model",
+            }
+            if len(payload["accounts"]) > 1:
+                result.pop("evidence_comment_ids")
+            return json.dumps({"results": [result]})
+
+    transport = ValidationTransport()
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=transport,
+        model="fixture-model",
+        context_budget=100000,
+        max_batch_accounts=100,
+    )
+
+    result = analyzer.analyze(
+        [account(str(1000 + index), "ordinary discussion") for index in range(4)],
+        SampleSet("v1", ()),
+    )
+
+    assert transport.calls == [4, 2, 1, 1, 2, 1, 1]
+    assert result.batch_count == 7
+    assert {item.uid for item in result.results} == {"1000", "1001", "1002", "1003"}
+
+
 def test_rule_engine_prioritizes_friendly_exception_and_requires_context_for_terms() -> None:
     engine = RuleEngine(
         RuleCatalog(
@@ -104,6 +204,7 @@ def test_rule_engine_prioritizes_friendly_exception_and_requires_context_for_ter
             known_terms=("巴斯特", "䟋", "天龙八部", "粘慕斯"),
             friendly_exceptions=("曼巴斯特",),
             nickname_positive=("典型詹黑昵称",),
+            standalone_terms=(),
             hostile_context=("垃圾", "恶心"),
         )
     )
@@ -120,6 +221,48 @@ def test_rule_engine_prioritizes_friendly_exception_and_requires_context_for_ter
     assert contextual_term.decision is AnalysisDecision.HIT
     assert nickname is not None
     assert nickname.decision is AnalysisDecision.HIT
+
+
+@pytest.mark.parametrize("term", ["巴斯特", "䟋", "天龙八部", "粘慕斯"])
+def test_default_catalog_treats_known_terms_as_standalone_high_confidence_hits(term: str) -> None:
+    result = RuleEngine().evaluate(account("1005", term))
+
+    assert result is not None
+    assert result.decision is AnalysisDecision.HIT
+    assert result.signals == (f"known_term_standalone:{term}",)
+    assert result.confidence == 0.96
+
+
+def test_friendly_exception_still_overrides_standalone_term() -> None:
+    result = RuleEngine().evaluate(account("1006", "曼巴斯特"))
+
+    assert result is not None
+    assert result.decision is AnalysisDecision.NON_TARGET
+    assert result.signals == ("friendly_exception:曼巴斯特",)
+
+
+def test_published_nickname_sample_becomes_a_hard_rule_without_model_call() -> None:
+    transport = RecordingModelTransport()
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=transport,
+        model="fixture-model",
+        context_budget=1000,
+    )
+    target = AccountBundle(uid="1004", nickname="用户提供的詹黑型昵称", comments=())
+
+    result = analyzer.analyze(
+        (target,),
+        SampleSet(
+            "samples-v2",
+            (SampleItem("n1", "nickname", "positive", "用户提供的詹黑型昵称"),),
+        ),
+    )
+
+    assert result.batch_count == 0
+    assert transport.requests == []
+    assert result.results[0].decision is AnalysisDecision.HIT
+    assert result.results[0].signals == ("nickname_hard_rule",)
+    assert result.results[0].sample_version == "samples-v2"
 
 
 def test_sample_injector_compresses_chinese_samples_within_budget() -> None:
@@ -223,6 +366,94 @@ def test_analyzer_accepts_openai_text_content_segments() -> None:
     assert result.results[0].decision is AnalysisDecision.UNCERTAIN
 
 
+def test_analyzer_recovers_when_output_limit_truncates_a_large_batch() -> None:
+    class OutputLimitedTransport:
+        max_output_tokens = 64
+
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def complete(self, payload: dict) -> str:
+            self.calls.append(len(payload["accounts"]))
+            results = [
+                {
+                    "uid": item["uid"],
+                    "decision": "uncertain",
+                    "evidence_comment_ids": [comment["comment_id"] for comment in item["comments"]],
+                    "signals": ["model-review"],
+                    "reason": "Needs human review",
+                    "confidence": 0.51,
+                    "model_version": "fixture-model",
+                }
+                for item in payload["accounts"]
+            ]
+            encoded = json.dumps({"results": results})
+            limit = self.max_output_tokens * 4
+            return encoded if len(encoded) <= limit else encoded[:limit]
+
+    transport = OutputLimitedTransport()
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=transport,
+        model="fixture-model",
+        context_budget=100000,
+    )
+
+    result = analyzer.analyze(
+        [account(str(1000 + index), "ordinary discussion") for index in range(24)],
+        SampleSet("v1", ()),
+    )
+
+    assert len(result.results) == 24
+    assert len(transport.calls) > 1
+
+
+def test_analyzer_accepts_prefixed_fenced_json_model_content() -> None:
+    encoded = json.dumps(
+        {
+            "results": [
+                {
+                    "uid": "1001",
+                    "decision": "uncertain",
+                    "evidence_comment_ids": ["c1"],
+                    "reason": "Needs review",
+                    "confidence": 0.5,
+                    "model_version": "fixture-model",
+                }
+            ]
+        }
+    )
+
+    class WrappedTransport:
+        def complete(self, _payload: dict) -> str:
+            return f"<think>analysis</think>\n```json\n{encoded}\n```"
+
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=WrappedTransport(), model="fixture-model", context_budget=1000
+    )
+
+    result = analyzer.analyze([account("1001", "needs analysis")], SampleSet("v1", ()))
+
+    assert result.results[0].uid == "1001"
+    assert result.results[0].decision is AnalysisDecision.UNCERTAIN
+
+
+def test_analyzer_accepts_minimal_non_target_result() -> None:
+    class MinimalTransport:
+        def complete(self, _payload: dict) -> dict:
+            return {"results": [{"uid": "1001", "decision": "non_target"}]}
+
+    analyzer = OpenAICompatibleBatchAnalyzer(
+        transport=MinimalTransport(), model="fixture-model", context_budget=1000
+    )
+
+    result = analyzer.analyze([account("1001", "ordinary discussion")], SampleSet("v1", ()))
+
+    assert result.results[0].decision is AnalysisDecision.NON_TARGET
+    assert result.results[0].evidence_comment_ids == ()
+    assert result.results[0].confidence == 0.0
+    assert result.results[0].model_version == "fixture-model"
+
+
 def test_openai_transport_sends_batch_request_with_authentication() -> None:
     requests: list[httpx.Request] = []
 
@@ -256,6 +487,33 @@ def test_openai_transport_sends_batch_request_with_authentication() -> None:
         client.close()
 
     assert len(requests) == 1
+
+
+def test_openai_transport_bounds_output_budget_to_batch_size() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["max_tokens"] == 4096
+        return httpx.Response(200, json={"results": []})
+
+    client = httpx.Client(
+        base_url="https://model.example/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = OpenAICompatibleTransport(
+            base_url="https://model.example/v1",
+            api_key=None,
+            model="fixture-model",
+            max_output_tokens=65535,
+            client=client,
+        )
+        transport.complete(
+            {
+                "accounts": [{"uid": "1001"}, {"uid": "1002"}],
+            }
+        )
+    finally:
+        client.close()
 
 
 def test_openai_transport_retries_transient_http_status() -> None:
@@ -403,7 +661,7 @@ def test_openai_transport_retries_timeout_and_raises_unavailable() -> None:
             max_retries=1,
             retry_backoff=0,
         )
-        with pytest.raises(AnalyzerUnavailableError, match="fixture timeout"):
+        with pytest.raises(AnalyzerTimeoutError, match="fixture timeout"):
             transport.complete({"accounts": []})
     finally:
         client.close()
@@ -505,7 +763,7 @@ def test_analyzer_splits_a_server_rejected_batch_and_keeps_single_uid_fallback()
     analyzer = OpenAICompatibleBatchAnalyzer(
         transport=transport,
         model="fixture-model",
-        context_budget=1000,
+        context_budget=2000,
     )
 
     result = analyzer.analyze(

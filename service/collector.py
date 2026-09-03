@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import httpx
 
+from .bilibili_wbi import BilibiliWbiSigner
+from .cursors import CursorValue, normalize_cursor
 from .tasks import VideoTask
 
 DEFAULT_BILIBILI_USER_AGENT = (
@@ -40,7 +44,7 @@ class CollectionCheckpoint:
     declared_comments: int = 0
     declared_total: int | None = None
     declared_reply_counts: dict[str, int] = field(default_factory=dict)
-    root_cursor: int | None = None
+    root_cursor: CursorValue | None = None
 
 
 @dataclass(frozen=True)
@@ -60,8 +64,16 @@ class CollectionResult:
     checkpoint: CollectionCheckpoint
     stats: CollectionStats
     complete: bool
+    terminal: bool = False
     failed_items: tuple[str, ...] = ()
     pause_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class VideoMetadata:
+    video_id: str
+    aid: str
+    title: str | None
 
 
 class CommentCollector(Protocol):
@@ -70,11 +82,39 @@ class CommentCollector(Protocol):
 
 
 class CommentTransport(Protocol):
-    def fetch_root_page(self, video_id: str, page: int) -> dict[str, Any]:
+    def fetch_root_page(self, video_id: str, page: CursorValue) -> dict[str, Any]:
         """Fetch one first-level comment page."""
 
     def fetch_replies(self, video_id: str, root_id: str, page: int) -> dict[str, Any]:
         """Fetch one reply page for a root comment."""
+
+
+class VideoMetadataProvider(Protocol):
+    def fetch_video_metadata(self, video_id: str) -> VideoMetadata:
+        """Fetch authoritative metadata for a Bilibili video."""
+
+
+def fetch_official_video_title(
+    provider: VideoMetadataProvider | None, video_id: str
+) -> str | None:
+    """Return a clean Bilibili title without allowing a client snapshot to leak in."""
+
+    if provider is None or not re.fullmatch(r"BV[0-9A-Za-z]{10}", video_id, re.IGNORECASE):
+        return None
+    try:
+        metadata = provider.fetch_video_metadata(video_id)
+    except Exception:
+        return None
+    if isinstance(metadata, VideoMetadata):
+        title = metadata.title
+    elif isinstance(metadata, Mapping):
+        title = metadata.get("title")
+    else:
+        title = None
+    if not isinstance(title, str):
+        return None
+    normalized = title.strip()
+    return normalized or None
 
 
 class BilibiliAuthenticationError(RuntimeError):
@@ -96,7 +136,7 @@ class BilibiliRateLimitError(BilibiliTransportError):
 
 
 class BilibiliCommentTransport:
-    """HTTP boundary for Bilibili's public comment read endpoints.
+    """HTTP boundary for Bilibili's public video metadata and comment endpoints.
 
     The transport only reads comment pages. Authentication cookies are supplied by the
     service-owned session provider and are never returned by this adapter.
@@ -115,6 +155,7 @@ class BilibiliCommentTransport:
         retry_backoff: float = 0.5,
         client: httpx.Client | None = None,
         user_agent: str = DEFAULT_BILIBILI_USER_AGENT,
+        wbi_signer: BilibiliWbiSigner | None = None,
     ) -> None:
         self.cookies_provider = cookies_provider
         self.user_agent = user_agent
@@ -128,16 +169,32 @@ class BilibiliCommentTransport:
             },
         )
         self._video_oid_cache: dict[str, str] = {}
+        self._video_metadata_cache: dict[str, VideoMetadata] = {}
         self._min_interval = max(0.0, min_interval)
         self._max_retries = max(0, max_retries)
         self._retry_backoff = max(0.0, retry_backoff)
         self._last_request = 0.0
+        self._wbi_signer = wbi_signer
 
-    def fetch_root_page(self, video_id: str, page: int) -> dict[str, Any]:
+    def fetch_root_page(self, video_id: str, page: CursorValue) -> dict[str, Any]:
         oid = self._resolve_oid(video_id)
+        params: dict[str, object] = {
+            "type": 1,
+            "oid": oid,
+            "mode": 3,
+            "next": 0 if isinstance(page, str) else page,
+            "ps": 20,
+        }
+        if isinstance(page, str):
+            params["pagination_str"] = json.dumps(
+                {"offset": page}, ensure_ascii=False, separators=(",", ":")
+            )
+        signed_params = self._wbi_signer_for_comments().sign(
+            {**params, "web_location": 1315875}
+        )
         return self._get(
-            "/x/v2/reply/main",
-            {"type": 1, "oid": oid, "mode": 3, "next": page, "ps": 20},
+            "/x/v2/reply/wbi/main",
+            signed_params,
             referer=f"https://www.bilibili.com/video/{video_id}/",
         )
 
@@ -149,20 +206,68 @@ class BilibiliCommentTransport:
             referer=f"https://www.bilibili.com/video/{video_id}/",
         )
 
+    def fetch_video_metadata(self, video_id: str) -> VideoMetadata:
+        cached = self._video_metadata_cache.get(video_id)
+        if cached is not None:
+            return cached
+        payload = self._get(
+            "/x/web-interface/view",
+            {"bvid": video_id},
+            referer=f"https://www.bilibili.com/video/{video_id}/",
+        )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(data, dict):
+            raise RuntimeError("Bilibili video metadata returned an invalid object")
+        aid = data.get("aid")
+        if aid is None:
+            raise RuntimeError("Bilibili video metadata did not contain an aid")
+        raw_title = data.get("title")
+        title = raw_title.strip() if isinstance(raw_title, str) else None
+        metadata = VideoMetadata(video_id=video_id, aid=str(aid), title=title or None)
+        self._video_metadata_cache[video_id] = metadata
+        self._video_oid_cache[video_id] = metadata.aid
+        return metadata
+
     def _resolve_oid(self, video_id: str) -> str:
         if not video_id.upper().startswith("BV"):
             return video_id
         cached = self._video_oid_cache.get(video_id)
         if cached:
             return cached
-        payload = self._get("/x/web-interface/view", {"bvid": video_id})
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        aid = data.get("aid") if isinstance(data, dict) else None
-        if aid is None:
-            raise RuntimeError("Bilibili video metadata did not contain an aid")
-        resolved = str(aid)
-        self._video_oid_cache[video_id] = resolved
-        return resolved
+        return self.fetch_video_metadata(video_id).aid
+
+    def _wbi_signer_for_comments(self) -> BilibiliWbiSigner:
+        if self._wbi_signer is not None:
+            return self._wbi_signer
+        payload = self._get(
+            "/x/web-interface/nav",
+            {},
+            allow_auth_codes=True,
+        )
+        wbi_img = payload.get("wbi_img") if isinstance(payload, dict) else None
+        if not isinstance(wbi_img, dict):
+            raise BilibiliTransportError(
+                "invalid_wbi_keys",
+                "Bilibili navigation response did not contain WBI keys",
+                category="protocol",
+            )
+        image_url = wbi_img.get("img_url")
+        sub_url = wbi_img.get("sub_url")
+        if not isinstance(image_url, str) or not isinstance(sub_url, str):
+            raise BilibiliTransportError(
+                "invalid_wbi_keys",
+                "Bilibili navigation response contained invalid WBI key URLs",
+                category="protocol",
+            )
+        try:
+            self._wbi_signer = BilibiliWbiSigner.from_urls(image_url, sub_url)
+        except ValueError as exc:
+            raise BilibiliTransportError(
+                "invalid_wbi_keys",
+                "Bilibili navigation response contained unusable WBI keys",
+                category="protocol",
+            ) from exc
+        return self._wbi_signer
 
     def _get(
         self,
@@ -170,6 +275,7 @@ class BilibiliCommentTransport:
         params: dict[str, object],
         *,
         referer: str | None = None,
+        allow_auth_codes: bool = False,
     ) -> dict[str, Any]:
         cookies = self.cookies_provider() or {}
         headers = {
@@ -243,6 +349,14 @@ class BilibiliCommentTransport:
             if code == 0:
                 return payload.get("data") or {}
             if code in {-101, -111}:
+                data = payload.get("data")
+                if (
+                    code == -101
+                    and allow_auth_codes
+                    and isinstance(data, dict)
+                    and isinstance(data.get("wbi_img"), dict)
+                ):
+                    return payload.get("data") or {}
                 raise BilibiliAuthenticationError(
                     payload.get("message") or "Bilibili session is no longer valid"
                 )
@@ -280,13 +394,6 @@ class BilibiliCommentCollector:
         declared_total = checkpoint.declared_total
         pinned_comments = 0
         invalid_item = False
-        fresh_checkpoint = (
-            checkpoint.root_page == 1
-            and checkpoint.root_cursor is None
-            and not checkpoint.reply_pages
-            and checkpoint.requested_pages == 0
-        )
-
         while True:
             requested_pages += 1
             try:
@@ -456,7 +563,11 @@ class BilibiliCommentCollector:
                 comments.append(comment)
                 pinned_comments += int(comment.is_pinned)
                 root_id = comment.comment_id
-                if int(item.get("rcount") or 0) <= 0 and not item.get("replies"):
+                declared_root_replies = _coerce_integer(item.get("rcount"), 0) or 0
+                declared_reply_by_root[root_id] = max(
+                    declared_reply_by_root.get(root_id, 0), declared_root_replies
+                )
+                if declared_root_replies <= 0 and not item.get("replies"):
                     continue
                 reply_page = reply_pages.get(root_id, 1)
                 while True:
@@ -640,7 +751,7 @@ class BilibiliCommentCollector:
                 root_page += 1
                 root_cursor = _next_cursor(payload)
                 continue
-            total_declared = _total_declared(
+            total_declared = total_declared_count(
                 declared_comments, sum(declared_reply_by_root.values()), declared_total
             )
             total_saved = len(comments)
@@ -650,8 +761,7 @@ class BilibiliCommentCollector:
                     root_page + 1,
                     reply_pages,
                     (
-                        not fresh_checkpoint
-                        or not total_declared
+                        not total_declared
                         or total_saved >= total_declared
                     ) and not invalid_item,
                     requested_pages,
@@ -666,6 +776,7 @@ class BilibiliCommentCollector:
                 sum(declared_reply_by_root.values()),
                 failed_items,
                 declared_total=declared_total,
+                terminal=True,
             )
 
     @staticmethod
@@ -748,11 +859,14 @@ class BilibiliCommentCollector:
         *,
         declared_total: int | None = None,
         pause_reason: str | None = None,
+        terminal: bool = False,
     ) -> CollectionResult:
         saved_comments = sum(comment.level == "root" for comment in comments)
         saved_replies = sum(comment.level == "reply" for comment in comments)
         total_saved = saved_comments + saved_replies
-        total_declared = _total_declared(declared_comments, declared_replies, declared_total)
+        total_declared = total_declared_count(
+            declared_comments, declared_replies, declared_total
+        )
         coverage = (
             min(1.0, total_saved / total_declared) if total_declared else float(bool(total_saved))
         )
@@ -769,6 +883,7 @@ class BilibiliCommentCollector:
                 coverage=coverage,
             ),
             complete=checkpoint.complete,
+            terminal=terminal,
             failed_items=tuple(failed_items),
             pause_reason=pause_reason,
         )
@@ -781,7 +896,7 @@ class BilibiliCommentCollector:
         requested_pages: int,
         declared_comments: int,
         declared_reply_counts: dict[str, int],
-        root_cursor: int | None = None,
+        root_cursor: CursorValue | None = None,
         *,
         declared_total: int | None = None,
     ) -> CollectionCheckpoint:
@@ -853,6 +968,15 @@ def _metadata_errors(payload: dict[str, Any], prefix: str) -> list[str]:
                 errors.append(f"{prefix}:cursor.{metadata_field}:not_integer")
         if "is_end" in cursor and not isinstance(cursor["is_end"], bool):
             errors.append(f"{prefix}:cursor.is_end:not_boolean")
+        pagination = cursor.get("pagination_reply")
+        if pagination is not None and not isinstance(pagination, dict):
+            errors.append(f"{prefix}:cursor.pagination_reply:not_object")
+        if isinstance(pagination, dict):
+            next_offset = pagination.get("next_offset")
+            if next_offset not in (None, "") and not isinstance(next_offset, str):
+                errors.append(
+                    f"{prefix}:cursor.pagination_reply.next_offset:not_string"
+                )
     if "has_more" in payload and not isinstance(payload["has_more"], bool):
         errors.append(f"{prefix}:has_more:not_boolean")
     return errors
@@ -890,10 +1014,23 @@ def _declared_total(payload: dict[str, Any]) -> int | None:
     return None
 
 
-def _total_declared(
+def total_declared_count(
     declared_comments: int, declared_replies: int, declared_total: int | None
 ) -> int:
-    return declared_total if declared_total is not None else declared_comments + declared_replies
+    """Return the declared whole-comment total without double-counting replies.
+
+    Bilibili's WBI ``cursor.all_count`` is an all-level total. When it is
+    available as ``declared_total``, per-root reply counts are diagnostics for
+    coverage, not an additional denominator. Legacy transports that expose
+    only separate root/reply declarations still use their sum.
+    """
+    if declared_total is not None:
+        return max(
+            max(0, declared_total),
+            max(0, declared_comments),
+            max(0, declared_replies),
+        )
+    return max(0, declared_comments) + max(0, declared_replies)
 
 
 def _has_more(payload: dict[str, Any], page: int, *, item_count: int | None = None) -> bool:
@@ -902,8 +1039,12 @@ def _has_more(payload: dict[str, Any], page: int, *, item_count: int | None = No
     cursor = payload.get("cursor")
     cursor = cursor if isinstance(cursor, dict) else {}
     if "is_end" in cursor:
-        next_cursor = _coerce_integer(cursor.get("next"), None)
-        return not bool(cursor.get("is_end")) and (next_cursor is not None and next_cursor > 0)
+        if bool(cursor.get("is_end")):
+            return False
+        next_cursor = _next_cursor(payload)
+        if isinstance(next_cursor, str):
+            return bool(next_cursor)
+        return next_cursor is not None and next_cursor > 0
     page_info = payload.get("page")
     page_info = page_info if isinstance(page_info, dict) else {}
     page_count = _coerce_integer(page_info.get("page_count"), 0) or 0
@@ -916,11 +1057,16 @@ def _has_more(payload: dict[str, Any], page: int, *, item_count: int | None = No
     return item_count is not None and item_count >= 20
 
 
-def _next_cursor(payload: dict[str, Any]) -> int | None:
+def _next_cursor(payload: dict[str, Any]) -> CursorValue | None:
     cursor = payload.get("cursor")
     cursor = cursor if isinstance(cursor, dict) else {}
-    value = cursor.get("next")
-    return _coerce_integer(value, None)
+    pagination = cursor.get("pagination_reply")
+    if isinstance(pagination, dict):
+        opaque_cursor = normalize_cursor(pagination.get("next_offset"))
+        if opaque_cursor is not None:
+            return opaque_cursor
+    numeric_cursor = _coerce_integer(cursor.get("next"), None)
+    return numeric_cursor
 
 
 def _pinned_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -928,10 +1074,23 @@ def _pinned_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for key in ("top", "top_replies"):
         value = payload.get(key)
         if isinstance(value, dict):
-            candidates.append(value)
+            if _looks_like_comment_item(value):
+                candidates.append(value)
         elif isinstance(value, list):
-            candidates.extend(item for item in value if isinstance(item, dict))
+            candidates.extend(
+                item for item in value if isinstance(item, dict) and _looks_like_comment_item(item)
+            )
     upper = payload.get("upper") or {}
-    if isinstance(upper, dict) and isinstance(upper.get("top"), dict):
+    if (
+        isinstance(upper, dict)
+        and isinstance(upper.get("top"), dict)
+        and _looks_like_comment_item(upper["top"])
+    ):
         candidates.append(upper["top"])
     return [{**item, "is_top": True} for item in candidates]
+
+
+def _looks_like_comment_item(value: dict[str, Any]) -> bool:
+    """Reject Bilibili's top-comment metadata wrapper before parsing it as a comment."""
+
+    return value.get("rpid") not in (None, "") or value.get("id") not in (None, "")

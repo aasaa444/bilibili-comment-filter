@@ -1,5 +1,6 @@
 import type {
   ApiErrorEnvelope,
+  AnalysisRun,
   AuthSession,
   AuthSessionRequest,
   BlacklistItem,
@@ -7,11 +8,15 @@ import type {
   CreateTaskRequest,
   CreateUidRequest,
   Evidence,
+  FilterProfile,
   HealthResponse,
-  SampleSetKind,
+  ModelHealth,
   ReviewRecord,
   SampleSet,
+  SampleSetKind,
   TaskComment,
+  TaskAnalysis,
+  TaskEvent,
   TaskStatus,
   UidRecord,
   UidSyncResponse,
@@ -77,6 +82,7 @@ export class ApiClient {
       method: "DELETE",
     }).then(() => undefined);
   }
+
   async syncUids(since?: number): Promise<UidSyncResponse> {
     const query = since === undefined ? "" : `?since=${encodeURIComponent(String(since))}`;
     return normalizeUidSync(await this.request<unknown>(`/api/uids/sync${query}`));
@@ -91,6 +97,39 @@ export class ApiClient {
     return this.requestList(`/api/tasks${query}`, "tasks", normalizeVideoTask);
   }
 
+  listProfiles(): Promise<ApiList<FilterProfile>> {
+    return this.requestList("/api/profiles", "profiles", normalizeFilterProfile);
+  }
+
+  activateProfile(profileId: string): Promise<FilterProfile> {
+    return this.request<unknown>(`/api/profiles/${encodeURIComponent(profileId)}/activate`, {
+      method: "POST",
+    }).then(requireFilterProfile);
+  }
+
+  createProfile(payload: {
+    name: string;
+    description?: string;
+    knownTerms?: string[];
+    standaloneTerms?: string[];
+    friendlyExceptions?: string[];
+    hostileContext?: string[];
+    nicknamePositive?: string[];
+  }): Promise<FilterProfile> {
+    return this.request<unknown>("/api/profiles", {
+      method: "POST",
+      body: {
+        name: payload.name,
+        description: payload.description ?? "",
+        known_terms: payload.knownTerms ?? [],
+        standalone_terms: payload.standaloneTerms ?? [],
+        friendly_exceptions: payload.friendlyExceptions ?? [],
+        hostile_context: payload.hostileContext ?? [],
+        nickname_positive: payload.nicknamePositive ?? [],
+      },
+    }).then(requireFilterProfile);
+  }
+
   createTask(payload: CreateTaskRequest): Promise<VideoTask> {
     return this.request<unknown>("/api/tasks", { method: "POST", body: toCreateTaskPayload(payload) }).then(requireVideoTask);
   }
@@ -101,6 +140,14 @@ export class ApiClient {
 
   listTaskComments(taskId: string): Promise<ApiList<TaskComment>> {
     return this.requestList(`/api/tasks/${encodeURIComponent(taskId)}/comments`, "comments", normalizeTaskComment);
+  }
+
+  listTaskEvents(taskId: string): Promise<ApiList<TaskEvent>> {
+    return this.requestList(`/api/tasks/${encodeURIComponent(taskId)}/events`, "events", normalizeTaskEvent);
+  }
+
+  getTaskAnalysis(taskId: string): Promise<TaskAnalysis> {
+    return this.request<unknown>(`/api/tasks/${encodeURIComponent(taskId)}/analysis`).then(normalizeTaskAnalysis);
   }
 
   retryTask(taskId: string): Promise<VideoTask> {
@@ -120,6 +167,7 @@ export class ApiClient {
     if (params.reviewStatus) query.set("review_status", params.reviewStatus);
     return this.requestList(`/api/reviews${query.size ? `?${query}` : ""}`, "evidence", normalizeEvidence);
   }
+
   listReviewActions(params: { evidenceId?: string; uid?: string } = {}): Promise<ApiList<ReviewRecord>> {
     const query = new URLSearchParams();
     if (params.evidenceId) query.set("evidence_id", params.evidenceId);
@@ -175,6 +223,17 @@ export class ApiClient {
     return this.requestList("/api/blacklist", "blacklist", normalizeBlacklistItem);
   }
 
+  getBlacklistSettings(): Promise<BlacklistSettings> {
+    return this.request<unknown>("/api/blacklist/settings").then(requireBlacklistSettings);
+  }
+
+  updateBlacklistSettings(enabled: boolean): Promise<BlacklistSettings> {
+    return this.request<unknown>("/api/blacklist/settings", {
+      method: "PATCH",
+      body: { enabled },
+    }).then(requireBlacklistSettings);
+  }
+
   pauseBlacklist(itemId: string): Promise<BlacklistItem> {
     return this.request<unknown>(`/api/blacklist/${encodeURIComponent(itemId)}/pause`, { method: "POST" }).then(requireBlacklistItem);
   }
@@ -187,16 +246,6 @@ export class ApiClient {
     return this.request<unknown>(`/api/blacklist/${encodeURIComponent(itemId)}/retry`, { method: "POST" }).then(requireBlacklistItem);
   }
 
-  getBlacklistSettings(): Promise<BlacklistSettings> {
-    return this.request<unknown>("/api/blacklist/settings").then(requireBlacklistSettings);
-  }
-
-  updateBlacklistSettings(enabled: boolean): Promise<BlacklistSettings> {
-    return this.request<unknown>("/api/blacklist/settings", {
-      method: "PATCH",
-      body: { enabled },
-    }).then(requireBlacklistSettings);
-  }
   private async request<T>(path: string, options: { method?: string; body?: unknown } = {}): Promise<T> {
     let response: Response;
     try {
@@ -210,7 +259,6 @@ export class ApiClient {
     }
 
     const payload: unknown = await readResponsePayload(response);
-
     if (!response.ok) {
       const envelope = asApiErrorEnvelope(payload);
       throw new ApiRequestError(
@@ -257,6 +305,21 @@ function normalizeHealth(value: unknown): HealthResponse {
     service: stringValue(candidate.service),
     version: stringValue(candidate.version),
     detail: stringValue(candidate.detail) ?? stringValue(candidate.message),
+    model: normalizeModelHealth(candidate.model),
+  };
+}
+
+function normalizeModelHealth(value: unknown): ModelHealth | undefined {
+  const candidate = asRecord(value);
+  const status = stringValue(candidate.status);
+  const detail = stringValue(candidate.detail);
+  if (!status || !detail) return undefined;
+  return {
+    status,
+    detail,
+    baseUrlConfigured: booleanValue(candidate.base_url_configured) ?? booleanValue(candidate.baseUrlConfigured) ?? false,
+    modelConfigured: booleanValue(candidate.model_configured) ?? booleanValue(candidate.modelConfigured) ?? false,
+    apiKeyConfigured: booleanValue(candidate.api_key_configured) ?? booleanValue(candidate.apiKeyConfigured) ?? false,
   };
 }
 
@@ -340,6 +403,7 @@ function normalizeVideoTask(value: unknown): VideoTask | null {
     failedItems: failedItems === null ? undefined : stringArray(failedItems),
     errorCode: stringValue(candidate.error_code) ?? stringValue(candidate.errorCode),
     error: stringValue(candidate.error) ?? stringValue(candidate.error_message),
+    profileId: stringValue(candidate.profile_id) ?? stringValue(candidate.profileId),
   };
 }
 
@@ -366,6 +430,60 @@ function normalizeTaskComment(value: unknown): TaskComment | null {
   };
 }
 
+function normalizeTaskEvent(value: unknown): TaskEvent | null {
+  const candidate = asRecord(value);
+  const eventId = numberValue(candidate.event_id) ?? numberValue(candidate.eventId);
+  const eventType = stringValue(candidate.event_type) ?? stringValue(candidate.eventType);
+  const taskId = stringValue(candidate.task_id) ?? stringValue(candidate.taskId);
+  if (eventId === null || !eventType || !taskId) return null;
+  return {
+    eventId,
+    taskId,
+    attempt: numberValue(candidate.attempt) ?? 0,
+    phase: stringValue(candidate.phase) ?? "task",
+    eventType,
+    status: stringValue(candidate.status) ?? "info",
+    message: stringValue(candidate.message) ?? "",
+    details: asRecord(candidate.details),
+    createdAt: stringValue(candidate.created_at) ?? stringValue(candidate.createdAt) ?? "",
+  };
+}
+
+function normalizeTaskAnalysis(value: unknown): TaskAnalysis {
+  const candidate = asRecord(value);
+  const latest = normalizeAnalysisRun(candidate.latest);
+  const attempts = (arrayValue(candidate.attempts) ?? [])
+    .map(normalizeAnalysisRun)
+    .filter((item): item is AnalysisRun => item !== null);
+  return { latest, attempts };
+}
+
+function normalizeAnalysisRun(value: unknown): AnalysisRun | null {
+  const candidate = asRecord(value);
+  const analysisId = stringValue(candidate.analysis_id) ?? stringValue(candidate.analysisId);
+  const taskId = stringValue(candidate.task_id) ?? stringValue(candidate.taskId);
+  const status = stringValue(candidate.status);
+  if (!analysisId || !taskId || !status) return null;
+  return {
+    analysisId,
+    taskId,
+    attempt: numberValue(candidate.attempt) ?? 0,
+    status,
+    model: stringValue(candidate.model),
+    sampleVersion: stringValue(candidate.sample_version) ?? stringValue(candidate.sampleVersion),
+    batchCount: numberValue(candidate.batch_count) ?? numberValue(candidate.batchCount) ?? 0,
+    accountCount: numberValue(candidate.account_count) ?? numberValue(candidate.accountCount) ?? 0,
+    hitCount: numberValue(candidate.hit_count) ?? numberValue(candidate.hitCount) ?? 0,
+    uncertainCount: numberValue(candidate.uncertain_count) ?? numberValue(candidate.uncertainCount) ?? 0,
+    nonTargetCount: numberValue(candidate.non_target_count) ?? numberValue(candidate.nonTargetCount) ?? 0,
+    evidenceCount: numberValue(candidate.evidence_count) ?? numberValue(candidate.evidenceCount) ?? 0,
+    errorCode: stringValue(candidate.error_code) ?? stringValue(candidate.errorCode),
+    errorMessage: stringValue(candidate.error_message) ?? stringValue(candidate.errorMessage),
+    startedAt: stringValue(candidate.started_at) ?? stringValue(candidate.startedAt),
+    completedAt: stringValue(candidate.completed_at) ?? stringValue(candidate.completedAt),
+  };
+}
+
 function normalizeEvidence(value: unknown): Evidence | null {
   const candidate = asRecord(value);
   const evidenceId = stringValue(candidate.evidence_id) ?? stringValue(candidate.evidenceId) ?? stringValue(candidate.id);
@@ -389,7 +507,7 @@ function normalizeEvidence(value: unknown): Evidence | null {
     videoId: stringValue(candidate.video_id) ?? stringValue(candidate.videoId) ?? firstNormalizedComment?.videoId ?? "",
     comments,
     commentText: stringValue(candidate.comment_text) ?? stringValue(candidate.commentText) ?? firstNormalizedComment?.content ?? stringValue(firstComment.content) ?? "",
-    threadContext: stringValue(candidate.thread_context) ?? stringValue(candidate.threadContext) ?? (firstNormalizedComment?.context.join("\n") || stringArray(firstComment.context).join("\n") || undefined),
+    threadContext: stringValue(candidate.thread_context) ?? stringValue(candidate.threadContext) ?? (stringArray(firstComment.context).join("\n") || undefined),
     sourceVideo: stringValue(candidate.source_video) ?? stringValue(candidate.sourceVideo) ?? (stringValue(candidate.video_id) ? `https://www.bilibili.com/video/${candidate.video_id}` : undefined),
     commentUrl: stringValue(candidate.comment_url) ?? stringValue(candidate.commentUrl) ?? firstNormalizedComment?.commentUrl ?? stringValue(firstComment.comment_url),
     signal: stringValue(candidate.signal) ?? (signals.join(", ") || undefined),
@@ -400,6 +518,7 @@ function normalizeEvidence(value: unknown): Evidence | null {
     sampleVersion: stringValue(candidate.sample_version) ?? stringValue(candidate.sampleVersion),
     ruleVersion: stringValue(candidate.rule_version) ?? stringValue(candidate.ruleVersion),
     createdAt: stringValue(candidate.created_at) ?? stringValue(candidate.createdAt) ?? "",
+    profileId: stringValue(candidate.profile_id) ?? stringValue(candidate.profileId),
   };
 }
 
@@ -423,6 +542,7 @@ function normalizeEvidenceComment(value: unknown): TaskComment | null {
     context: stringArray(candidate.context),
   };
 }
+
 function normalizeReviewRecord(value: unknown): ReviewRecord | null {
   const candidate = asRecord(value);
   const reviewId = stringValue(candidate.review_id) ?? stringValue(candidate.reviewId) ?? stringValue(candidate.action_id) ?? stringValue(candidate.id);
@@ -468,6 +588,28 @@ function normalizeSampleSet(value: unknown): SampleSet | null {
     items,
     createdAt: stringValue(candidate.created_at) ?? stringValue(candidate.createdAt) ?? "",
     publishedAt: stringValue(candidate.published_at) ?? stringValue(candidate.publishedAt),
+    profileId: stringValue(candidate.profile_id) ?? stringValue(candidate.profileId),
+  };
+}
+
+function normalizeFilterProfile(value: unknown): FilterProfile | null {
+  const candidate = asRecord(value);
+  const profileId = stringValue(candidate.profile_id) ?? stringValue(candidate.profileId);
+  const name = stringValue(candidate.name);
+  if (!profileId || !name) return null;
+  return {
+    profileId,
+    name,
+    description: stringValue(candidate.description) ?? "",
+    status: stringValue(candidate.status) ?? "active",
+    knownTerms: stringArray(candidate.known_terms ?? candidate.knownTerms),
+    standaloneTerms: stringArray(candidate.standalone_terms ?? candidate.standaloneTerms),
+    friendlyExceptions: stringArray(candidate.friendly_exceptions ?? candidate.friendlyExceptions),
+    hostileContext: stringArray(candidate.hostile_context ?? candidate.hostileContext),
+    nicknamePositive: stringArray(candidate.nickname_positive ?? candidate.nicknamePositive),
+    createdAt: stringValue(candidate.created_at) ?? stringValue(candidate.createdAt) ?? "",
+    updatedAt: stringValue(candidate.updated_at) ?? stringValue(candidate.updatedAt) ?? "",
+    isCurrent: booleanValue(candidate.is_current) ?? booleanValue(candidate.isCurrent) ?? false,
   };
 }
 
@@ -532,6 +674,7 @@ function normalizeBlacklistSettings(value: unknown): BlacklistSettings | null {
     updatedAt: stringValue(candidate.updated_at) ?? stringValue(candidate.updatedAt) ?? "",
   };
 }
+
 function requireNormalized<T>(value: T | null, label: string): T {
   if (value === null) throw new ApiRequestError(502, `${label}响应格式无效`);
   return value;
@@ -541,7 +684,9 @@ const requireUidRecord = (value: unknown): UidRecord => requireNormalized(normal
 const requireVideoTask = (value: unknown): VideoTask => requireNormalized(normalizeVideoTask(value), "任务");
 const requireReviewRecord = (value: unknown): ReviewRecord => requireNormalized(normalizeReviewRecord(value), "复核");
 const requireSampleSet = (value: unknown): SampleSet => requireNormalized(normalizeSampleSet(value), "样本");
+const requireFilterProfile = (value: unknown): FilterProfile => requireNormalized(normalizeFilterProfile(value), "过滤策略");
 const requireBlacklistItem = (value: unknown): BlacklistItem => requireNormalized(normalizeBlacklistItem(value), "队列");
+
 const requireBlacklistSettings = (value: unknown): BlacklistSettings => requireNormalized(normalizeBlacklistSettings(value), "Blacklist settings");
 
 function toCreateUidPayload(payload: CreateUidRequest): Record<string, unknown> {
@@ -559,7 +704,6 @@ function toUpdateUidPayload(payload: UpdateUidRequest): Record<string, unknown> 
 function toCreateTaskPayload(payload: CreateTaskRequest): Record<string, unknown> {
   return {
     video_url: payload.videoUrl || `https://www.bilibili.com/video/${payload.bvid}`,
-    title: payload.title,
   };
 }
 

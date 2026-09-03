@@ -155,6 +155,28 @@ class UidRegistry:
             )
             return self.get(uid)
 
+    def remove(self, uid: str) -> UidRecord | None:
+        """Remove a UID and record a tombstone for incremental cache sync."""
+
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM uid_records WHERE uid = ?", (uid,)
+            ).fetchone()
+            if row is None:
+                return None
+            current = self._from_row(row)
+            timestamp = datetime.now(UTC).isoformat()
+            version = self._next_version(connection)
+            # uid_events has a foreign key to uid_records, so its historical
+            # rows must be removed before the authoritative record is deleted.
+            connection.execute("DELETE FROM uid_events WHERE uid = ?", (uid,))
+            connection.execute("DELETE FROM uid_records WHERE uid = ?", (uid,))
+            connection.execute(
+                "INSERT INTO uid_removals (uid, version, created_at) VALUES (?, ?, ?)",
+                (uid, version, timestamp),
+            )
+            return current
+
     def get(self, uid: str) -> UidRecord:
         row = self.database.execute("SELECT * FROM uid_records WHERE uid = ?", (uid,)).fetchone()
         if row is None:
@@ -176,11 +198,11 @@ class UidRegistry:
         ).fetchone()
         return int(row["current_version"])
 
-    def sync(self, since: int) -> tuple[str, int, list[UidRecord]]:
+    def sync(self, since: int) -> tuple[str, int, list[UidRecord], list[str]]:
         current_version = self.version()
         if since == 0:
-            return "full", current_version, self.list()
-        rows = self.database.execute(
+            return "full", current_version, self.list(), []
+        event_rows = self.database.execute(
             """
             SELECT uid, MAX(version) AS latest_version
             FROM uid_events
@@ -190,8 +212,41 @@ class UidRegistry:
             """,
             (since,),
         ).fetchall()
-        records = [self.get(row["uid"]) for row in rows]
-        return "delta", current_version, records
+        removal_rows = self.database.execute(
+            """
+            SELECT uid, MAX(version) AS latest_version
+            FROM uid_removals
+            WHERE version > ?
+            GROUP BY uid
+            """,
+            (since,),
+        ).fetchall()
+        changes: dict[str, tuple[int, str]] = {
+            row["uid"]: (int(row["latest_version"]), "upsert") for row in event_rows
+        }
+        for row in removal_rows:
+            uid = row["uid"]
+            version = int(row["latest_version"])
+            current = changes.get(uid)
+            if current is None or version >= current[0]:
+                changes[uid] = (version, "remove")
+
+        records: list[UidRecord] = []
+        removed: list[str] = []
+        ordered_changes = sorted(
+            changes.items(), key=lambda item: (item[1][0], item[0])
+        )
+        for uid, (_, change_type) in ordered_changes:
+            if change_type == "remove":
+                removed.append(uid)
+                continue
+            try:
+                records.append(self.get(uid))
+            except UidNotFoundError:
+                # A later removal may have raced the read; the tombstone is
+                # the only safe delta to expose to the browser cache.
+                removed.append(uid)
+        return "delta", current_version, records, removed
 
     def is_filterable(self, uid: str) -> bool:
         try:

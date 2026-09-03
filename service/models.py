@@ -41,9 +41,18 @@ class EvidenceReviewStatus(StrEnum):
     HISTORY = "history"
     ALL = "all"
 
+
 class ComponentHealth(BaseModel):
     status: str
     detail: str
+
+
+class ModelHealth(ComponentHealth):
+    """Safe diagnostics for the remote OpenAI-compatible model configuration."""
+
+    base_url_configured: bool
+    model_configured: bool
+    api_key_configured: bool
 
 
 class HealthResponse(BaseModel):
@@ -51,6 +60,7 @@ class HealthResponse(BaseModel):
     database: ComponentHealth
     worker: ComponentHealth
     auth: ComponentHealth
+    model: ModelHealth
 
 
 class AuthSessionRequest(BaseModel):
@@ -124,6 +134,37 @@ class TaskCreateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=512)
 
 
+class FilterProfileCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=128)
+    description: str = Field(default="", max_length=1000)
+    known_terms: list[str] = Field(default_factory=list, max_length=200)
+    standalone_terms: list[str] = Field(default_factory=list, max_length=200)
+    friendly_exceptions: list[str] = Field(default_factory=list, max_length=200)
+    hostile_context: list[str] = Field(default_factory=list, max_length=200)
+    nickname_positive: list[str] = Field(default_factory=list, max_length=200)
+
+
+class FilterProfileResponse(BaseModel):
+    profile_id: str
+    name: str
+    description: str
+    status: str
+    known_terms: list[str]
+    standalone_terms: list[str]
+    friendly_exceptions: list[str]
+    hostile_context: list[str]
+    nickname_positive: list[str]
+    created_at: datetime
+    updated_at: datetime
+    is_current: bool
+
+
+class FilterProfileListResponse(BaseModel):
+    items: list[FilterProfileResponse]
+
+
 class TaskProgressResponse(BaseModel):
     requested_pages: int
     saved_comments: int
@@ -147,6 +188,7 @@ class TaskResponse(BaseModel):
     attempt: int
     error_code: str | None
     error_message: str | None
+    profile_id: str
     progress: TaskProgressResponse
 
 
@@ -173,6 +215,46 @@ class CommentListResponse(BaseModel):
     items: list[CommentResponse]
 
 
+class TaskEventResponse(BaseModel):
+    event_id: int
+    task_id: str
+    attempt: int
+    phase: str
+    event_type: str
+    status: str
+    message: str
+    details: dict[str, object]
+    created_at: datetime
+
+
+class TaskEventListResponse(BaseModel):
+    items: list[TaskEventResponse]
+
+
+class AnalysisRunResponse(BaseModel):
+    analysis_id: str
+    task_id: str
+    attempt: int
+    status: str
+    model: str | None
+    sample_version: str | None
+    batch_count: int
+    account_count: int
+    hit_count: int
+    uncertain_count: int
+    non_target_count: int
+    evidence_count: int
+    error_code: str | None
+    error_message: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+class TaskAnalysisResponse(BaseModel):
+    latest: AnalysisRunResponse | None
+    attempts: list[AnalysisRunResponse]
+
+
 class EvidenceResponse(BaseModel):
     evidence_id: str
     task_id: str
@@ -189,6 +271,7 @@ class EvidenceResponse(BaseModel):
     sample_version: str
     rule_version: str
     created_at: datetime
+    profile_id: str
 
 
 class EvidenceListResponse(BaseModel):
@@ -241,6 +324,7 @@ class SampleImportRequest(BaseModel):
     label: str = Field(default="positive", min_length=1, max_length=64)
     text: str | None = Field(default=None, max_length=100000)
     items: list[SampleItemInput] = Field(default_factory=list)
+    profile_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SampleResponse(BaseModel):
@@ -254,6 +338,7 @@ class SampleResponse(BaseModel):
     created_at: datetime
     published_at: datetime | None = None
     is_current: bool = False
+    profile_id: str = "default-james-haters"
 
 
 class SampleListResponse(BaseModel):

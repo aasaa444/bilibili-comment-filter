@@ -53,7 +53,7 @@ from service.worker import BackgroundWorker, WorkerConfig
             BlacklistQueueStatus.FAILED,
             "network",
             "临时网络错误，拉黑操作失败",
-            "稍后自动重试，或点击“重试”",
+            "网络恢复后请点击“重试”",
         ),
         (
             ExecutionFailureKind.ENVIRONMENT,
@@ -142,18 +142,19 @@ def test_legacy_failed_queue_item_is_not_retried_automatically() -> None:
                 ),
             )
 
-        def retry(self, item_id: str):
-            retry_calls.append(item_id)
+        def process_next(self, _executor):
+            return None
 
     worker = BackgroundWorker(
-        task_store=object(),
+        task_store=type("EmptyTaskStore", (), {"list": lambda _self: ()})(),
         orchestrator=object(),
         queue=LegacyQueue(),
         executor=object(),
-        config=WorkerConfig(queue_retry_delay=0),
+        config=WorkerConfig(queue_interval=0),
+        auto_blacklist_enabled=lambda: True,
     )
 
-    assert worker._retry_ready_queue() is False
+    assert worker.run_once() is False
     assert retry_calls == []
 
 
@@ -194,6 +195,9 @@ def test_blacklist_api_keeps_raw_error_inside_diagnostic_fields() -> None:
     app.state.blacklist_executor = FixedExecutor()
     with TestClient(app) as client:
         item, _ = app.state.blacklist_queue.enqueue(uid="9003")
+        enabled = client.patch("/api/blacklist/settings", json={"enabled": True})
+        assert enabled.status_code == 200
+        assert enabled.json()["enabled"] is True
         response = client.post("/api/blacklist/process")
 
         assert response.status_code == 200

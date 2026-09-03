@@ -20,6 +20,15 @@ export interface HealthResponse {
   service?: string;
   version?: string;
   detail?: string;
+  model?: ModelHealth;
+}
+
+export interface ModelHealth {
+  status: string;
+  detail: string;
+  baseUrlConfigured: boolean;
+  modelConfigured: boolean;
+  apiKeyConfigured: boolean;
 }
 
 export type AuthStatus = "valid" | "invalid" | "missing" | "verification_failed";
@@ -63,6 +72,7 @@ export interface VideoTask {
   failedItems?: string[];
   errorCode?: string;
   error?: string;
+  profileId?: string;
 }
 
 export interface TaskComment {
@@ -78,6 +88,42 @@ export interface TaskComment {
   createdAt: number | null;
   isPinned: boolean;
   context: string[];
+}
+
+export interface TaskEvent {
+  eventId: number;
+  taskId: string;
+  attempt: number;
+  phase: string;
+  eventType: string;
+  status: string;
+  message: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AnalysisRun {
+  analysisId: string;
+  taskId: string;
+  attempt: number;
+  status: "running" | "completed" | "failed" | "unavailable" | "not_started" | string;
+  model?: string;
+  sampleVersion?: string;
+  batchCount: number;
+  accountCount: number;
+  hitCount: number;
+  uncertainCount: number;
+  nonTargetCount: number;
+  evidenceCount: number;
+  errorCode?: string;
+  errorMessage?: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface TaskAnalysis {
+  latest: AnalysisRun | null;
+  attempts: AnalysisRun[];
 }
 
 export interface Evidence {
@@ -100,7 +146,9 @@ export interface Evidence {
   sampleVersion?: string;
   ruleVersion?: string;
   createdAt: string;
+  profileId?: string;
 }
+
 export type ReviewAction = "keep" | "confirm" | "revoke" | "hide-only" | "exception" | "positive-sample";
 
 export interface ReviewRecord {
@@ -133,6 +181,22 @@ export interface SampleSet {
   items: SampleItem[];
   createdAt: string;
   publishedAt?: string;
+  profileId?: string;
+}
+
+export interface FilterProfile {
+  profileId: string;
+  name: string;
+  description: string;
+  status: string;
+  knownTerms: string[];
+  standaloneTerms: string[];
+  friendlyExceptions: string[];
+  hostileContext: string[];
+  nicknamePositive: string[];
+  createdAt: string;
+  updatedAt: string;
+  isCurrent: boolean;
 }
 
 export interface BlacklistItem {
@@ -146,6 +210,12 @@ export interface BlacklistItem {
   userMessage?: string;
   recoveryAction?: string;
   errorAt?: string;
+  updatedAt: string;
+}
+
+export interface BlacklistSettings {
+  enabled: boolean;
+  mode: "local_only" | "local_and_official_queue";
   updatedAt: string;
 }
 
@@ -170,7 +240,6 @@ export interface UpdateUidRequest {
 export interface CreateTaskRequest {
   bvid: string;
   videoUrl: string;
-  title?: string;
 }
 
 export interface AuthCookie {
@@ -188,9 +257,4 @@ export interface AuthSessionRequest {
   source: "extension";
   origin: string;
   cookies: AuthCookie[];
-}
-export interface BlacklistSettings {
-  enabled: boolean;
-  mode: "local_only" | "local_and_official_queue";
-  updatedAt: string;
 }

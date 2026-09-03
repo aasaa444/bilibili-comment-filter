@@ -17,5 +17,8 @@ data/*.pid
 logs/
 playwright-report/
 test-results/
+.codegraph/
+.ua/
+.understand-anything/
 .DS_Store
 Thumbs.db

@@ -26,6 +26,7 @@ def seeded_app():
         blacklist_executor=RecordingBlacklistExecutor(),
     )
     http = TestClient(app)
+    http.patch("/api/blacklist/settings", json={"enabled": True})
     http.post("/api/auth/session", json={"cookies": {"SESSDATA": "fixture"}})
     task = http.post(
         "/api/tasks", json={"video_url": "https://www.bilibili.com/video/BV1management1"}
@@ -72,6 +73,59 @@ def test_review_exception_restores_display_and_cancels_pending_blacklist() -> No
         item for item in http.get("/api/blacklist").json()["items"] if item["uid"] == "1001"
     )
     assert queue["status"] == "cancelled"
+
+    pending = http.get("/api/reviews", params={"task_id": task_id})
+    assert pending.status_code == 200
+    assert all(item["uid"] != "1001" for item in pending.json()["items"])
+    assert len(pending.json()["items"]) == 1
+    history = http.get(
+        "/api/reviews",
+        params={"task_id": task_id, "review_status": "history"},
+    )
+    assert [item["uid"] for item in history.json()["items"]] == ["1001"]
+
+
+def test_review_revoke_removes_uid_and_emits_incremental_removal() -> None:
+    _, http, task_id = seeded_app()
+    evidence = next(
+        item
+        for item in http.get("/api/reviews", params={"task_id": task_id}).json()["items"]
+        if item["uid"] == "1001"
+    )
+    baseline = http.get("/api/uids/sync", params={"since": 0}).json()["version"]
+
+    action = http.post(
+        f"/api/reviews/{evidence['evidence_id']}",
+        json={"action": "revoke", "actor": "test-user"},
+    )
+
+    assert action.status_code == 200
+    assert action.json()["action"] == "revoke"
+    assert action.json()["before_state"] == "queued"
+    assert action.json()["after_state"] is None
+    assert all(item["uid"] != "1001" for item in http.get("/api/uids").json()["items"])
+    delta = http.get("/api/uids/sync", params={"since": baseline}).json()
+    assert delta["items"] == []
+    assert delta["removed"] == ["1001"]
+
+    queue = next(
+        item for item in http.get("/api/blacklist").json()["items"] if item["uid"] == "1001"
+    )
+    assert queue["status"] == "cancelled"
+
+
+def test_uid_delete_restores_display_and_cancels_pending_blacklist() -> None:
+    app, http, _ = seeded_app()
+
+    response = http.delete("/api/uids/1001")
+
+    assert response.status_code == 204
+    assert all(item["uid"] != "1001" for item in http.get("/api/uids").json()["items"])
+    queue = next(
+        item for item in http.get("/api/blacklist").json()["items"] if item["uid"] == "1001"
+    )
+    assert queue["status"] == "cancelled"
+    assert app.state.uid_registry.get("1002").uid == "1002"
 
 
 def test_missing_review_evidence_returns_not_found() -> None:
@@ -291,6 +345,7 @@ def test_blacklist_queue_pause_resume_and_test_executor_are_observable() -> None
     registry = UidRegistry(database)
     registry.add(uid="9001", nickname="queue-user", state=UidState.QUEUED)
     app = create_app(db_path=":memory:", blacklist_executor=RecordingBlacklistExecutor())
+    app.state.settings_store.set_blacklist_automation(True)
     app.state.uid_registry.add(uid="9001", nickname="queue-user", state=UidState.QUEUED)
     item, _ = app.state.blacklist_queue.enqueue(uid="9001")
     http = TestClient(app)

@@ -21,6 +21,10 @@ def test_video_submission_to_review_and_blacklist_queue(e2e_app) -> None:
     assert auth.json()["cookie_present"] is True
     assert "fixture-only" not in auth.text
 
+    enabled = http.patch("/api/blacklist/settings", json={"enabled": True})
+    assert enabled.status_code == 200
+    assert enabled.json()["enabled"] is True
+
     submitted = http.post(
         "/api/tasks",
         json={
@@ -103,10 +107,10 @@ def test_video_submission_to_review_and_blacklist_queue(e2e_app) -> None:
     assert revoked.status_code == 200
     assert revoked.json()["action"] == "revoke"
     assert revoked.json()["before_state"] == "queued"
-    assert revoked.json()["after_state"] == "exception"
+    assert revoked.json()["after_state"] is None
 
     after_review_uids = {item["uid"]: item for item in _items(http.get("/api/uids"))}
-    assert after_review_uids["1001"]["state"] == "exception"
+    assert "1001" not in after_review_uids
     assert after_review_uids["1002"]["state"] == "queued"
     after_review_queue = {item["uid"]: item for item in _items(http.get("/api/blacklist"))}
     assert after_review_queue["1001"]["status"] == "cancelled"

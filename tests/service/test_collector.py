@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import httpx
 import pytest
 
+from service.bilibili_wbi import BilibiliWbiSigner
 from service.collector import (
     BilibiliAuthenticationError,
     BilibiliCommentCollector,
@@ -172,7 +173,7 @@ def test_collector_records_empty_root_page_as_explainable_terminal_page() -> Non
     assert transport.pages == [1]
 
 
-def test_collector_records_empty_reply_page_without_duplicate() -> None:
+def test_collector_records_empty_reply_page_as_incomplete_without_duplicate() -> None:
     class EmptyReplyTransport:
         def __init__(self) -> None:
             self.root_pages: list[int] = []
@@ -207,12 +208,14 @@ def test_collector_records_empty_reply_page_without_duplicate() -> None:
         make_task(), CollectionCheckpoint()
     )
 
-    assert result.complete is True
-    assert result.checkpoint.complete is True
+    assert result.complete is False
+    assert result.checkpoint.complete is False
     assert [comment.comment_id for comment in result.comments] == ["602"]
     assert result.stats.requested_pages == 2
     assert result.stats.saved_comments == 1
     assert result.stats.saved_replies == 0
+    assert result.stats.declared_replies == 1
+    assert result.stats.coverage == pytest.approx(0.5)
     assert result.failed_items == ("empty_reply_page:602:1",)
     assert transport.root_pages == [1]
     assert transport.reply_pages == [("602", 1)]
@@ -256,7 +259,8 @@ def test_collector_returns_checkpoint_and_resumes_after_page_failure() -> None:
 
     resumed = collector.collect(task, partial.checkpoint)
 
-    assert resumed.complete is True
+    assert resumed.complete is False
+    assert resumed.terminal is True
     assert [comment.comment_id for comment in resumed.comments] == ["202"]
 
 
@@ -459,6 +463,105 @@ def test_collector_treats_zero_cursor_as_end_without_refetching_page() -> None:
     assert result.stats.saved_comments == 1
 
 
+def test_collector_uses_opaque_pagination_offset_when_numeric_cursor_is_missing() -> None:
+    class OpaqueCursorTransport:
+        root_cursor_mode = True
+
+        def __init__(self) -> None:
+            self.pages: list[int | str] = []
+
+        def fetch_root_page(self, _video_id: str, page: int | str) -> dict:
+            self.pages.append(page)
+            if page == 0:
+                return {
+                    "replies": [
+                        {
+                            "rpid": 310,
+                            "member": {"mid": 3100, "uname": "opaque-user-1"},
+                            "content": {"message": "first page"},
+                        }
+                    ],
+                    "cursor": {
+                        "all_count": 2,
+                        "is_end": False,
+                        "pagination_reply": {"next_offset": "opaque-offset"},
+                    },
+                }
+            assert page == "opaque-offset"
+            return {
+                "replies": [
+                    {
+                        "rpid": 311,
+                        "member": {"mid": 3101, "uname": "opaque-user-2"},
+                        "content": {"message": "second page"},
+                    }
+                ],
+                "cursor": {"all_count": 2, "next": 0, "is_end": True},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("opaque cursor fixture has no replies")
+
+    transport = OpaqueCursorTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert transport.pages == [0, "opaque-offset"]
+    assert [comment.comment_id for comment in result.comments] == ["310", "311"]
+
+
+def test_collector_prefers_opaque_pagination_offset_when_numeric_cursor_is_present() -> None:
+    class BothCursorTransport:
+        root_cursor_mode = True
+
+        def __init__(self) -> None:
+            self.pages: list[int | str] = []
+
+        def fetch_root_page(self, _video_id: str, page: int | str) -> dict:
+            self.pages.append(page)
+            if page == 0:
+                return {
+                    "replies": [
+                        {
+                            "rpid": 312,
+                            "member": {"mid": 3102, "uname": "both-cursors-user-1"},
+                            "content": {"message": "first page"},
+                        }
+                    ],
+                    "cursor": {
+                        "all_count": 2,
+                        "next": 7,
+                        "is_end": False,
+                        "pagination_reply": {"next_offset": "opaque-offset"},
+                    },
+                }
+            assert page == "opaque-offset"
+            return {
+                "replies": [
+                    {
+                        "rpid": 313,
+                        "member": {"mid": 3103, "uname": "both-cursors-user-2"},
+                        "content": {"message": "second page"},
+                    }
+                ],
+                "cursor": {"all_count": 2, "next": 0, "is_end": True},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("both-cursors fixture has no replies")
+
+    transport = BothCursorTransport()
+    result = BilibiliCommentCollector(transport).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert transport.pages == [0, "opaque-offset"]
+    assert [comment.comment_id for comment in result.comments] == ["312", "313"]
+
+
 def test_collector_keeps_explicit_cursor_continuation_after_empty_root_page() -> None:
     class EmptyRootTransport:
         root_cursor_mode = True
@@ -588,7 +691,7 @@ def test_collector_treats_zero_reply_cursor_as_end_without_refetching_page() -> 
     assert result.stats.saved_replies == 1
 
 
-def test_cursor_total_count_is_not_added_to_declared_reply_counts() -> None:
+def test_cursor_total_count_is_not_double_counted_with_reply_counts() -> None:
     class CursorWithRepliesTransport:
         root_cursor_mode = True
 
@@ -638,28 +741,90 @@ def test_cursor_total_count_is_not_added_to_declared_reply_counts() -> None:
     assert result.stats.coverage == 1.0
 
 
+def test_collector_uses_root_rcount_when_reply_page_has_no_declared_count() -> None:
+    class RootReplyCountTransport:
+        root_cursor_mode = False
+
+        def fetch_root_page(self, _video_id: str, page: int) -> dict:
+            assert page == 1
+            return {
+                "replies": [
+                    {
+                        "rpid": 550,
+                        "mid": 5500,
+                        "member": {"mid": 5500, "uname": "root"},
+                        "content": {"message": "root"},
+                        "rcount": 2,
+                    }
+                ],
+                "page": {"count": 1, "page_count": 1},
+            }
+
+        def fetch_replies(self, _video_id: str, root_id: str, page: int) -> dict:
+            assert (root_id, page) == ("550", 1)
+            return {
+                "replies": [
+                    {
+                        "rpid": 551,
+                        "mid": 5501,
+                        "member": {"mid": 5501, "uname": "reply"},
+                        "content": {"message": "reply"},
+                        "root": 550,
+                        "parent": 550,
+                    }
+                ]
+            }
+
+    result = BilibiliCommentCollector(RootReplyCountTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is False
+    assert result.stats.declared_comments == 1
+    assert result.stats.declared_replies == 2
+    assert result.stats.saved_replies == 1
+    assert result.stats.coverage == pytest.approx(2 / 3)
+
+
 def test_bilibili_transport_resolves_bv_and_passes_cookie_to_comment_requests() -> None:
     requests: list[httpx.Request] = []
+    signer = BilibiliWbiSigner("a" * 32, "b" * 32)
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.headers["cookie"] == "SESSDATA=session-secret"
         assert request.headers["User-Agent"] == COMPATIBLE_USER_AGENT
-        if request.url.path in {"/x/v2/reply/main", "/x/v2/reply/reply"}:
+        if request.url.path in {"/x/v2/reply/wbi/main", "/x/v2/reply/reply"}:
             assert request.headers["Referer"] == (
                 "https://www.bilibili.com/video/BV1realvideo/"
             )
         if request.url.path == "/x/web-interface/view":
             assert dict(request.url.params) == {"bvid": "BV1realvideo"}
             return httpx.Response(200, json={"code": 0, "data": {"aid": 7788}})
-        if request.url.path == "/x/v2/reply/main":
-            assert dict(request.url.params) == {
+        if request.url.path == "/x/v2/reply/wbi/main":
+            params = dict(request.url.params)
+            assert {**params, "w_rid": "", "wts": ""} == {
                 "type": "1",
                 "oid": "7788",
                 "mode": "3",
                 "next": "1",
                 "ps": "20",
+                "web_location": "1315875",
+                "w_rid": "",
+                "wts": "",
             }
+            expected = signer.sign(
+                {
+                    "type": 1,
+                    "oid": "7788",
+                    "mode": 3,
+                    "next": 1,
+                    "ps": 20,
+                    "web_location": 1315875,
+                },
+                timestamp=int(params["wts"]),
+            )
+            assert params["w_rid"] == expected["w_rid"]
             return httpx.Response(200, json={"code": 0, "data": {"replies": []}})
         if request.url.path == "/x/v2/reply/reply":
             assert dict(request.url.params) == {
@@ -681,6 +846,7 @@ def test_bilibili_transport_resolves_bv_and_passes_cookie_to_comment_requests() 
             lambda: {"SESSDATA": "session-secret"},
             client=client,
             min_interval=0,
+            wbi_signer=signer,
         )
 
         assert transport.fetch_root_page("BV1realvideo", 1) == {"replies": []}
@@ -690,9 +856,163 @@ def test_bilibili_transport_resolves_bv_and_passes_cookie_to_comment_requests() 
 
     assert [request.url.path for request in requests] == [
         "/x/web-interface/view",
-        "/x/v2/reply/main",
+        "/x/v2/reply/wbi/main",
         "/x/v2/reply/reply",
     ]
+
+
+def test_bilibili_transport_reads_authoritative_video_title() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/x/web-interface/view"
+        assert dict(request.url.params) == {"bvid": "BV1eFu36LEt2"}
+        assert request.headers["Referer"] == "https://www.bilibili.com/video/BV1eFu36LEt2/"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {"aid": 117058427821372, "title": "  B站官方原标题  "},
+            },
+        )
+
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: {"SESSDATA": "session-secret"},
+            client=client,
+            min_interval=0,
+        )
+
+        metadata = transport.fetch_video_metadata("BV1eFu36LEt2")
+
+        assert metadata.video_id == "BV1eFu36LEt2"
+        assert metadata.aid == "117058427821372"
+        assert metadata.title == "B站官方原标题"
+    finally:
+        client.close()
+
+    assert len(requests) == 1
+
+
+def test_bilibili_transport_loads_wbi_keys_from_navigation_auth_failure_payload() -> None:
+    requests: list[httpx.Request] = []
+    image_key = "a" * 32
+    sub_key = "b" * 32
+    signer = BilibiliWbiSigner(image_key, sub_key)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/x/web-interface/view":
+            return httpx.Response(200, json={"code": 0, "data": {"aid": 7788}})
+        if request.url.path == "/x/web-interface/nav":
+            return httpx.Response(
+                200,
+                json={
+                    "code": -101,
+                    "message": "账号未登录",
+                    "data": {
+                        "wbi_img": {
+                            "img_url": f"https://i0.hdslb.com/bfs/wbi/{image_key}.png",
+                            "sub_url": f"https://i0.hdslb.com/bfs/wbi/{sub_key}.png",
+                        }
+                    },
+                },
+            )
+        if request.url.path == "/x/v2/reply/wbi/main":
+            params = dict(request.url.params)
+            expected = signer.sign(
+                {
+                    "type": 1,
+                    "oid": "7788",
+                    "mode": 3,
+                    "next": 0,
+                    "ps": 20,
+                    "web_location": 1315875,
+                },
+                timestamp=int(params["wts"]),
+            )
+            assert params["w_rid"] == expected["w_rid"]
+            return httpx.Response(200, json={"code": 0, "data": {"replies": []}})
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: None,
+            client=client,
+            min_interval=0,
+        )
+
+        assert transport.fetch_root_page("BV1realvideo", 0) == {"replies": []}
+    finally:
+        client.close()
+
+    assert [request.url.path for request in requests] == [
+        "/x/web-interface/view",
+        "/x/web-interface/nav",
+        "/x/v2/reply/wbi/main",
+    ]
+
+
+def test_bilibili_transport_sends_opaque_root_cursor_as_pagination_string() -> None:
+    requests: list[httpx.Request] = []
+    signer = BilibiliWbiSigner("a" * 32, "b" * 32)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/x/v2/reply/wbi/main"
+        params = dict(request.url.params)
+        assert {**params, "w_rid": "", "wts": ""} == {
+            "type": "1",
+            "oid": "7788",
+            "mode": "3",
+            "next": "0",
+            "ps": "20",
+            "pagination_str": '{"offset":"opaque-offset"}',
+            "web_location": "1315875",
+            "w_rid": "",
+            "wts": "",
+        }
+        expected = signer.sign(
+            {
+                "type": 1,
+                "oid": "7788",
+                "mode": 3,
+                "next": 0,
+                "ps": 20,
+                "pagination_str": '{"offset":"opaque-offset"}',
+                "web_location": 1315875,
+            },
+            timestamp=int(params["wts"]),
+        )
+        assert params["w_rid"] == expected["w_rid"]
+        return httpx.Response(200, json={"code": 0, "data": {"replies": []}})
+
+    client = httpx.Client(
+        base_url="https://api.bilibili.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        transport = BilibiliCommentTransport(
+            lambda: None,
+            client=client,
+            min_interval=0,
+            wbi_signer=signer,
+        )
+
+        assert transport.fetch_root_page("7788", "opaque-offset") == {"replies": []}
+    finally:
+        client.close()
+
+    assert len(requests) == 1
 
 
 def test_collector_records_and_stops_on_a_duplicate_root_page() -> None:
@@ -726,6 +1046,7 @@ def test_collector_records_and_stops_on_a_duplicate_root_page() -> None:
 
 def test_bilibili_transport_accepts_custom_user_agent() -> None:
     requests: list[httpx.Request] = []
+    signer = BilibiliWbiSigner("a" * 32, "b" * 32)
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -741,6 +1062,7 @@ def test_bilibili_transport_accepts_custom_user_agent() -> None:
             client=client,
             min_interval=0,
             user_agent="fixture-browser/1.0",
+            wbi_signer=signer,
         )
 
         assert transport.fetch_root_page("12345", 1) == {"replies": []}
@@ -1030,6 +1352,37 @@ def test_collector_preserves_pinned_flag_when_root_is_in_both_lists() -> None:
     assert len(result.comments) == 1
     assert result.comments[0].is_pinned is True
     assert result.stats.pinned_comments == 1
+
+
+def test_collector_ignores_bilibili_top_metadata_wrapper() -> None:
+    class TopMetadataTransport:
+        root_cursor_mode = True
+
+        def fetch_root_page(self, _video_id: str, _page: int) -> dict:
+            return {
+                "replies": [
+                    {
+                        "rpid": 101,
+                        "mid": 1001,
+                        "member": {"mid": 1001, "uname": "ordinary-user"},
+                        "content": {"message": "ordinary comment"},
+                    }
+                ],
+                "top": {"admin": None, "upper": None, "vote": None},
+                "cursor": {"all_count": 1, "next": 0, "is_end": True},
+            }
+
+        def fetch_replies(self, _video_id: str, _root_id: str, _page: int) -> dict:
+            raise AssertionError("no replies are expected in this fixture")
+
+    result = BilibiliCommentCollector(TopMetadataTransport()).collect(
+        make_task(), CollectionCheckpoint()
+    )
+
+    assert result.complete is True
+    assert result.failed_items == ()
+    assert len(result.comments) == 1
+    assert result.stats.pinned_comments == 0
 
 
 def test_collector_keeps_incomplete_when_declared_count_exceeds_saved_comments() -> None:

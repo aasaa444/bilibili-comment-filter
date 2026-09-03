@@ -503,7 +503,8 @@ textarea {
 
 .task-detail-heading h4,
 .task-comments-section h5,
-.task-failures h5 {
+.task-failures h5,
+.task-observability-panel h5 {
   margin: 0;
   font-weight: 600;
 }
@@ -513,7 +514,8 @@ textarea {
 }
 
 .task-comments-section h5,
-.task-failures h5 {
+.task-failures h5,
+.task-observability-panel h5 {
   font-size: 14px;
 }
 
@@ -551,6 +553,165 @@ textarea {
   margin-top: 16px;
 }
 
+.task-observability-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.task-observability-panel {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.task-observability-panel .section-heading {
+  margin-bottom: 10px;
+}
+
+.task-analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--border);
+}
+
+.task-analysis-grid .task-stat {
+  background: #181818;
+}
+
+.task-timeline {
+  display: grid;
+  gap: 10px;
+  max-height: 420px;
+  margin: 0;
+  padding: 0 0 0 18px;
+  overflow: auto;
+}
+
+.task-timeline-item {
+  padding-left: 4px;
+}
+
+.task-timeline-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.task-timeline-meta time {
+  margin-left: auto;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.task-timeline-item > p {
+  margin: 5px 0 0;
+  color: var(--secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.task-event-details {
+  gap: 4px;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.task-event-details dd {
+  overflow-wrap: anywhere;
+}
+
+.task-raw-diagnostic,
+.task-failure-raw {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.task-raw-diagnostic summary,
+.task-failure-raw summary {
+  padding-top: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.task-raw-diagnostic summary:hover,
+.task-failure-raw summary:hover {
+  color: var(--secondary);
+}
+
+.task-raw-diagnostic pre {
+  max-height: 220px;
+  margin: 8px 0 0;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: #111111;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.task-raw-diagnostic dl {
+  margin: 8px 0 0;
+}
+
+.task-failure-summary {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.task-failure-summary li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--warning);
+  background: rgba(255, 159, 14, 0.08);
+  color: var(--secondary);
+}
+
+.task-failure-summary strong {
+  flex: 0 0 auto;
+  color: var(--warning);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.task-comments-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.task-comments-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.task-comments-pagination {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--secondary);
+  font-size: 12px;
+}
+
 .task-failure-list {
   display: grid;
   gap: 4px;
@@ -570,6 +731,12 @@ textarea {
   margin: 4px 0 0;
   color: var(--secondary);
   white-space: pre-wrap;
+}
+
+.task-error-info {
+  border-left-color: var(--warning);
+  background: rgba(255, 159, 14, 0.08);
+  color: var(--warning);
 }
 
 .task-comments {
@@ -1138,6 +1305,7 @@ a { color: var(--primary); }
   .review-workbench { grid-template-columns: 1fr; }
   .evidence-inbox { max-height: none; overflow: visible; }
   .evidence-inspector { position: static; max-height: none; }
+  .task-observability-grid { grid-template-columns: 1fr; }
   .task-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
@@ -1161,6 +1329,8 @@ a { color: var(--primary); }
   dl div { grid-template-columns: 1fr; gap: 0; }
   .task-detail-heading,
   .task-comment-heading { flex-direction: column; }
+  .task-comments-toolbar { align-items: flex-start; flex-direction: column; }
+  .task-analysis-grid { grid-template-columns: 1fr; }
   .task-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .task-comment-reply { margin-left: 10px; }
 }

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -13,16 +13,18 @@ from pydantic import BaseModel, Field, ValidationError
 _DEFAULT_MAX_OUTPUT_TOKENS = 512
 _REQUEST_JSON_OVERHEAD_TOKENS = 128
 _SYSTEM_PROMPT = (
-    "You classify Bilibili comment authors at UID level for a local "
-    "high-recall filter. Judge all comments belonging to one UID together, "
-    "using nickname, wording, thread context, and provided samples. "
-    "Mark hit for explicit insults, malicious denigration, sustained "
-    "mockery, obvious hostility toward James, or a clearly hostile "
-    "nickname. Mark non_target only when the account is clearly ordinary, "
+    "You classify Bilibili comment authors at UID level for a local high-recall "
+    "filter. Judge all comments belonging to one UID together using the active "
+    "profile, nickname, wording, context, and samples. Mark hit for explicit "
+    "malice, sustained mockery, or a hostile nickname matching the profile. "
+    "Mark non_target only when the account is clearly ordinary, "
     "friendly, or neutral. Use uncertain when evidence is ambiguous, but "
     "always cite at least one supplied comment for hit or uncertain. "
-    "A configured friendly exception such as Mamba Buster must not be "
-    "treated as a hit. Return exactly one result for every input UID, "
+    "For non_target, uid and decision are sufficient; reason, confidence, "
+    "and model_version may be omitted. For hit or uncertain, include "
+    "evidence_comment_ids, reason, confidence, and model_version. "
+    "Configured friendly exceptions must not be treated as hits. Return "
+    "exactly one result for every input UID, "
     "with only the values hit, non_target, or uncertain in decision. "
     "Return one JSON object with a results array and no markdown."
 )
@@ -68,6 +70,15 @@ class SampleItem:
 class SampleSet:
     version: str
     items: tuple[SampleItem, ...]
+    profile: FilterProfileContext | None = None
+
+
+@dataclass(frozen=True)
+class FilterProfileContext:
+    profile_id: str
+    name: str
+    description: str
+    catalog: RuleCatalog
 
 
 @dataclass(frozen=True)
@@ -111,25 +122,52 @@ class AnalyzerTransport(Protocol):
 
 
 class AnalyzerUnavailableError(RuntimeError):
-    def __init__(self, message: str, *, partial_results: tuple[AnalysisResult, ...] = ()) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_results: tuple[AnalysisResult, ...] = (),
+        batch_count: int = 0,
+        model: str | None = None,
+        sample_version: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.partial_results = tuple(partial_results)
+        self.batch_count = batch_count
+        self.model = model
+        self.sample_version = sample_version
 
 
 class AnalyzerContextLimitError(AnalyzerUnavailableError):
     """The model endpoint rejected a request because its context is too large."""
 
 
+class AnalyzerTimeoutError(AnalyzerUnavailableError):
+    """The model endpoint did not produce a response before the transport timeout."""
+
+
 class AnalyzerInvalidResponseError(ValueError):
-    def __init__(self, message: str, *, partial_results: tuple[AnalysisResult, ...] = ()) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_results: tuple[AnalysisResult, ...] = (),
+        batch_count: int = 0,
+        model: str | None = None,
+        sample_version: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.partial_results = tuple(partial_results)
+        self.batch_count = batch_count
+        self.model = model
+        self.sample_version = sample_version
 
 
 @dataclass(frozen=True)
 class RuleCatalog:
-    version: str = "rules-v1"
+    version: str = "rules-v2"
     known_terms: tuple[str, ...] = ("巴斯特", "䟋", "天龙八部", "粘慕斯")
+    standalone_terms: tuple[str, ...] = ("巴斯特", "䟋", "天龙八部", "粘慕斯")
     friendly_exceptions: tuple[str, ...] = ("曼巴斯特",)
     nickname_positive: tuple[str, ...] = ()
     hostile_context: tuple[str, ...] = ("垃圾", "恶心", "废物", "滚", "詹黑")
@@ -161,6 +199,15 @@ class RuleEngine:
                 "Nickname matches a configured high-confidence sample",
                 0.98,
             )
+        for term in self.catalog.standalone_terms:
+            if term in text:
+                return self._result(
+                    account,
+                    AnalysisDecision.HIT,
+                    (f"known_term_standalone:{term}",),
+                    "Known high-confidence term appears in the account context",
+                    0.96,
+                )
         for term in self.catalog.known_terms:
             if term in text and any(marker in text for marker in self.catalog.hostile_context):
                 return self._result(
@@ -195,6 +242,46 @@ class RuleEngine:
     @staticmethod
     def _normalize(value: str) -> str:
         return re.sub(r"\s+", "", value).casefold()
+
+
+def rule_engine_with_samples(engine: RuleEngine, samples: SampleSet) -> RuleEngine:
+    """Overlay published nickname-positive samples onto the hard-rule catalog."""
+
+    nickname_positive = list(engine.catalog.nickname_positive)
+    normalized = {engine._normalize(value) for value in nickname_positive if value.strip()}
+    for item in samples.items:
+        if item.kind not in {"nickname", "nickname-positive"}:
+            continue
+        value = item.content.strip()
+        normalized_value = engine._normalize(value)
+        if not value or normalized_value in normalized:
+            continue
+        nickname_positive.append(value)
+        normalized.add(normalized_value)
+    if tuple(nickname_positive) == engine.catalog.nickname_positive:
+        return engine
+    return RuleEngine(replace(engine.catalog, nickname_positive=tuple(nickname_positive)))
+
+
+def evaluate_rule_results(
+    accounts: tuple[AccountBundle, ...],
+    samples: SampleSet,
+    engine: RuleEngine | None = None,
+) -> tuple[AnalysisResult, ...]:
+    """Apply deterministic high-confidence rules before any model call."""
+
+    base_engine = (
+        RuleEngine(samples.profile.catalog)
+        if samples.profile is not None
+        else engine or RuleEngine()
+    )
+    effective_engine = rule_engine_with_samples(base_engine, samples)
+    results: list[AnalysisResult] = []
+    for account in accounts:
+        result = effective_engine.evaluate(account)
+        if result is not None:
+            results.append(replace(result, sample_version=samples.version))
+    return tuple(results)
 
 
 class SampleInjector:
@@ -249,7 +336,7 @@ class OpenAICompatibleTransport:
         base_url: str,
         api_key: str | None,
         model: str,
-        timeout: float = 30.0,
+        timeout: float = 120.0,
         max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
         max_retries: int = 2,
         retry_backoff: float = 0.25,
@@ -264,9 +351,14 @@ class OpenAICompatibleTransport:
 
     def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        account_count = len(payload.get("accounts", ()))
+        request_max_output_tokens = min(
+            self.max_output_tokens,
+            max(4096, account_count * 256),
+        )
         request = {
             "model": self.model,
-            "max_tokens": self.max_output_tokens,
+            "max_tokens": request_max_output_tokens,
             "messages": [
                 {
                     "role": "system",
@@ -298,7 +390,10 @@ class OpenAICompatibleTransport:
                 retryable = exc.response.status_code in {408, 409, 429} or (
                     exc.response.status_code >= 500
                 )
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                retryable = True
+            except httpx.NetworkError as exc:
                 last_error = exc
                 retryable = True
             except AnalyzerInvalidResponseError:
@@ -310,19 +405,20 @@ class OpenAICompatibleTransport:
                 break
             if self.retry_backoff:
                 time.sleep(self.retry_backoff * (attempt + 1))
-        raise AnalyzerUnavailableError(
-            f"Model service is unavailable: {last_error}"
-        ) from last_error
+        message = f"Model service is unavailable: {last_error}"
+        if isinstance(last_error, httpx.TimeoutException):
+            raise AnalyzerTimeoutError(message) from last_error
+        raise AnalyzerUnavailableError(message) from last_error
 
 
 class _ResultPayload(BaseModel):
     uid: str = Field(min_length=1)
     decision: AnalysisDecision
-    evidence_comment_ids: list[str] = []
-    signals: list[str] = []
-    reason: str = Field(min_length=1)
-    confidence: float = Field(ge=0.0, le=1.0)
-    model_version: str = Field(min_length=1)
+    evidence_comment_ids: list[str] = Field(default_factory=list)
+    signals: list[str] = Field(default_factory=list)
+    reason: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    model_version: str | None = None
     sample_version: str | None = None
     rule_version: str | None = None
 
@@ -334,12 +430,14 @@ class OpenAICompatibleBatchAnalyzer:
         transport: AnalyzerTransport,
         model: str,
         context_budget: int = 4096,
+        max_batch_accounts: int = 32,
         rule_engine: RuleEngine | None = None,
         sample_injector: SampleInjector | None = None,
     ) -> None:
         self.transport = transport
         self.model = model
         self.context_budget = context_budget
+        self.max_batch_accounts = max(1, int(max_batch_accounts))
         self.max_output_tokens = max(
             1,
             int(getattr(transport, "max_output_tokens", _DEFAULT_MAX_OUTPUT_TOKENS)),
@@ -351,11 +449,17 @@ class OpenAICompatibleBatchAnalyzer:
         self, accounts: tuple[AccountBundle, ...], samples: SampleSet
     ) -> AnalysisBatchResult:
         sample_context = self.sample_injector.prepare(samples, accounts, self._input_budget())
+        base_engine = (
+            RuleEngine(samples.profile.catalog)
+            if samples.profile is not None
+            else self.rule_engine
+        )
+        rule_engine = rule_engine_with_samples(base_engine, samples)
         rule_results: list[AnalysisResult] = []
         unresolved: list[AccountBundle] = []
         available_tokens = self._available_tokens(sample_context)
         for account in accounts:
-            rule_result = self.rule_engine.evaluate(account)
+            rule_result = rule_engine.evaluate(account)
             if rule_result is None:
                 account_tokens = _estimate_text(
                     json.dumps(self._account_payload(account), ensure_ascii=False)
@@ -368,12 +472,7 @@ class OpenAICompatibleBatchAnalyzer:
                     unresolved.append(account)
             else:
                 rule_results.append(
-                    AnalysisResult(
-                        **{
-                            **rule_result.__dict__,
-                            "sample_version": sample_context.version,
-                        }
-                    )
+                    replace(rule_result, sample_version=sample_context.version)
                 )
 
         batches = self._split(unresolved, sample_context)
@@ -384,6 +483,7 @@ class OpenAICompatibleBatchAnalyzer:
             batch = pending_batches.pop(0)
             payload = {
                 "model": self.model,
+                "profile": _profile_payload(samples.profile),
                 "rule_version": rule_engine.catalog.version,
                 "sample_version": sample_context.version,
                 "sample_mode": sample_context.mode,
@@ -412,13 +512,40 @@ class OpenAICompatibleBatchAnalyzer:
                     )
                 )
                 continue
+            except AnalyzerTimeoutError as exc:
+                if len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    pending_batches[0:0] = [batch[:midpoint], batch[midpoint:]]
+                    continue
+                raise AnalyzerTimeoutError(
+                    str(exc),
+                    partial_results=completed_results,
+                    batch_count=batch_count,
+                    model=self.model,
+                    sample_version=sample_context.version,
+                ) from exc
             except AnalyzerUnavailableError as exc:
                 raise AnalyzerUnavailableError(
-                    str(exc), partial_results=completed_results
+                    str(exc),
+                    partial_results=completed_results,
+                    batch_count=batch_count,
+                    model=self.model,
+                    sample_version=sample_context.version,
                 ) from exc
             except AnalyzerInvalidResponseError as exc:
+                # A model can return parseable JSON that is still invalid for one UID
+                # (for example, missing evidence). Isolate that response to avoid
+                # discarding all other UIDs in the same batch.
+                if len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    pending_batches[0:0] = [batch[:midpoint], batch[midpoint:]]
+                    continue
                 raise AnalyzerInvalidResponseError(
-                    str(exc), partial_results=completed_results
+                    str(exc),
+                    partial_results=completed_results,
+                    batch_count=batch_count,
+                    model=self.model,
+                    sample_version=sample_context.version,
                 ) from exc
             model_results.extend(parsed)
         return AnalysisBatchResult(
@@ -438,7 +565,10 @@ class OpenAICompatibleBatchAnalyzer:
             account_tokens = _estimate_text(
                 json.dumps(self._account_payload(account), ensure_ascii=False)
             )
-            if current and current_tokens + account_tokens > available:
+            if current and (
+                current_tokens + account_tokens > available
+                or len(current) >= self.max_batch_accounts
+            ):
                 batches.append(current)
                 current = []
                 current_tokens = 0
@@ -534,13 +664,23 @@ class OpenAICompatibleBatchAnalyzer:
                         f"Model returned unknown evidence for UID {parsed.uid}: "
                         f"{sorted(invalid_comment_ids)}"
                     )
-                if (
-                    parsed.decision in {AnalysisDecision.HIT, AnalysisDecision.UNCERTAIN}
-                    and not parsed.evidence_comment_ids
-                ):
-                    raise AnalyzerInvalidResponseError(
-                        f"Model returned no evidence for UID: {parsed.uid}"
-                    )
+                if parsed.decision in {AnalysisDecision.HIT, AnalysisDecision.UNCERTAIN}:
+                    if not parsed.evidence_comment_ids:
+                        raise AnalyzerInvalidResponseError(
+                            f"Model returned no evidence for UID: {parsed.uid}"
+                        )
+                    if not parsed.reason or not parsed.reason.strip():
+                        raise AnalyzerInvalidResponseError(
+                            f"Model returned no reason for UID: {parsed.uid}"
+                        )
+                    if parsed.confidence is None:
+                        raise AnalyzerInvalidResponseError(
+                            f"Model returned no confidence for UID: {parsed.uid}"
+                        )
+                    if not parsed.model_version or not parsed.model_version.strip():
+                        raise AnalyzerInvalidResponseError(
+                            f"Model returned no model version for UID: {parsed.uid}"
+                        )
                 returned_uids.add(parsed.uid)
                 results.append(
                     AnalysisResult(
@@ -548,9 +688,9 @@ class OpenAICompatibleBatchAnalyzer:
                         decision=parsed.decision,
                         evidence_comment_ids=tuple(parsed.evidence_comment_ids),
                         signals=tuple(parsed.signals),
-                        reason=parsed.reason,
-                        confidence=parsed.confidence,
-                        model_version=parsed.model_version,
+                        reason=parsed.reason or "Model classified this UID as non-target",
+                        confidence=parsed.confidence if parsed.confidence is not None else 0.0,
+                        model_version=parsed.model_version or self.model,
                         sample_version=parsed.sample_version or sample_context.version,
                         rule_version=parsed.rule_version or self.rule_engine.catalog.version,
                     )
@@ -589,15 +729,35 @@ class OpenAICompatibleBatchAnalyzer:
 
 def _parse_json_text(value: str) -> dict[str, Any]:
     stripped = value.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.IGNORECASE)
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        raise AnalyzerInvalidResponseError("Model response was not valid JSON") from exc
-    if not isinstance(parsed, dict):
-        raise AnalyzerInvalidResponseError("Model response must be a JSON object")
-    return parsed
+    without_reasoning = re.sub(
+        r"<(?:think|analysis|reasoning)>.*?</(?:think|analysis|reasoning)>",
+        "",
+        stripped,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    candidates = [without_reasoning]
+    fenced = re.search(
+        r"```(?:json)?\s*(.*?)\s*```", without_reasoning, flags=re.IGNORECASE | re.DOTALL
+    )
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        for match in re.finditer(r"\{", candidate):
+            try:
+                parsed, _ = decoder.raw_decode(candidate[match.start() :])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and "results" in parsed:
+                return parsed
+    raise AnalyzerInvalidResponseError("Model response was not valid JSON")
 
 
 def _estimate_text(value: str) -> int:
@@ -613,6 +773,30 @@ def _sample_payload(item: SampleItem) -> dict[str, str]:
         "kind": item.kind,
         "label": item.label,
         "content": item.content,
+    }
+
+
+def _profile_payload(profile: FilterProfileContext | None) -> dict[str, object]:
+    if profile is None:
+        catalog = RuleCatalog()
+        return {
+            "profile_id": "default-james-haters",
+            "name": "詹黑过滤",
+            "description": "识别针对詹姆斯的恶意贬损、持续嘲讽和明显敌意表达",
+            "known_terms": list(catalog.known_terms),
+            "standalone_terms": list(catalog.standalone_terms),
+            "friendly_exceptions": list(catalog.friendly_exceptions),
+            "hostile_context": list(catalog.hostile_context),
+        }
+    catalog = profile.catalog
+    return {
+        "profile_id": profile.profile_id,
+        "name": profile.name,
+        "description": profile.description,
+        "known_terms": list(catalog.known_terms),
+        "standalone_terms": list(catalog.standalone_terms),
+        "friendly_exceptions": list(catalog.friendly_exceptions),
+        "hostile_context": list(catalog.hostile_context),
     }
 
 

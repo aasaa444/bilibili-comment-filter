@@ -43,6 +43,13 @@ def test_fixture_startup_creates_persistent_database_and_reports_ready(tmp_path)
     assert database.is_file()
 
 
+def test_cli_worker_toggle_is_part_of_the_startup_contract() -> None:
+    cli_source = _read("service/cli.py")
+
+    assert "BILIBILI_FILTER_WORKER_ENABLED" in cli_source
+    assert "start_background_worker=_env_bool(" in cli_source
+
+
 def test_windows_start_and_stop_scripts_define_a_safe_local_contract() -> None:
     start = _read("scripts/start.ps1")
     stop = _read("scripts/stop.ps1")
@@ -174,6 +181,8 @@ def test_compose_declares_environment_health_and_named_persistence_contract() ->
         "BILIBILI_FILTER_OPENAI_MODEL",
         "BILIBILI_FILTER_OPENAI_CONTEXT_TOKENS",
         "BILIBILI_FILTER_OPENAI_MAX_OUTPUT_TOKENS",
+        "BILIBILI_FILTER_OPENAI_MAX_BATCH_ACCOUNTS",
+        "BILIBILI_FILTER_OPENAI_TIMEOUT_SECONDS",
         "BILIBILI_FILTER_WORKER_ENABLED",
         "BILIBILI_FILTER_BROWSER_HEADLESS",
     ):

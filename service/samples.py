@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from .analyzer import SampleItem, SampleSet
 from .db import Database
+from .profiles import DEFAULT_FILTER_PROFILE_ID, FilterProfileStore
 
 
 @dataclass(frozen=True)
@@ -28,13 +29,17 @@ class SampleRecord:
     created_at: datetime
     published_at: datetime | None
     is_current: bool
+    profile_id: str = DEFAULT_FILTER_PROFILE_ID
 
 
 class SampleStore:
     """Versioned local sample storage used by the analyzer and management API."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self, database: Database, profile_store: FilterProfileStore | None = None
+    ) -> None:
         self.database = database
+        self.profile_store = profile_store
 
     def create(
         self,
@@ -43,6 +48,7 @@ class SampleStore:
         label: str,
         items: list[NewSampleItem | tuple[str, str | None]],
         source: str = "manual",
+        profile_id: str = DEFAULT_FILTER_PROFILE_ID,
     ) -> SampleRecord:
         candidates: list[tuple[str, str, str, str]] = []
         has_non_empty_input = False
@@ -90,9 +96,11 @@ class SampleStore:
                 FROM sample_items
                 JOIN sample_sets ON sample_sets.sample_id = sample_items.sample_id
                 WHERE sample_sets.status IN ('published', 'disabled')
+                  AND sample_sets.profile_id = ?
                 ORDER BY sample_sets.published_at, sample_sets.created_at,
                          sample_sets.sample_id, sample_items.rowid
-                """
+                """,
+                (profile_id,),
             ).fetchall()
             for item_row in inherited_rows:
                 value = str(item_row["content"]).strip()
@@ -127,10 +135,10 @@ class SampleStore:
             connection.execute(
                 """
                 INSERT INTO sample_sets
-                    (sample_id, kind, version, status, created_at)
-                VALUES (?, ?, ?, 'draft', ?)
+                    (sample_id, kind, version, status, created_at, profile_id)
+                VALUES (?, ?, ?, 'draft', ?, ?)
                 """,
-                (sample_id, sample_kind, version, timestamp.isoformat()),
+                (sample_id, sample_kind, version, timestamp.isoformat(), profile_id),
             )
             for value, content_label, item_kind, item_source in normalized:
                 connection.execute(
@@ -178,9 +186,9 @@ class SampleStore:
                 """
                 UPDATE sample_sets
                 SET status = 'disabled', retired_at = ?
-                WHERE status = 'published'
+                WHERE status = 'published' AND profile_id = ?
                 """,
-                (timestamp,),
+                (timestamp, row["profile_id"]),
             )
             connection.execute(
                 """
@@ -192,25 +200,47 @@ class SampleStore:
             )
         return self.get(sample_id)
 
-    def current(self) -> SampleSet:
+    def current(self, profile_id: str | None = None) -> SampleSet:
+        effective_profile_id = profile_id
+        if effective_profile_id is None and self.profile_store is not None:
+            effective_profile_id = self.profile_store.current().profile_id
+        effective_profile_id = effective_profile_id or DEFAULT_FILTER_PROFILE_ID
         row = self.database.execute(
             """
             SELECT * FROM sample_sets
             WHERE status = 'published'
+              AND profile_id = ?
             ORDER BY published_at DESC, sample_id DESC
             LIMIT 1
-            """
+            """,
+            (effective_profile_id,),
         ).fetchone()
         if row is None:
-            return SampleSet("samples-empty", ())
+            profile = (
+                self.profile_store.get(effective_profile_id)
+                if self.profile_store is not None
+                else None
+            )
+            return SampleSet("samples-empty", (), profile=profile)
         record = self._from_row(row)
-        return SampleSet(record.version, record.items)
+        profile = (
+            self.profile_store.get(record.profile_id)
+            if self.profile_store is not None
+            else None
+        )
+        return SampleSet(record.version, record.items, profile=profile)
 
     def add_review_sample(self, *, content: str, kind: str = "comment") -> SampleRecord:
+        profile_id = (
+            self.profile_store.current().profile_id
+            if self.profile_store is not None
+            else DEFAULT_FILTER_PROFILE_ID
+        )
         draft = self.create(
             kind=kind,
             label="positive",
             items=[NewSampleItem(content, "positive", kind, "review")],
+            profile_id=profile_id,
         )
         return self.publish(draft.sample_id)
 
@@ -251,6 +281,7 @@ class SampleStore:
                 datetime.fromisoformat(row["published_at"]) if row["published_at"] else None
             ),
             is_current=row["status"] == "published",
+            profile_id=row["profile_id"] or DEFAULT_FILTER_PROFILE_ID,
         )
 
     @staticmethod

@@ -22,9 +22,94 @@ class TestHTMLElement {
   }
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findRegionBounds(value, selector) {
+  const marker = selector.match(/data-[\w-]+/)?.[0];
+  if (!marker) return null;
+  const opening = new RegExp(`<([a-z][\\w-]*)\\b[^>]*\\b${escapeRegExp(marker)}\\b[^>]*>`, "i").exec(value);
+  if (!opening || opening.index === undefined) return null;
+  const tag = opening[1];
+  const openingEnd = opening.index + opening[0].length;
+  const tags = new RegExp(`<(/?)${escapeRegExp(tag)}\\b[^>]*>`, "gi");
+  tags.lastIndex = openingEnd;
+  let depth = 1;
+  let match;
+  while ((match = tags.exec(value))) {
+    if (match[1]) depth -= 1;
+    else if (!match[0].endsWith("/>") && !match[0].startsWith("<!")) depth += 1;
+    if (depth === 0) {
+      return {
+        outerStart: opening.index,
+        innerStart: openingEnd,
+        innerEnd: match.index,
+        outerEnd: tags.lastIndex,
+      };
+    }
+  }
+  return null;
+}
+
+class TestRegion {
+  constructor(owner, selector) {
+    this.owner = owner;
+    this.selector = selector;
+    this.scrollTop = 0;
+  }
+
+  get innerHTML() {
+    const bounds = findRegionBounds(this.owner.value, this.selector);
+    return bounds ? this.owner.value.slice(bounds.innerStart, bounds.innerEnd) : "";
+  }
+
+  set innerHTML(value) {
+    const bounds = findRegionBounds(this.owner.value, this.selector);
+    if (!bounds) return;
+    this.owner.value = `${this.owner.value.slice(0, bounds.innerStart)}${value}${this.owner.value.slice(bounds.innerEnd)}`;
+  }
+
+  get outerHTML() {
+    const bounds = findRegionBounds(this.owner.value, this.selector);
+    return bounds ? this.owner.value.slice(bounds.outerStart, bounds.outerEnd) : "";
+  }
+
+  set outerHTML(value) {
+    const bounds = findRegionBounds(this.owner.value, this.selector);
+    if (!bounds) return;
+    this.owner.value = `${this.owner.value.slice(0, bounds.outerStart)}${value}${this.owner.value.slice(bounds.outerEnd)}`;
+  }
+}
+
+class TestContent {
+  constructor(owner) {
+    this.owner = owner;
+    this.value = "";
+    this.regions = new Map();
+  }
+
+  set innerHTML(value) {
+    this.owner.contentRenderCount += 1;
+    this.value = value;
+    this.regions = new Map();
+  }
+
+  get innerHTML() {
+    return this.value;
+  }
+
+  querySelector(selector) {
+    if (!findRegionBounds(this.value, selector)) return null;
+    if (!this.regions.has(selector)) this.regions.set(selector, new TestRegion(this, selector));
+    return this.regions.get(selector);
+  }
+}
+
 class TestRoot {
   constructor() {
-    this.content = { innerHTML: "" };
+    this.contentRenderCount = 0;
+    this.content = new TestContent(this);
     this.listeners = new Map();
     this.html = "";
   }
@@ -44,7 +129,7 @@ class TestRoot {
   }
 
   querySelector(selector) {
-    return selector === "[data-content]" ? this.content : null;
+    return selector === "[data-content]" ? this.content : this.content.querySelector(selector);
   }
 }
 
@@ -53,7 +138,7 @@ const evidence = {
   taskId: "task-1",
   uid: "1001",
   nicknameSnapshot: "hostile-user",
-  result: "hit",
+  result: "uncertain",
   commentText: "完整根评论",
   threadContext: "根评论上下文",
   sourceVideo: "https://www.bilibili.com/video/BV1example01",
@@ -99,15 +184,18 @@ const evidence = {
 function createApi() {
   const calls = [];
   const reviewQueries = [];
+  const resultQueries = [];
   return {
     calls,
     reviewQueries,
+    resultQueries,
     getHealth: async () => ({ status: "ready" }),
     getAuthSession: async () => null,
     listTasks: async () => ({ items: [] }),
     listUids: async () => ({ items: [{ uid: "1001", nicknameSnapshot: "hostile-user", status: "hidden", hidden: true, updatedAt: "" }] }),
     listEvidence: async (params = {}) => {
       reviewQueries.push(params.reviewStatus);
+      resultQueries.push(params.result);
       return { items: [evidence] };
     },
     listReviewActions: async () => ({ items: [] }),
@@ -167,7 +255,7 @@ test("review inbox keeps primary evidence visible and opens full details in a se
     const html = root.content.innerHTML;
     assert.match(html, /data-evidence-inbox/);
     assert.match(html, /data-evidence-row="evidence-1"/);
-    assert.match(html, /AI · 命中/);
+    assert.match(html, /AI · 不确定/);
     assert.match(html, /人工 · 未复核/);
     assert.match(html, /置信度 97%/);
     assert.match(html, /巴斯特/);
@@ -186,6 +274,44 @@ test("review inbox keeps primary evidence visible and opens full details in a se
     assert.match(root.content.innerHTML, /samples-v3/);
     assert.match(root.content.innerHTML, /remote-model-v1/);
     assert.match(root.content.innerHTML, /关闭详情/);
+  });
+});
+
+test("review inbox defaults to AI uncertain evidence and can switch result categories", async () => {
+  await withFakeDom(async () => {
+    const hitEvidence = { ...evidence, evidenceId: "evidence-hit", uid: "2001", nicknameSnapshot: "hit-user", result: "hit" };
+    const api = createApi();
+    api.listEvidence = async (params = {}) => {
+      api.resultQueries.push(params.result);
+      if (params.result === "hit") return { items: [hitEvidence] };
+      if (params.result === "all" || params.result === undefined) return { items: [evidence, hitEvidence] };
+      return { items: [evidence] };
+    };
+    const root = new TestRoot();
+    mountManagementPage(root, api);
+    await flush();
+    await openReviews(root);
+
+    assert.equal(api.resultQueries[0], "uncertain");
+    assert.match(root.content.innerHTML, /data-evidence-row="evidence-1"/);
+    assert.doesNotMatch(root.content.innerHTML, /data-evidence-row="evidence-hit"/);
+    assert.match(root.content.innerHTML, /AI 不确定（优先复核）/);
+
+    await root.listeners.get("change")({
+      target: new TestHTMLElement({}, { name: "reviewResultFilter", value: "hit" }),
+    });
+    await flush();
+    assert.match(root.content.innerHTML, /data-evidence-row="evidence-hit"/);
+    assert.doesNotMatch(root.content.innerHTML, /data-evidence-row="evidence-1"/);
+    assert.match(root.content.innerHTML, /AI 已命中/);
+
+    await root.listeners.get("change")({
+      target: new TestHTMLElement({}, { name: "reviewResultFilter", value: "all" }),
+    });
+    await flush();
+    assert.match(root.content.innerHTML, /data-evidence-row="evidence-1"/);
+    assert.match(root.content.innerHTML, /data-evidence-row="evidence-hit"/);
+    assert.match(root.content.innerHTML, /全部 AI 结果/);
   });
 });
 
@@ -232,6 +358,54 @@ test("review action reports row-local busy and moves completed evidence to histo
   });
 });
 
+test("review action does not redraw the whole inbox and advances to the next evidence", async () => {
+  await withFakeDom(async () => {
+    const second = { ...evidence, evidenceId: "evidence-2", uid: "1002", nicknameSnapshot: "next-user" };
+    let resolveReview;
+    const reviewPromise = new Promise((resolve) => { resolveReview = resolve; });
+    const api = createApi();
+    api.getBlacklistSettings = async () => ({ enabled: true, mode: "local_and_official_queue", updatedAt: "" });
+    api.listEvidence = async () => ({ items: [evidence, second] });
+    api.reviewEvidence = async () => reviewPromise;
+    const root = new TestRoot();
+    mountManagementPage(root, api);
+    await flush();
+    await openReviews(root);
+    const rendersBeforeAction = root.contentRenderCount;
+    const inbox = root.querySelector("[data-evidence-inbox]");
+    const history = root.querySelector("[data-review-history]");
+    inbox.scrollTop = 480;
+
+    const actionPromise = root.listeners.get("click")({
+      target: new TestHTMLElement({ reviewAction: "confirm", evidenceId: "evidence-1" }),
+    });
+    await flush();
+    assert.equal(root.contentRenderCount, rendersBeforeAction);
+
+    resolveReview({
+      reviewId: "review-1",
+      evidenceId: "evidence-1",
+      uid: "1001",
+      action: "confirm",
+      previousStatus: "hidden",
+      nextStatus: "queued",
+      actor: "local-user",
+      createdAt: "2026-08-10T00:00:01Z",
+    });
+    await actionPromise;
+    await flush();
+
+    assert.equal(root.contentRenderCount, rendersBeforeAction);
+    assert.equal(root.querySelector("[data-evidence-inbox]"), inbox);
+    assert.equal(root.querySelector("[data-review-history]"), history);
+    assert.equal(inbox.scrollTop, 480);
+    assert.doesNotMatch(root.content.innerHTML, /data-evidence-row="evidence-1"/);
+    assert.match(root.content.innerHTML, /data-evidence-row="evidence-2"/);
+    assert.match(root.content.innerHTML, /1002 · next-user/);
+    assert.match(root.querySelector("[data-evidence-inspector]").innerHTML, /1002 · next-user/);
+  });
+});
+
 test("review inbox can switch between pending, history, and all evidence without showing inbox actions in history", async () => {
   await withFakeDom(async () => {
     const root = new TestRoot();
@@ -240,13 +414,13 @@ test("review inbox can switch between pending, history, and all evidence without
     await flush();
     await openReviews(root);
 
-    assert.deepEqual(api.reviewQueries, ["pending"]);
+    assert.deepEqual(api.reviewQueries, ["pending", "pending"]);
     await root.listeners.get("change")({
       target: new TestHTMLElement({}, { name: "reviewStatus", value: "history" }),
     });
     await flush();
 
-    assert.deepEqual(api.reviewQueries, ["pending", "history", "pending"]);
+    assert.deepEqual(api.reviewQueries, ["pending", "pending", "history", "pending"]);
     assert.match(root.content.innerHTML, /复核历史证据/);
     assert.doesNotMatch(root.content.innerHTML, /data-review-action=/);
   });
