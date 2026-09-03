@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title desc">
+  <title id="title">B站评论过滤工作流</title>
+  <desc id="desc">浏览器插件提交视频，采集器保存评论，模型按策略分析，结果进入本地隐藏、证据复核或官方队列。</desc>
+  <rect width="1200" height="300" rx="10" fill="#151515"/>
+  <text x="52" y="54" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="30" font-weight="700" fill="#fff">一条视频任务，四个真实落点</text>
+  <text x="54" y="84" font-family="Cascadia Mono, Consolas, monospace" font-size="16" fill="#969696">SUBMIT → COLLECT → ANALYZE → ACT</text>
+  <g font-family="Microsoft YaHei, Segoe UI, sans-serif">
+    <g transform="translate(52 119)">
+      <rect width="220" height="111" rx="6" fill="#1b1b1b" stroke="#2f2f2f" stroke-width="2"/>
+      <text x="20" y="31" font-size="16" fill="#ff9900">01 / 插件</text>
+      <text x="20" y="63" font-size="23" fill="#fff">提交当前视频</text>
+      <text x="20" y="90" font-size="15" fill="#969696">连接状态 · UID 缓存</text>
+    </g>
+    <path d="M284 174H326" stroke="#ff9900" stroke-width="2"/>
+    <path d="M318 166L328 174L318 182" fill="none" stroke="#ff9900" stroke-width="2"/>
+    <g transform="translate(340 119)">
+      <rect width="220" height="111" rx="6" fill="#1b1b1b" stroke="#2f2f2f" stroke-width="2"/>
+      <text x="20" y="31" font-size="16" fill="#ff9900">02 / 服务</text>
+      <text x="20" y="63" font-size="23" fill="#fff">采集并保存</text>
+      <text x="20" y="90" font-size="15" fill="#969696">分页 · 回复 · 断点</text>
+    </g>
+    <path d="M572 174H614" stroke="#ff9900" stroke-width="2"/>
+    <path d="M606 166L616 174L606 182" fill="none" stroke="#ff9900" stroke-width="2"/>
+    <g transform="translate(628 119)">
+      <rect width="220" height="111" rx="6" fill="#1b1b1b" stroke="#2f2f2f" stroke-width="2"/>
+      <text x="20" y="31" font-size="16" fill="#ff9900">03 / 策略</text>
+      <text x="20" y="63" font-size="23" fill="#fff">批量分析</text>
+      <text x="20" y="90" font-size="15" fill="#969696">命中 · 不确定 · 非目标</text>
+    </g>
+    <path d="M860 174H902" stroke="#ff9900" stroke-width="2"/>
+    <path d="M894 166L904 174L894 182" fill="none" stroke="#ff9900" stroke-width="2"/>
+    <g transform="translate(916 119)">
+      <rect width="232" height="111" rx="6" fill="#ff9900"/>
+      <text x="20" y="31" font-size="16" fill="#151515" font-weight="700">04 / 状态</text>
+      <text x="20" y="63" font-size="23" fill="#151515" font-weight="700">隐藏 / 复核 / 队列</text>
+      <text x="20" y="90" font-size="15" fill="#151515">UID 是名单唯一主键</text>
+    </g>
+  </g>
+</svg>

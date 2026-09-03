@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="390" viewBox="0 0 1200 390" role="img" aria-labelledby="title desc">
+  <title id="title">B站评论过滤</title>
+  <desc id="desc">本机优先的 B 站评论过滤工具，将视频评论按策略分析并转换为 UID 隐藏、复核或队列状态。</desc>
+  <rect width="1200" height="390" rx="10" fill="#151515"/>
+  <path d="M56 326H1144" stroke="#2f2f2f" stroke-width="2"/>
+  <path d="M690 54V326" stroke="#2f2f2f" stroke-width="2"/>
+  <g font-family="Microsoft YaHei, Segoe UI, sans-serif" fill="#fff">
+    <text x="56" y="75" font-size="18" font-weight="600" fill="#ff9900">BILIBILI / COMMENT TOOL</text>
+    <text x="56" y="145" font-size="56" font-weight="700">B站评论过滤</text>
+    <text x="56" y="193" font-size="26" fill="#c6c6c6">把不想看的 UID，留在你的视野之外。</text>
+    <text x="56" y="249" font-size="18" fill="#969696">本机优先 · 策略驱动 · 批量分析 · 证据可复核</text>
+  </g>
+  <g transform="translate(740 58)">
+    <rect width="350" height="245" rx="6" fill="#1b1b1b" stroke="#2f2f2f" stroke-width="2"/>
+    <text x="24" y="34" font-family="Cascadia Mono, Consolas, monospace" font-size="17" fill="#969696">COMMENT PIPELINE</text>
+    <g font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="19">
+      <rect x="24" y="56" width="302" height="39" rx="3" fill="#252525"/>
+      <circle cx="45" cy="75" r="7" fill="#ff9900"/>
+      <text x="64" y="82" fill="#fff">视频评论 / 楼中楼</text>
+      <path d="M175 95V113" stroke="#ff9900" stroke-width="2"/>
+      <path d="M169 108L175 116L181 108" fill="none" stroke="#ff9900" stroke-width="2"/>
+      <rect x="24" y="120" width="302" height="39" rx="3" fill="#252525"/>
+      <circle cx="45" cy="139" r="7" fill="#ff9900"/>
+      <text x="64" y="146" fill="#fff">按当前策略批量分析</text>
+      <path d="M175 159V177" stroke="#ff9900" stroke-width="2"/>
+      <path d="M169 172L175 180L181 172" fill="none" stroke="#ff9900" stroke-width="2"/>
+      <rect x="24" y="184" width="132" height="37" rx="3" fill="#ff9900"/>
+      <text x="43" y="208" fill="#151515" font-weight="700">UID 隐藏</text>
+      <rect x="171" y="184" width="155" height="37" rx="3" fill="#252525" stroke="#ff9900"/>
+      <text x="190" y="208" fill="#ff9900">证据 / 队列</text>
+    </g>
+  </g>
+  <g font-family="Cascadia Mono, Consolas, monospace" font-size="15" fill="#969696">
+    <text x="56" y="354">LOCAL-FIRST / UID IS THE SOURCE OF TRUTH</text>
+    <text x="1002" y="354">v0.1</text>
+  </g>
+</svg>
